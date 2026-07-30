@@ -18,14 +18,14 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use gpui::{
-    AnyElement, ClipboardItem, Context, FocusHandle, KeyDownEvent, SharedString, Window, actions,
-    div, prelude::*, px, uniform_list,
+    AnyElement, ClipboardItem, Context, FocusHandle, KeyDownEvent, ScrollHandle, SharedString,
+    Window, actions, div, prelude::*, px, uniform_list,
 };
 
 use throne_core_client::{
     ConnectionRow, CoreConfig, CoreSession, force_clear_system_proxy, set_system_proxy,
 };
-use throne_domain::{AppState, CoreStatus, GroupId, Profile, TrafficSnapshot};
+use throne_domain::{AppState, CoreStatus, GroupId, Profile, ProfileId, TrafficSnapshot};
 use throne_import::import_from_url;
 
 use crate::theme::{Theme, latency_color};
@@ -37,7 +37,7 @@ use crate::ui::dialogs::{
 use crate::ui::widgets::{
     TOOLBAR_BTN_GAP, TOOLBAR_BTN_W, TOOLBAR_MENU_TOP, TOOLBAR_PAD_X, menu_item, menu_label,
     menu_separator, modal_shell, mode_checkbox, secondary_btn, start_stop_btn, toolbar_btn,
-    toolbar_menu_panel,
+    toolbar_menu_panel, StartStopState,
 };
 
 actions!(
@@ -90,6 +90,53 @@ enum SortColumn {
     Traffic,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CoreAction {
+    Start,
+    Stop,
+    Switch(ProfileId),
+}
+
+fn next_core_action(status: &CoreStatus, profile_id: ProfileId) -> CoreAction {
+    match status {
+        CoreStatus::Running {
+            profile_id: running_id,
+            ..
+        } if *running_id != profile_id => CoreAction::Switch(profile_id),
+        CoreStatus::Running { .. } | CoreStatus::Starting => CoreAction::Stop,
+        CoreStatus::Stopped | CoreStatus::Stopping | CoreStatus::Error(_) => CoreAction::Start,
+    }
+}
+
+fn should_scroll_logs_to_bottom(logs_tab_active: bool, previous: &str, current: &str) -> bool {
+    logs_tab_active && !current.is_empty() && previous != current
+}
+
+fn should_update_rendered_log_text(logs_tab_active: bool) -> bool {
+    logs_tab_active
+}
+
+#[derive(Default)]
+struct PendingProfileSwitch(Option<ProfileId>);
+
+impl PendingProfileSwitch {
+    fn schedule(&mut self, profile_id: ProfileId) -> bool {
+        if self.0.is_some() {
+            return false;
+        }
+        self.0 = Some(profile_id);
+        true
+    }
+
+    fn clear(&mut self) {
+        self.0 = None;
+    }
+
+    fn take(&mut self) -> Option<ProfileId> {
+        self.0.take()
+    }
+}
+
 pub struct MainWindow {
     state: AppState,
     focus_handle: FocusHandle,
@@ -98,6 +145,8 @@ pub struct MainWindow {
     open_menu: OpenMenu,
     /// Bottom panel tab: 0 Logs, 1 Connections
     bottom_tab: usize,
+    log_scroll_handle: ScrollHandle,
+    rendered_log_text: String,
     ctx_menu_at: Option<(f32, f32)>,
     dialog: Dialog,
     mg_focus: MgFocus,
@@ -106,6 +155,10 @@ pub struct MainWindow {
     core: Arc<Mutex<CoreSession>>,
     /// True while a start/stop background job is in flight (ignore re-clicks).
     core_op_busy: bool,
+    /// Target profile to start once the current core has fully stopped.
+    pending_profile_switch: PendingProfileSwitch,
+    /// Frame index for the Start/Stop transition indicator.
+    loading_frame: usize,
     /// True while a URL-test / sub-update job is in flight.
     background_busy: bool,
     sort_column: SortColumn,
@@ -164,11 +217,15 @@ impl MainWindow {
             db_path_label,
             open_menu: OpenMenu::None,
             bottom_tab: 0,
+            log_scroll_handle: ScrollHandle::new(),
+            rendered_log_text: String::new(),
             ctx_menu_at: None,
             dialog: Dialog::None,
             mg_focus: MgFocus::NewName,
             core: Arc::new(Mutex::new(CoreSession::new(core_cfg))),
             core_op_busy: false,
+            pending_profile_switch: PendingProfileSwitch::default(),
+            loading_frame: 0,
             background_busy: false,
             sort_column: SortColumn::None,
             sort_asc: true,
@@ -177,6 +234,7 @@ impl MainWindow {
             runtime_poll_busy: false,
         };
         window.spawn_runtime_poller(cx);
+        window.spawn_loading_indicator(cx);
         window
     }
 
@@ -193,6 +251,33 @@ impl MainWindow {
             }
         })
         .detach();
+    }
+
+    fn spawn_loading_indicator(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                smol::Timer::after(std::time::Duration::from_millis(120)).await;
+                if this
+                    .update(cx, |this, cx| {
+                        if matches!(
+                            this.state.core_status(),
+                            CoreStatus::Starting | CoreStatus::Stopping
+                        ) {
+                            this.loading_frame = (this.loading_frame + 1) % 4;
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn loading_glyph(&self) -> &'static str {
+        ["|", "/", "-", "\\"][self.loading_frame]
     }
 
     fn toggle_sort(&mut self, col: SortColumn, cx: &mut Context<Self>) {
@@ -679,9 +764,29 @@ impl MainWindow {
             if matches!(self.state.core_status(), CoreStatus::Stopping) {
                 return;
             }
+            self.pending_profile_switch.clear();
             self.stop_proxy(cx);
         } else {
             self.start_proxy(cx);
+        }
+    }
+
+    fn activate_profile(&mut self, profile_id: ProfileId, cx: &mut Context<Self>) {
+        match next_core_action(self.state.core_status(), profile_id) {
+            CoreAction::Switch(profile_id) => self.switch_profile(profile_id, cx),
+            CoreAction::Start | CoreAction::Stop => self.toggle_proxy(cx),
+        }
+    }
+
+    fn switch_profile(&mut self, profile_id: ProfileId, cx: &mut Context<Self>) {
+        if self.core_op_busy {
+            self.state
+                .set_status_message("Core is busy (start/stop in progress)…");
+            cx.notify();
+            return;
+        }
+        if self.pending_profile_switch.schedule(profile_id) {
+            self.stop_proxy(cx);
         }
     }
 
@@ -791,6 +896,7 @@ impl MainWindow {
                 this.core_op_busy = false;
                 // Always mark stopped locally — stop_profile force-kills core.
                 this.state.set_core_status(CoreStatus::Stopped);
+                let switch_target = this.pending_profile_switch.take();
                 match result {
                     Ok(()) => this.state.set_status_message("Core stopped"),
                     Err(e) => this
@@ -798,6 +904,17 @@ impl MainWindow {
                         .set_status_message(format!("Stopped (with errors): {e}")),
                 }
                 let _ = this.persist_db();
+                if let Some(profile_id) = switch_target {
+                    if this.state.select_profile(profile_id).is_ok() {
+                        this.start_proxy(cx);
+                        return;
+                    }
+                    this.state.set_core_status(CoreStatus::Error(
+                        "Selected profile was removed while switching".into(),
+                    ));
+                    this.state
+                        .set_status_message("Switch failed: selected profile was removed");
+                }
                 cx.notify();
             })
             .ok();
@@ -1232,6 +1349,7 @@ impl MainWindow {
             this.update(cx, |this, cx| {
                 this.runtime_poll_busy = false;
                 if let Some((stats, conns)) = snap {
+                    let mut traffic_changed = false;
                     if let Some(cum) = stats {
                         let now = std::time::Instant::now();
                         let rates = if let Some(prev_at) = this.prev_traffic_at {
@@ -1305,7 +1423,6 @@ impl MainWindow {
 
         cx.spawn(async move |this, cx| {
             let result = cx
-                    let mut traffic_changed = false;
                 .background_spawn(async move { set_system_proxy(on, &host, port) })
                 .await;
             this.update(cx, |this, cx| {
@@ -1325,7 +1442,6 @@ impl MainWindow {
         .detach();
     }
 
-                            traffic_changed |= cum.proxy_down > 0 || cum.proxy_up > 0;
     fn set_sys_dns(&mut self, on: bool, cx: &mut Context<Self>) {
         self.state.set_system_dns(on);
         let _ = self.persist_db();
@@ -1650,7 +1766,12 @@ impl MainWindow {
     // ─── layout regions ─────────────────────────────────────────────────
 
     fn render_top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let running = self.state.core_status().is_running();
+        let start_stop_state = match self.state.core_status() {
+            CoreStatus::Running { .. } => StartStopState::Stop,
+            CoreStatus::Starting => StartStopState::Starting,
+            CoreStatus::Stopping => StartStopState::Stopping,
+            CoreStatus::Stopped | CoreStatus::Error(_) => StartStopState::Start,
+        };
         let entity = cx.entity().clone();
 
         div()
@@ -1666,7 +1787,7 @@ impl MainWindow {
             .child(self.render_tool_cluster(cx))
             .child({
                 let e = entity.clone();
-                start_stop_btn(running, move |_, _, cx| {
+                start_stop_btn(start_stop_state, self.loading_glyph(), move |_, _, cx| {
                     e.update(cx, |this, cx| this.toggle_proxy(cx));
                 })
             })
@@ -2750,7 +2871,7 @@ impl MainWindow {
                                         e_select.update(cx, |this, cx| {
                                             let _ = this.state.select_profile(id);
                                             if ev.click_count >= 2 {
-                                                this.toggle_proxy(cx);
+                                                this.activate_profile(id, cx);
                                             } else {
                                                 cx.notify();
                                             }
@@ -2800,10 +2921,16 @@ impl MainWindow {
         cx.notify();
     }
 
-    fn render_bottom_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_bottom_tabs(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity().clone();
         let tab = self.bottom_tab;
         let logs = self.state.logs_text();
+        if should_scroll_logs_to_bottom(tab == 0, &self.rendered_log_text, &logs) {
+            self.log_scroll_handle.scroll_to_bottom();
+        }
+        if should_update_rendered_log_text(tab == 0) {
+            self.rendered_log_text = logs.clone();
+        }
         let log_preview = if logs.is_empty() {
             "(no log lines yet)".to_string()
         } else {
@@ -2872,6 +2999,7 @@ impl MainWindow {
                     .text_xs()
                     .text_color(Theme::text_muted())
                     .overflow_y_scroll()
+                    .track_scroll(&self.log_scroll_handle)
                     .when(tab == 0, {
                         let e = entity.clone();
                         move |el| {
@@ -3235,4 +3363,76 @@ impl Render for MainWindow {
             .when(ctx_open, |el| el.child(self.render_ctx_menu(cx)))
             .when(dialog_open, |el| el.child(self.render_dialog_overlay(cx)))
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CoreAction, next_core_action, should_scroll_logs_to_bottom, should_update_rendered_log_text,
+    };
+    use throne_domain::CoreStatus;
+
+    #[test]
+    fn new_non_empty_log_text_requests_scroll_to_bottom() {
+        assert!(!should_scroll_logs_to_bottom(
+            false,
+            "old log",
+            "old log\nnew log"
+        ));
+        assert!(should_scroll_logs_to_bottom(
+            true,
+            "old log",
+            "old log\nnew log"
+        ));
+        assert!(!should_scroll_logs_to_bottom(true, "same", "same"));
+        assert!(!should_scroll_logs_to_bottom(true, "old log", ""));
+    }
+
+    #[test]
+    fn inactive_logs_tab_preserves_snapshot_until_returning_to_logs() {
+        assert!(!should_update_rendered_log_text(false));
+        assert!(should_update_rendered_log_text(true));
+
+        let mut initial_snapshot = String::new();
+        if should_update_rendered_log_text(true) {
+            initial_snapshot = "old log".to_owned();
+        }
+        assert_eq!(initial_snapshot, "old log");
+
+        let changed_logs = "old log\nnew log";
+        if should_update_rendered_log_text(false) {
+            initial_snapshot = changed_logs.to_owned();
+        }
+        assert!(!should_scroll_logs_to_bottom(
+            false,
+            &initial_snapshot,
+            changed_logs
+        ));
+        assert_eq!(initial_snapshot, "old log");
+        assert!(should_scroll_logs_to_bottom(
+            true,
+            &initial_snapshot,
+            changed_logs
+        ));
+    }
+
+    #[test]
+    fn double_clicking_a_different_profile_while_running_requests_a_switch() {
+        let running = CoreStatus::Running {
+            profile_id: 1,
+            profile_name: "Taiwan 04".into(),
+        };
+
+        assert_eq!(next_core_action(&running, 2), CoreAction::Switch(2));
+    }
+
+    #[test]
+    fn pending_switch_keeps_its_target_while_stop_is_in_progress() {
+        let mut pending = super::PendingProfileSwitch::default();
+
+        assert!(pending.schedule(2));
+        assert!(!pending.schedule(3));
+        assert_eq!(pending.take(), Some(2));
+    }
+
 }

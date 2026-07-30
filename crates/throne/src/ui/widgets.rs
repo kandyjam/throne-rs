@@ -11,6 +11,52 @@ pub const TOOLBAR_MENU_TOP: f32 = 66.;
 /// Left padding of the top bar.
 pub const TOOLBAR_PAD_X: f32 = 8.;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartStopState {
+    Start,
+    Stop,
+    Starting,
+    Stopping,
+}
+
+pub fn start_stop_presentation(state: StartStopState) -> (&'static str, bool) {
+    match state {
+        StartStopState::Start => ("Start", false),
+        StartStopState::Stop => ("Stop", false),
+        StartStopState::Starting => ("Starting…", true),
+        StartStopState::Stopping => ("Stopping…", true),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StartStopState, start_stop_presentation};
+
+    #[test]
+    fn transitional_start_stop_states_show_loading_feedback() {
+        assert_eq!(
+            start_stop_presentation(StartStopState::Starting),
+            ("Starting…", true)
+        );
+        assert_eq!(
+            start_stop_presentation(StartStopState::Stopping),
+            ("Stopping…", true)
+        );
+    }
+
+    #[test]
+    fn stable_start_stop_states_do_not_show_loading_feedback() {
+        assert_eq!(
+            start_stop_presentation(StartStopState::Start),
+            ("Start", false)
+        );
+        assert_eq!(
+            start_stop_presentation(StartStopState::Stop),
+            ("Stop", false)
+        );
+    }
+}
+
 /// Toolbar button. Dropdown content is rendered as a **root-level overlay**
 /// (see `MainWindow::render_toolbar_menu_overlay`) so it is not clipped or
 /// painted under the profile table / group tabs.
@@ -83,13 +129,21 @@ pub fn toolbar_menu_panel(
 }
 
 pub fn start_stop_btn(
-    running: bool,
+    state: StartStopState,
+    loading_glyph: &'static str,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    let (label, color, glyph) = if running {
-        ("Stop", Theme::stop_red(), "■")
+    let (label, loading) = start_stop_presentation(state);
+    let color = match state {
+        StartStopState::Stop | StartStopState::Stopping => Theme::stop_red(),
+        StartStopState::Start | StartStopState::Starting => Theme::start_green(),
+    };
+    let glyph = if loading {
+        loading_glyph
+    } else if matches!(state, StartStopState::Stop) {
+        "■"
     } else {
-        ("Start", Theme::start_green(), "▶")
+        "▶"
     };
     div()
         .id("startstop")
