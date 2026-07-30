@@ -2,11 +2,10 @@
 
 use gpui::{App, SharedString, Window, div, prelude::*, px};
 
-use throne_domain::{
-    AppState, DefaultOutbound, GroupId, ProfileId, ProfileType, RulesetMirror,
-};
+use throne_domain::{AppState, GroupId, ProfileId, ProfileType, RulesetMirror};
 
 use crate::theme::Theme;
+use crate::ui::routing::RoutingDraft;
 use crate::ui::widgets::{form_row, modal_shell, mode_checkbox, primary_btn, secondary_btn};
 
 #[derive(Clone, Debug, Default)]
@@ -37,15 +36,8 @@ pub enum Dialog {
     AddFromInput {
         text: String,
     },
-    RoutingSettings {
-        selected: i64,
-        name: String,
-        remote_url: String,
-        auto_update: bool,
-        default_outbound: DefaultOutbound,
-        /// 0 name · 1 remote_url
-        focus: usize,
-    },
+    /// Full upstream-style Routes dialog (tabs + draft + nested editors).
+    RoutingSettings(RoutingDraft),
     TunSettings {
         vpn_mtu: String,
         vpn_strict_route: bool,
@@ -113,18 +105,7 @@ impl Dialog {
     }
 
     pub fn routing_from_state(state: &AppState) -> Self {
-        let r = state.active_route();
-        let selected = r.map(|x| x.id).unwrap_or(-1);
-        Self::RoutingSettings {
-            selected,
-            name: r.map(|x| x.name.clone()).unwrap_or_default(),
-            remote_url: r.map(|x| x.remote_url.clone()).unwrap_or_default(),
-            auto_update: r.map(|x| x.auto_update).unwrap_or(false),
-            default_outbound: r
-                .map(|x| x.default_outbound)
-                .unwrap_or(DefaultOutbound::Proxy),
-            focus: 0,
-        }
+        Self::RoutingSettings(RoutingDraft::from_state(state))
     }
 
     pub fn tun_from_state(state: &AppState) -> Self {
@@ -584,161 +565,6 @@ fn detect_hint(text: &str) -> &'static str {
         return "Share link(s)";
     }
     "Unknown — will try import anyway"
-}
-
-pub fn routing_settings_body(
-    state: &AppState,
-    selected: i64,
-    name: &str,
-    remote_url: &str,
-    auto_update: bool,
-    default_outbound: DefaultOutbound,
-    focus: usize,
-    on_select: impl Fn(i64, &mut Window, &mut App) + Clone + 'static,
-    on_focus: impl Fn(usize, &mut Window, &mut App) + Clone + 'static,
-    on_toggle_auto: impl Fn(&mut Window, &mut App) + 'static,
-    on_cycle_outbound: impl Fn(&mut Window, &mut App) + 'static,
-    on_fetch: impl Fn(&mut Window, &mut App) + 'static,
-    on_save: impl Fn(&mut Window, &mut App) + 'static,
-    on_cancel: impl Fn(&mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    let mut list = div()
-        .id("rt-list")
-        .flex()
-        .flex_col()
-        .gap_1()
-        .mb_3()
-        .max_h(px(120.))
-        .overflow_y_scroll();
-    for r in state.all_routes() {
-        let id = r.id;
-        let sel = selected == id;
-        let on_select = on_select.clone();
-        let label = format!(
-            "{}{}",
-            if sel { "● " } else { "○ " },
-            r.summary()
-        );
-        list = list.child(
-            div()
-                .id(SharedString::from(format!("rt-{id}")))
-                .px_2()
-                .py_1()
-                .rounded_sm()
-                .cursor_pointer()
-                .bg(if sel {
-                    Theme::bg_selected()
-                } else {
-                    Theme::bg_app()
-                })
-                .text_color(if sel {
-                    Theme::text_on_selected()
-                } else {
-                    Theme::text()
-                })
-                .text_sm()
-                .child(label)
-                .on_click(move |_, w, cx| on_select(id, w, cx)),
-        );
-    }
-
-    let mk_field = |idx: usize, label: &'static str, val: String| {
-        let on_focus = on_focus.clone();
-        let focused = focus == idx;
-        div()
-            .id(SharedString::from(format!("rt-f-{idx}")))
-            .flex()
-            .items_center()
-            .gap_3()
-            .mb_2()
-            .cursor_pointer()
-            .on_click(move |_, w, cx| on_focus(idx, w, cx))
-            .child(
-                div()
-                    .w(px(120.))
-                    .text_xs()
-                    .text_color(Theme::text_muted())
-                    .child(label),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(if focused {
-                        Theme::accent()
-                    } else {
-                        Theme::border_light()
-                    })
-                    .bg(Theme::bg_app())
-                    .text_sm()
-                    .text_color(Theme::text())
-                    .child(if focused {
-                        format!("{val}▌")
-                    } else if val.is_empty() {
-                        "…".into()
-                    } else {
-                        val
-                    }),
-            )
-    };
-
-    div()
-        .flex()
-        .flex_col()
-        .child(
-            div()
-                .text_xs()
-                .text_color(Theme::text_muted())
-                .mb_2()
-                .child("Routing profiles — select, edit, fetch remote URL"),
-        )
-        .child(list)
-        .child(mk_field(0, "Name", name.to_string()))
-        .child(mk_field(1, "Remote URL", remote_url.to_string()))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .mb_2()
-                .child(mode_checkbox(
-                    "rt-auto",
-                    "Auto-update remote",
-                    auto_update,
-                    move |_, w, cx| on_toggle_auto(w, cx),
-                ))
-                .child(
-                    div()
-                        .id("rt-defout")
-                        .px_2()
-                        .py_1()
-                        .rounded_sm()
-                        .border_1()
-                        .border_color(Theme::border_light())
-                        .bg(Theme::bg_app())
-                        .text_xs()
-                        .cursor_pointer()
-                        .on_click(move |_, w, cx| on_cycle_outbound(w, cx))
-                        .child(format!("Default out: {}", default_outbound.label())),
-                ),
-        )
-        .child(
-            div()
-                .flex()
-                .justify_end()
-                .gap_2()
-                .mt_2()
-                .child(secondary_btn("rt-cancel", "Cancel", move |_, w, cx| {
-                    on_cancel(w, cx)
-                }))
-                .child(secondary_btn("rt-fetch", "Fetch remote", move |_, w, cx| {
-                    on_fetch(w, cx)
-                }))
-                .child(primary_btn("rt-save", "Save", move |_, w, cx| on_save(w, cx))),
-        )
 }
 
 pub fn tun_settings_body(

@@ -291,6 +291,14 @@ fn parse_json_doc(text: &str) -> Option<Value> {
     None
 }
 
+/// `throne://route/<base64url>` share link (upstream `ToShareLink`).
+pub fn to_share_link(profile: &RouteProfile) -> String {
+    use base64::Engine;
+    let json = serde_json::to_string(&to_share_object(profile)).unwrap_or_else(|_| "{}".into());
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json.as_bytes());
+    format!("throne://route/{b64}")
+}
+
 /// Build upstream-compatible share object for export.
 pub fn to_share_object(profile: &RouteProfile) -> Value {
     if profile.is_raw {

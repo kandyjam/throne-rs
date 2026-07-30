@@ -16,7 +16,9 @@ use throne_domain::{ParsedOutbound, ProfileType, RouteProfile};
 pub use deeplink::{Deeplink, parse_deeplink};
 pub use fetch::{fetch_url, fetch_url_with_timeout};
 pub use links::parse_share_link;
-pub use route_share::{RouteImportReport, to_share_object, try_import_routes};
+pub use route_share::{
+    RouteImportReport, import_route_payload, to_share_link, to_share_object, try_import_routes,
+};
 
 /// Fetch `url` and run [`import_text`] on the body.
 pub fn import_from_url(url: &str) -> ImportReport {

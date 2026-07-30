@@ -4,9 +4,11 @@
 //! (profiles, groups, routes, runtime status) without Qt dependencies.
 
 mod models;
+mod route_simple;
 mod store;
 mod version;
 
 pub use models::*;
+pub use route_simple::SimpleAction;
 pub use store::{AppState, StoreError, SubUpdateSummary};
 pub use version::{NKR_VERSION, display_name, user_agent};

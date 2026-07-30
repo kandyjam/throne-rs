@@ -31,8 +31,10 @@ use throne_import::import_from_url;
 use crate::theme::{Theme, latency_color};
 use crate::ui::dialogs::{
     Dialog, add_input_body, basic_settings_body, confirm_delete_unavailable_body,
-    edit_profile_body, hotkey_settings_body, manage_groups_body, routing_settings_body,
-    tun_settings_body,
+    edit_profile_body, hotkey_settings_body, manage_groups_body, tun_settings_body,
+};
+use crate::ui::routing::{
+    RoutingEvent, RoutingNested, RoutingSideEffect, routing_settings_view,
 };
 use crate::ui::widgets::{
     TOOLBAR_BTN_GAP, TOOLBAR_BTN_W, TOOLBAR_MENU_TOP, TOOLBAR_PAD_X, menu_item, menu_label,
@@ -444,114 +446,329 @@ impl MainWindow {
         cx.notify();
     }
 
-    fn save_routing_settings(&mut self, cx: &mut Context<Self>) {
-        if let Dialog::RoutingSettings {
-            selected,
-            name,
-            remote_url,
-            auto_update,
-            default_outbound,
-            ..
-        } = &self.dialog
-        {
-            if *selected < 0 {
-                self.state.set_status_message("No route selected");
+    fn handle_routing_event(&mut self, ev: RoutingEvent, cx: &mut Context<Self>) {
+        let Dialog::RoutingSettings(draft) = &mut self.dialog else {
+            return;
+        };
+        let effect = draft.apply_event(ev);
+        self.dispatch_routing_effect(effect, cx);
+    }
+
+    fn dispatch_routing_effect(&mut self, effect: RoutingSideEffect, cx: &mut Context<Self>) {
+        match effect {
+            RoutingSideEffect::None => {
                 cx.notify();
-                return;
             }
-            let id = *selected;
-            let r = self.state.update_route_meta(
-                id,
-                name.clone(),
-                remote_url.clone(),
-                *auto_update,
-                *default_outbound,
-            );
-            match r {
-                Ok(()) => {
-                    let _ = self.state.set_active_route(id);
-                    self.close_dialog();
-                    let _ = self.persist_db();
+            RoutingSideEffect::Close => {
+                self.close_dialog();
+                cx.notify();
+            }
+            RoutingSideEffect::Commit => {
+                self.commit_routing_settings(cx);
+            }
+            RoutingSideEffect::CopyClipboard(text) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                if let Dialog::RoutingSettings(d) = &mut self.dialog {
+                    d.notice = "Copied!".into();
                 }
-                Err(e) => self.state.set_status_message(e.to_string()),
+                self.state.set_status_message("Route share link copied");
+                cx.notify();
+            }
+            RoutingSideEffect::TryClipboardImport => {
+                let clip = cx
+                    .read_from_clipboard()
+                    .and_then(|c| c.text().map(|s| s.to_string()))
+                    .or_else(read_os_clipboard)
+                    .unwrap_or_default();
+                let clip = clip.trim().to_string();
+                if !clip.is_empty() {
+                    if self.try_import_route_text(&clip, true, cx) {
+                        return;
+                    }
+                }
+                if let Dialog::RoutingSettings(d) = &mut self.dialog {
+                    d.nested = RoutingNested::ImportPaste {
+                        text: String::new(),
+                    };
+                }
+                cx.notify();
+            }
+            RoutingSideEffect::ImportText(text) => {
+                let _ = self.try_import_route_text(&text, false, cx);
+                cx.notify();
+            }
+            RoutingSideEffect::UpdateRemotes(profiles) => {
+                self.update_remote_routes(profiles, cx);
+            }
+            RoutingSideEffect::FetchRemote { url, apply } => {
+                self.fetch_remote_into_editor(url, apply, cx);
+            }
+            RoutingSideEffect::WarpGenerate => {
+                if let Dialog::RoutingSettings(d) = &mut self.dialog {
+                    d.nested = RoutingNested::Notice {
+                        title: "Generate Warp Config".into(),
+                        body: "WARP auto-generate needs a running core (GenWgKeyPair). \
+                               Start the proxy first, or fill Endpoint / keys manually."
+                            .into(),
+                    };
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    fn commit_routing_settings(&mut self, cx: &mut Context<Self>) {
+        let Dialog::RoutingSettings(draft) = &self.dialog else {
+            return;
+        };
+        // Validate DNS hijack rules
+        let rules_text = draft.dns_rules_text();
+        if !crate::ui::routing::RoutingDraft::validate_dns_rules(&rules_text) {
+            if let Dialog::RoutingSettings(d) = &mut self.dialog {
+                d.nested = RoutingNested::Notice {
+                    title: "Invalid settings".into(),
+                    body: "DNS Rules are not valid".into(),
+                };
+            }
+            cx.notify();
+            return;
+        }
+        if draft.routes.is_empty() {
+            if let Dialog::RoutingSettings(d) = &mut self.dialog {
+                d.nested = RoutingNested::Notice {
+                    title: "Invalid settings".into(),
+                    body: "Routing profile cannot be empty".into(),
+                };
+            }
+            cx.notify();
+            return;
+        }
+        let routes = draft.routes.clone();
+        let active_id = draft.active_id;
+        let mut settings = draft.settings.clone();
+        settings.current_route_id = active_id;
+        // Keep dns rules from text
+        settings.dns_server_rules = draft.settings.dns_server_rules.clone();
+
+        match self.state.commit_routes(routes, active_id) {
+            Ok(()) => {
+                self.state.apply_routing_dialog_settings(settings);
+                // re-sync active id after commit (ids may have been reassigned)
+                if let Some(id) = self.state.active_route().map(|r| r.id) {
+                    let _ = self.state.set_active_route(id);
+                }
+                self.close_dialog();
+                let _ = self.persist_db();
+                self.state.set_status_message("Routing settings saved");
+            }
+            Err(e) => {
+                if let Dialog::RoutingSettings(d) = &mut self.dialog {
+                    d.notice = e.to_string();
+                }
             }
         }
         cx.notify();
     }
 
-    fn fetch_remote_route(&mut self, cx: &mut Context<Self>) {
-        let (id, url) = match &self.dialog {
-            Dialog::RoutingSettings {
-                selected,
-                remote_url,
-                ..
-            } if *selected >= 0 && !remote_url.trim().is_empty() => (*selected, remote_url.clone()),
-            _ => {
-                self.state
-                    .set_status_message("Set a remote URL on the route first");
-                cx.notify();
-                return;
+    /// Import route text into the open routing draft. Returns true if handled.
+    fn try_import_route_text(
+        &mut self,
+        text: &str,
+        from_clipboard: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let report = match throne_import::try_import_routes(text) {
+            Some(r) => r,
+            None => {
+                let r = throne_import::import_route_payload(text);
+                if r.routes.is_empty() {
+                    if !from_clipboard {
+                        if let Dialog::RoutingSettings(d) = &mut self.dialog {
+                            d.nested = RoutingNested::Notice {
+                                title: "Invalid input".into(),
+                                body: format!(
+                                    "Could not import this routing profile:\n{}",
+                                    r.errors.join("; ")
+                                ),
+                            };
+                        }
+                        cx.notify();
+                    }
+                    return false;
+                }
+                r
             }
         };
+        if report.routes.is_empty() {
+            if !from_clipboard {
+                if let Dialog::RoutingSettings(d) = &mut self.dialog {
+                    d.nested = RoutingNested::Notice {
+                        title: "Invalid input".into(),
+                        body: format!(
+                            "Could not import this routing profile:\n{}",
+                            report.errors.join("; ")
+                        ),
+                    };
+                }
+                cx.notify();
+            }
+            return false;
+        }
+
+        let is_remote_link = text.contains("remoteRoute")
+            || report.notes.iter().any(|n| n.contains("remoteRoute"));
+        if is_remote_link && report.routes.iter().all(|r| r.is_remote) {
+            let mut to_update = Vec::new();
+            if let Dialog::RoutingSettings(d) = &mut self.dialog {
+                for mut p in report.routes {
+                    p.id = -1;
+                    d.routes.push(p.clone());
+                    to_update.push(p);
+                }
+                d.selected_idx = d.routes.len().saturating_sub(1);
+                d.nested = RoutingNested::None;
+                d.notice = format!("Added {} remote profile(s)", to_update.len());
+            }
+            cx.notify();
+            self.update_remote_routes(to_update, cx);
+            return true;
+        }
+
+        let was_legacy = report.notes.iter().any(|n| n.contains("legacy"));
+        if let Dialog::RoutingSettings(d) = &mut self.dialog {
+            let name = report.routes[0].name.clone();
+            d.apply_imported_profile(report.routes[0].clone(), was_legacy);
+            if from_clipboard {
+                d.notice = if was_legacy {
+                    "Imported routing rule list from clipboard".into()
+                } else {
+                    format!("Imported «{name}» from clipboard")
+                };
+            }
+            if !report.warnings.is_empty() {
+                d.notice = report.warnings.join("; ");
+            }
+        }
+        cx.notify();
+        true
+    }
+
+    fn update_remote_routes(
+        &mut self,
+        profiles: Vec<throne_domain::RouteProfile>,
+        cx: &mut Context<Self>,
+    ) {
         if self.background_busy {
-            self.state.set_status_message("Busy — wait for current job");
+            if let Dialog::RoutingSettings(d) = &mut self.dialog {
+                d.notice = "Busy — wait for current job".into();
+            }
+            cx.notify();
+            return;
+        }
+        if profiles.is_empty() {
+            return;
+        }
+        self.background_busy = true;
+        let total = profiles.len();
+        if let Dialog::RoutingSettings(d) = &mut self.dialog {
+            d.notice = if total <= 1 {
+                "Updating...".into()
+            } else {
+                format!("Updating (1 / {total})")
+            };
+        }
+        cx.notify();
+
+        let jobs: Vec<(i64, String, String)> = profiles
+            .into_iter()
+            .map(|p| (p.id, p.remote_url.clone(), p.name.clone()))
+            .collect();
+
+        cx.spawn(async move |this, cx| {
+            let mut updated = Vec::new();
+            let mut failures = Vec::new();
+            for (i, (id, url, name)) in jobs.into_iter().enumerate() {
+                let current = i + 1;
+                this.update(cx, |this, cx| {
+                    if let Dialog::RoutingSettings(d) = &mut this.dialog {
+                        d.notice = if total <= 1 {
+                            "Updating...".into()
+                        } else {
+                            format!("Updating ({current} / {total})")
+                        };
+                    }
+                    cx.notify();
+                })
+                .ok();
+                let url_for_match = url.clone();
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let body = throne_import::fetch_url(&url)?;
+                        fetch_route_from_body(&body)
+                    })
+                    .await;
+                match result {
+                    Ok(r) => updated.push((id, r, url_for_match)),
+                    Err(e) => failures.push(format!("{name}: {e}")),
+                }
+            }
+            this.update(cx, |this, cx| {
+                this.background_busy = false;
+                if let Dialog::RoutingSettings(d) = &mut this.dialog {
+                    d.apply_remote_update_results(updated.clone());
+                    d.notice = if failures.is_empty() {
+                        format!("Updated {} remote routing profile(s).", updated.len())
+                    } else {
+                        format!(
+                            "Updated {}, failed {}:\n{}",
+                            updated.len(),
+                            failures.len(),
+                            failures.join("\n")
+                        )
+                    };
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn fetch_remote_into_editor(&mut self, url: String, apply: bool, cx: &mut Context<Self>) {
+        if self.background_busy {
+            if let Dialog::RoutingSettings(d) = &mut self.dialog {
+                d.notice = "Busy — wait for current job".into();
+            }
             cx.notify();
             return;
         }
         self.background_busy = true;
-        self.state
-            .set_status_message(format!("Fetching route · {url} …"));
+        if let Dialog::RoutingSettings(d) = &mut self.dialog {
+            d.notice = format!("Fetching {url} …");
+        }
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let body = throne_import::fetch_url(&url).map_err(|e| e)?;
-                    let report = throne_import::import_text(&body);
-                    if report.routes.is_empty() {
-                        // Try as route share JSON specifically
-                        if let Some(rr) = throne_import::try_import_routes(&body) {
-                            if rr.routes.is_empty() {
-                                return Err(format!(
-                                    "no route profile in body ({})",
-                                    rr.errors.join("; ")
-                                ));
-                            }
-                            return Ok(rr.routes);
-                        }
-                        return Err(if report.errors.is_empty() {
-                            "fetched body is not a route profile".into()
-                        } else {
-                            report.errors.join("; ")
-                        });
-                    }
-                    Ok(report.routes)
+                    let body = throne_import::fetch_url(&url)?;
+                    fetch_route_from_body(&body)
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.background_busy = false;
                 match result {
-                    Ok(routes) => {
-                        if let Some(r) = routes.into_iter().next() {
-                            match this.state.replace_route_content(id, r) {
-                                Ok(()) => {
-                                    // refresh dialog fields
-                                    this.dialog = Dialog::routing_from_state(&this.state);
-                                    if let Dialog::RoutingSettings { selected, .. } =
-                                        &mut this.dialog
-                                    {
-                                        *selected = id;
-                                    }
-                                    let _ = this.persist_db();
-                                    this.state.set_status_message("Remote route fetched");
-                                }
-                                Err(e) => this.state.set_status_message(e.to_string()),
-                            }
+                    Ok(r) => {
+                        if let Dialog::RoutingSettings(d) = &mut this.dialog {
+                            d.apply_remote_fetch_to_editor(r, apply);
                         }
                     }
-                    Err(e) => this
-                        .state
-                        .set_status_message(format!("Route fetch failed: {e}")),
+                    Err(e) => {
+                        if let Dialog::RoutingSettings(d) = &mut this.dialog {
+                            d.notice = format!("Route fetch failed: {e}");
+                        }
+                    }
                 }
                 cx.notify();
             })
@@ -1393,7 +1610,19 @@ impl MainWindow {
     }
 
     fn set_vpn(&mut self, on: bool, cx: &mut Context<Self>) {
-        // Upstream set_spmode_vpn: request elevation before enabling Tun.
+        // Upstream `MainWindow::set_spmode_vpn`:
+        //   if (enable == spmode_vpn) return;
+        //   if (enable) {
+        //     if (!IsAdmin()) {
+        //       if (!get_elevated_permissions()) { refresh_status(); return; }
+        //     }
+        //   }
+        //   spmode_vpn = enable;
+        //   if (started_id >= 0) profile_start(...);
+        if on == self.state.settings().tun_mode_enabled {
+            return;
+        }
+
         if on {
             let core = Arc::clone(&self.core);
             self.state
@@ -1405,6 +1634,7 @@ impl MainWindow {
                         let mut guard = core
                             .lock()
                             .map_err(|e| format!("core lock poisoned: {e}"))?;
+                        // IsAdmin || get_elevated_permissions
                         guard
                             .request_tun_privileges_for_toggle()
                             .map_err(|e| e.to_string())
@@ -1415,30 +1645,25 @@ impl MainWindow {
                         Ok(true) => {
                             this.state.set_spmode_vpn(true);
                             let _ = this.persist_db();
-                            this.state
-                                .set_status_message("Tun Mode enabled (core privileged)");
-                            // Upstream restarts running profile when Tun toggles.
+                            this.state.set_status_message("Tun Mode enabled");
+                            // Upstream: if started_id >= 0 → profile_start
                             if this.state.core_status().is_running() {
                                 this.start_proxy(cx);
                             }
                         }
                         Ok(false) => {
-                            // Reserved — elevation paths return Ok(true) or Err.
+                            // Should not happen — gate returns Ok(true) or Err.
                             this.state.set_spmode_vpn(false);
                             let _ = this.persist_db();
-                            this.state.set_status_message(
-                                "Tun elevation pending — complete the admin prompt, then enable again",
-                            );
                         }
                         Err(e) => {
+                            // Upstream: get_elevated_permissions failed → leave Tun off.
                             this.state.set_spmode_vpn(false);
                             let _ = this.persist_db();
-                            // Strip noisy "tun privilege required: " prefix for status bar.
                             let msg = e
                                 .strip_prefix("tun privilege required: ")
                                 .unwrap_or(&e);
-                            this.state
-                                .set_status_message(format!("Tun privileges: {msg}"));
+                            this.state.set_status_message(msg.to_string());
                         }
                     }
                     cx.notify();
@@ -1453,7 +1678,6 @@ impl MainWindow {
         let _ = self.persist_db();
         self.state.set_status_message("Tun Mode disabled");
         if self.state.core_status().is_running() {
-            // Rebuild config without Tun inbound.
             self.start_proxy(cx);
         }
         cx.notify();
@@ -1671,8 +1895,13 @@ impl MainWindow {
             key.chars().next().filter(|c| !c.is_control())
         } else if key == "space" {
             Some(' ')
-        } else if key == "enter" && matches!(self.dialog, Dialog::AddFromInput { .. }) {
-            // allow newlines in add-from-input
+        } else if key == "enter"
+            && matches!(
+                self.dialog,
+                Dialog::AddFromInput { .. } | Dialog::RoutingSettings(_)
+            )
+        {
+            // allow newlines in multi-line dialogs
             Some('\n')
         } else if key == "enter" && matches!(self.dialog, Dialog::EditProfile { .. }) {
             self.save_edit_profile(cx);
@@ -1749,20 +1978,8 @@ impl MainWindow {
                 cx.notify();
                 true
             }
-            Dialog::RoutingSettings {
-                name,
-                remote_url,
-                focus,
-                ..
-            } => {
-                let field = if *focus == 0 { name } else { remote_url };
-                if is_back {
-                    field.pop();
-                } else if let Some(c) = ch {
-                    if c != '\n' {
-                        field.push(c);
-                    }
-                }
+            Dialog::RoutingSettings(draft) => {
+                draft.handle_key(ch, is_back);
                 cx.notify();
                 true
             }
@@ -2405,111 +2622,11 @@ impl MainWindow {
                 )
                 .into_any_element()
             }
-            Dialog::RoutingSettings {
-                selected,
-                name,
-                remote_url,
-                auto_update,
-                default_outbound,
-                focus,
-            } => {
-                let e_close = entity.clone();
-                let e_sel = entity.clone();
-                let e_focus = entity.clone();
-                let e_auto = entity.clone();
-                let e_out = entity.clone();
-                let e_fetch = entity.clone();
-                let e_save = entity.clone();
-                let e_cancel = entity.clone();
-                modal_shell(
-                    "Routing Settings",
-                    routing_settings_body(
-                        &self.state,
-                        *selected,
-                        name,
-                        remote_url,
-                        *auto_update,
-                        *default_outbound,
-                        *focus,
-                        move |id, _, cx| {
-                            e_sel.update(cx, |t, cx| {
-                                if let Some(r) = t.state.active_route().filter(|x| x.id == id) {
-                                    let _ = r;
-                                }
-                                if let Some(r) = t.state.all_routes().into_iter().find(|x| x.id == id)
-                                {
-                                    let name = r.name.clone();
-                                    let remote_url = r.remote_url.clone();
-                                    let auto_update = r.auto_update;
-                                    let default_outbound = r.default_outbound;
-                                    if let Dialog::RoutingSettings {
-                                        selected,
-                                        name: n,
-                                        remote_url: u,
-                                        auto_update: a,
-                                        default_outbound: d,
-                                        focus,
-                                    } = &mut t.dialog
-                                    {
-                                        *selected = id;
-                                        *n = name;
-                                        *u = remote_url;
-                                        *a = auto_update;
-                                        *d = default_outbound;
-                                        *focus = 0;
-                                    }
-                                    let _ = t.state.set_active_route(id);
-                                }
-                                cx.notify();
-                            });
-                        },
-                        move |idx, _, cx| {
-                            e_focus.update(cx, |t, cx| {
-                                if let Dialog::RoutingSettings { focus, .. } = &mut t.dialog {
-                                    *focus = idx;
-                                }
-                                cx.notify();
-                            });
-                        },
-                        move |_, cx| {
-                            e_auto.update(cx, |t, cx| {
-                                if let Dialog::RoutingSettings { auto_update, .. } = &mut t.dialog {
-                                    *auto_update = !*auto_update;
-                                }
-                                cx.notify();
-                            });
-                        },
-                        move |_, cx| {
-                            e_out.update(cx, |t, cx| {
-                                if let Dialog::RoutingSettings {
-                                    default_outbound, ..
-                                } = &mut t.dialog
-                                {
-                                    *default_outbound = default_outbound.cycle_builtin();
-                                }
-                                cx.notify();
-                            });
-                        },
-                        move |_, cx| {
-                            e_fetch.update(cx, |t, cx| t.fetch_remote_route(cx));
-                        },
-                        move |_, cx| {
-                            e_save.update(cx, |t, cx| t.save_routing_settings(cx));
-                        },
-                        move |_, cx| {
-                            e_cancel.update(cx, |t, cx| {
-                                t.close_dialog();
-                                cx.notify();
-                            });
-                        },
-                    ),
-                    move |_, _, cx| {
-                        e_close.update(cx, |t, cx| {
-                            t.close_dialog();
-                            cx.notify();
-                        });
-                    },
-                )
+            Dialog::RoutingSettings(draft) => {
+                let e = entity.clone();
+                routing_settings_view(draft, move |ev, _, cx| {
+                    e.update(cx, |t, cx| t.handle_routing_event(ev, cx));
+                })
                 .into_any_element()
             }
             Dialog::TunSettings {
@@ -3285,6 +3402,33 @@ fn load_initial_state() -> (AppState, String) {
             (s, String::new())
         }
     }
+}
+
+/// Parse a fetched HTTP body into a single route profile.
+fn fetch_route_from_body(body: &str) -> Result<throne_domain::RouteProfile, String> {
+    if let Some(rr) = throne_import::try_import_routes(body) {
+        if let Some(r) = rr.routes.into_iter().next() {
+            return Ok(r);
+        }
+        if !rr.errors.is_empty() {
+            return Err(rr.errors.join("; "));
+        }
+    }
+    let rr = throne_import::import_route_payload(body);
+    if let Some(r) = rr.routes.into_iter().next() {
+        return Ok(r);
+    }
+    let report = throne_import::import_text(body);
+    if let Some(r) = report.routes.into_iter().next() {
+        return Ok(r);
+    }
+    let mut errs = rr.errors;
+    errs.extend(report.errors);
+    Err(if errs.is_empty() {
+        "fetched body is not a route profile".into()
+    } else {
+        errs.join("; ")
+    })
 }
 
 fn read_os_clipboard() -> Option<String> {

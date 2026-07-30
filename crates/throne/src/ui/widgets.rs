@@ -292,6 +292,17 @@ pub fn modal_shell(
     body: impl IntoElement,
     on_close: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
+    modal_shell_sized(title, body, px(520.), px(480.), on_close)
+}
+
+/// Sized modal chrome — used by larger dialogs (Routes ≈ 800×600 upstream).
+pub fn modal_shell_sized(
+    title: impl Into<SharedString>,
+    body: impl IntoElement,
+    width: gpui::Pixels,
+    max_height: gpui::Pixels,
+    on_close: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
     let on_close = std::rc::Rc::new(on_close);
     let on_close_bg = on_close.clone();
     let on_close_x = on_close;
@@ -321,8 +332,8 @@ pub fn modal_shell(
             div()
                 .id("modal-panel")
                 .relative()
-                .w(px(520.))
-                .max_h(px(480.))
+                .w(width)
+                .max_h(max_height)
                 .flex()
                 .flex_col()
                 .bg(Theme::bg_elevated())

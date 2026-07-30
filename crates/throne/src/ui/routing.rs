@@ -1,0 +1,2403 @@
+//! Routing Settings dialog — parity with upstream `DialogManageRoutes` +
+//! `RouteItem` / `RawRouteItem`.
+//!
+//! Tabs: Common · Hijack · Warp · DNS · Route  
+//! Route actions: New (structured/raw/remote) · Clone · Export · Import · Edit ·
+//! Delete · Update. Draft is committed only on OK.
+
+use std::rc::Rc;
+
+use gpui::{App, SharedString, Window, div, prelude::*, px};
+
+use throne_domain::{
+    AppSettings, AppState, DefaultOutbound, RouteProfile, RouteRule, SimpleAction,
+};
+
+use crate::theme::Theme;
+use crate::ui::widgets::{mode_checkbox, modal_shell_sized, primary_btn, secondary_btn};
+
+// ── Public draft types ──────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RoutingTab {
+    Common,
+    Hijack,
+    Warp,
+    Dns,
+    #[default]
+    Route,
+}
+
+impl RoutingTab {
+    pub const ALL: [Self; 5] = [
+        Self::Common,
+        Self::Hijack,
+        Self::Warp,
+        Self::Dns,
+        Self::Route,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Common => "Common",
+            Self::Hijack => "Hijack",
+            Self::Warp => "Warp",
+            Self::Dns => "DNS",
+            Self::Route => "Route",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RtFocus {
+    #[default]
+    None,
+    RemoteDns,
+    DirectDns,
+    LocalOverride,
+    DnsFinalOut,
+    CacheCap,
+    DnsObject,
+    DnsRules,
+    DnsV4,
+    DnsV6,
+    DnsPort,
+    RedirectAddr,
+    RedirectPort,
+    WarpEp,
+    WarpPriv,
+    WarpPub,
+    WarpAddrs,
+    WarpReserved,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RouteEditorTab {
+    #[default]
+    Basic,
+    Advanced,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ReFocus {
+    #[default]
+    Name,
+    RemoteUrl,
+    SimpleDirect,
+    SimpleProxy,
+    SimpleBlock,
+    SimpleWarp,
+    RuleName,
+    RuleProtocol,
+    RuleDomain,
+    RuleSuffix,
+    RuleIp,
+    RawJson,
+}
+
+#[derive(Clone, Debug)]
+pub struct RouteEditorDraft {
+    pub edit_idx: Option<usize>,
+    pub profile: RouteProfile,
+    pub tab: RouteEditorTab,
+    pub simple_direct: String,
+    pub simple_proxy: String,
+    pub simple_block: String,
+    pub simple_warp: String,
+    pub focus: ReFocus,
+    pub selected_rule: Option<usize>,
+}
+
+impl RouteEditorDraft {
+    pub fn from_profile(edit_idx: Option<usize>, mut profile: RouteProfile) -> Self {
+        profile.ensure_default_dns_hijack();
+        Self {
+            edit_idx,
+            simple_direct: profile.simple_rules_text(SimpleAction::Bypass),
+            simple_proxy: profile.simple_rules_text(SimpleAction::Proxy),
+            simple_block: profile.simple_rules_text(SimpleAction::Block),
+            simple_warp: profile.simple_rules_text(SimpleAction::WarpBypass),
+            profile,
+            tab: RouteEditorTab::Basic,
+            focus: ReFocus::Name,
+            selected_rule: None,
+        }
+    }
+
+    pub fn apply_simple_to_profile(&mut self) -> String {
+        let mut err = String::new();
+        err += &self
+            .profile
+            .update_simple_rules(&self.simple_direct, SimpleAction::Bypass);
+        err += &self
+            .profile
+            .update_simple_rules(&self.simple_proxy, SimpleAction::Proxy);
+        err += &self
+            .profile
+            .update_simple_rules(&self.simple_block, SimpleAction::Block);
+        err += &self
+            .profile
+            .update_simple_rules(&self.simple_warp, SimpleAction::WarpBypass);
+        err
+    }
+
+    pub fn reload_simple_from_profile(&mut self) {
+        self.simple_direct = self.profile.simple_rules_text(SimpleAction::Bypass);
+        self.simple_proxy = self.profile.simple_rules_text(SimpleAction::Proxy);
+        self.simple_block = self.profile.simple_rules_text(SimpleAction::Block);
+        self.simple_warp = self.profile.simple_rules_text(SimpleAction::WarpBypass);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RawEditorDraft {
+    pub edit_idx: Option<usize>,
+    pub name: String,
+    pub raw_route: String,
+    pub prevent_modifications: bool,
+    pub focus: ReFocus,
+}
+
+impl RawEditorDraft {
+    pub fn from_profile(edit_idx: Option<usize>, p: &RouteProfile) -> Self {
+        Self {
+            edit_idx,
+            name: p.name.clone(),
+            raw_route: if p.raw_route.trim().is_empty() {
+                "{\n  \"rules\": []\n}".into()
+            } else {
+                p.raw_route.clone()
+            },
+            prevent_modifications: p.prevent_modifications,
+            focus: ReFocus::Name,
+        }
+    }
+
+    pub fn into_profile(self, id: i64) -> RouteProfile {
+        let mut p = RouteProfile::new(id, self.name);
+        p.is_raw = true;
+        p.raw_route = self.raw_route;
+        p.prevent_modifications = self.prevent_modifications;
+        p
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub enum RoutingNested {
+    #[default]
+    None,
+    NewMenu,
+    UpdateMenu {
+        sel_is_remote: bool,
+    },
+    ImportPaste {
+        text: String,
+    },
+    RouteEditor(RouteEditorDraft),
+    RawEditor(RawEditorDraft),
+    Notice {
+        title: String,
+        body: String,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct RoutingDraft {
+    pub tab: RoutingTab,
+    pub routes: Vec<RouteProfile>,
+    pub selected_idx: usize,
+    pub active_id: i64,
+    pub settings: AppSettings,
+    pub focus: RtFocus,
+    pub nested: RoutingNested,
+    pub notice: String,
+}
+
+impl RoutingDraft {
+    pub fn from_state(state: &AppState) -> Self {
+        let routes: Vec<RouteProfile> = state.all_routes().into_iter().cloned().collect();
+        let active_id = state
+            .active_route()
+            .map(|r| r.id)
+            .or_else(|| routes.first().map(|r| r.id))
+            .unwrap_or(-1);
+        let selected_idx = routes.iter().position(|r| r.id == active_id).unwrap_or(0);
+        Self {
+            tab: RoutingTab::Route,
+            routes,
+            selected_idx,
+            active_id,
+            settings: state.settings().clone(),
+            focus: RtFocus::None,
+            nested: RoutingNested::None,
+            notice: String::new(),
+        }
+    }
+
+    pub fn selected(&self) -> Option<&RouteProfile> {
+        self.routes.get(self.selected_idx)
+    }
+
+    pub fn validate_dns_rules(raw: &str) -> bool {
+        for rule in raw.lines() {
+            let t = rule.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if !(t.starts_with("ruleset:")
+                || t.starts_with("domain:")
+                || t.starts_with("suffix:")
+                || t.starts_with("regex:"))
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn dns_rules_text(&self) -> String {
+        self.settings.dns_server_rules.join("\n")
+    }
+
+    pub fn set_dns_rules_from_text(&mut self, text: &str) {
+        self.settings.dns_server_rules = text
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+    }
+
+    /// Apply keystroke into the focused field. Returns true if handled.
+    pub fn handle_key(&mut self, ch: Option<char>, is_back: bool) -> bool {
+        // Nested editors first
+        match &mut self.nested {
+            RoutingNested::ImportPaste { text } => {
+                edit_str(text, ch, is_back, true);
+                return true;
+            }
+            RoutingNested::RouteEditor(ed) => {
+                let field: &mut String = match ed.focus {
+                    ReFocus::Name => &mut ed.profile.name,
+                    ReFocus::RemoteUrl => &mut ed.profile.remote_url,
+                    ReFocus::SimpleDirect => &mut ed.simple_direct,
+                    ReFocus::SimpleProxy => &mut ed.simple_proxy,
+                    ReFocus::SimpleBlock => &mut ed.simple_block,
+                    ReFocus::SimpleWarp => &mut ed.simple_warp,
+                    ReFocus::RuleName => {
+                        if let Some(i) = ed.selected_rule {
+                            if let Some(r) = ed.profile.rules.get_mut(i) {
+                                edit_str(&mut r.name, ch, is_back, false);
+                            }
+                        }
+                        return true;
+                    }
+                    ReFocus::RuleProtocol => {
+                        if let Some(i) = ed.selected_rule {
+                            if let Some(r) = ed.profile.rules.get_mut(i) {
+                                edit_str(&mut r.protocol, ch, is_back, false);
+                            }
+                        }
+                        return true;
+                    }
+                    ReFocus::RuleDomain => {
+                        return edit_rule_list_field(ed, |r| &mut r.domain, ch, is_back);
+                    }
+                    ReFocus::RuleSuffix => {
+                        return edit_rule_list_field(ed, |r| &mut r.domain_suffix, ch, is_back);
+                    }
+                    ReFocus::RuleIp => {
+                        return edit_rule_list_field(ed, |r| &mut r.ip_cidr, ch, is_back);
+                    }
+                    ReFocus::RawJson => return true,
+                };
+                let allow_nl = matches!(
+                    ed.focus,
+                    ReFocus::SimpleDirect
+                        | ReFocus::SimpleProxy
+                        | ReFocus::SimpleBlock
+                        | ReFocus::SimpleWarp
+                );
+                edit_str(field, ch, is_back, allow_nl);
+                return true;
+            }
+            RoutingNested::RawEditor(ed) => {
+                let field = match ed.focus {
+                    ReFocus::Name => &mut ed.name,
+                    _ => &mut ed.raw_route,
+                };
+                let allow_nl = !matches!(ed.focus, ReFocus::Name);
+                edit_str(field, ch, is_back, allow_nl);
+                return true;
+            }
+            RoutingNested::NewMenu
+            | RoutingNested::UpdateMenu { .. }
+            | RoutingNested::Notice { .. }
+            | RoutingNested::None => {}
+        }
+
+        let s = &mut self.settings;
+        let field: Option<(&mut String, bool)> = match self.focus {
+            RtFocus::RemoteDns => Some((&mut s.remote_dns, false)),
+            RtFocus::DirectDns => Some((&mut s.direct_dns, false)),
+            RtFocus::LocalOverride => Some((&mut s.core_box_underlying_dns, false)),
+            RtFocus::DnsFinalOut => Some((&mut s.dns_final_out, false)),
+            RtFocus::CacheCap => {
+                return edit_i32_field(&mut s.dns_cache_capacity, ch, is_back);
+            }
+            RtFocus::DnsObject => Some((&mut s.dns_object, true)),
+            RtFocus::DnsV4 => Some((&mut s.dns_v4_resp, false)),
+            RtFocus::DnsV6 => Some((&mut s.dns_v6_resp, false)),
+            RtFocus::DnsPort => {
+                return edit_i32_field(&mut s.dns_server_listen_port, ch, is_back);
+            }
+            RtFocus::RedirectAddr => Some((&mut s.redirect_listen_address, false)),
+            RtFocus::RedirectPort => {
+                return edit_i32_field(&mut s.redirect_listen_port, ch, is_back);
+            }
+            RtFocus::WarpEp => Some((&mut s.warp_ep, false)),
+            RtFocus::WarpPriv => Some((&mut s.warp_private_key, false)),
+            RtFocus::WarpPub => Some((&mut s.warp_public_key, false)),
+            RtFocus::WarpAddrs => {
+                let mut joined = s.warp_ifc_addrs.join(",");
+                edit_str(&mut joined, ch, is_back, false);
+                s.warp_ifc_addrs = split_csv(&joined);
+                return true;
+            }
+            RtFocus::WarpReserved => {
+                let mut joined = s.warp_reserved.join(",");
+                edit_str(&mut joined, ch, is_back, false);
+                s.warp_reserved = split_csv(&joined);
+                return true;
+            }
+            RtFocus::DnsRules => {
+                let mut t = self.dns_rules_text();
+                edit_str(&mut t, ch, is_back, true);
+                self.set_dns_rules_from_text(&t);
+                return true;
+            }
+            RtFocus::None => None,
+        };
+        if let Some((f, nl)) = field {
+            edit_str(f, ch, is_back, nl);
+            return true;
+        }
+        // swallow keys while dialog open
+        true
+    }
+}
+
+fn edit_str(s: &mut String, ch: Option<char>, is_back: bool, allow_nl: bool) {
+    if is_back {
+        s.pop();
+    } else if let Some(c) = ch {
+        if c == '\n' && !allow_nl {
+            return;
+        }
+        s.push(c);
+    }
+}
+
+fn edit_i32_field(n: &mut i32, ch: Option<char>, is_back: bool) -> bool {
+    let mut s = n.to_string();
+    if is_back {
+        s.pop();
+    } else if let Some(c) = ch {
+        if c.is_ascii_digit() {
+            s.push(c);
+        }
+    }
+    *n = s.parse().unwrap_or(0);
+    true
+}
+
+fn split_csv(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .collect()
+}
+
+fn edit_rule_list_field(
+    ed: &mut RouteEditorDraft,
+    get: impl FnOnce(&mut RouteRule) -> &mut Vec<String>,
+    ch: Option<char>,
+    is_back: bool,
+) -> bool {
+    let Some(i) = ed.selected_rule else {
+        return true;
+    };
+    let Some(rule) = ed.profile.rules.get_mut(i) else {
+        return true;
+    };
+    let list = get(rule);
+    let mut t = list.join("\n");
+    edit_str(&mut t, ch, is_back, true);
+    *list = t
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    true
+}
+
+// ── Cycle helpers ───────────────────────────────────────────────────────────
+
+const STRATEGIES: &[&str] = &["", "prefer_ipv4", "prefer_ipv6", "ipv4_only", "ipv6_only"];
+
+pub fn cycle_strategy(cur: &str) -> String {
+    let i = STRATEGIES.iter().position(|s| *s == cur).unwrap_or(0);
+    STRATEGIES[(i + 1) % STRATEGIES.len()].to_string()
+}
+
+fn strategy_label(s: &str) -> String {
+    if s.is_empty() {
+        "(default)".into()
+    } else {
+        s.into()
+    }
+}
+
+// ── UI builders ─────────────────────────────────────────────────────────────
+
+type ClickFn = Rc<dyn Fn(&mut Window, &mut App)>;
+
+fn field_row(
+    id: impl Into<SharedString>,
+    label: &'static str,
+    value: String,
+    focused: bool,
+    on_focus: ClickFn,
+) -> impl IntoElement {
+    div()
+        .id(id.into())
+        .flex()
+        .items_center()
+        .gap_3()
+        .mb_1p5()
+        .cursor_pointer()
+        .on_click(move |_, w, cx| on_focus(w, cx))
+        .child(
+            div()
+                .w(px(140.))
+                .text_xs()
+                .text_color(Theme::text_muted())
+                .child(label),
+        )
+        .child(
+            div()
+                .flex_1()
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(if focused {
+                    Theme::accent()
+                } else {
+                    Theme::border_light()
+                })
+                .bg(Theme::bg_app())
+                .text_sm()
+                .text_color(Theme::text())
+                .child(if focused {
+                    if value.is_empty() {
+                        "▌".into()
+                    } else {
+                        format!("{value}▌")
+                    }
+                } else if value.is_empty() {
+                    "…".into()
+                } else {
+                    value
+                }),
+        )
+}
+
+fn multi_field(
+    id: impl Into<SharedString>,
+    label: &'static str,
+    value: &str,
+    focused: bool,
+    h: f32,
+    on_focus: ClickFn,
+) -> impl IntoElement {
+    let id: SharedString = id.into();
+    let body_id = SharedString::from(format!("{id}-body"));
+    div()
+        .id(id)
+        .flex()
+        .flex_col()
+        .mb_2()
+        .cursor_text()
+        .on_click(move |_, w, cx| on_focus(w, cx))
+        .child(
+            div()
+                .text_xs()
+                .text_color(Theme::text_muted())
+                .mb_1()
+                .child(label),
+        )
+        .child(
+            div()
+                .id(body_id)
+                .w_full()
+                .h(px(h))
+                .overflow_y_scroll()
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(if focused {
+                    Theme::accent()
+                } else {
+                    Theme::border_light()
+                })
+                .bg(Theme::bg_app())
+                .text_xs()
+                .font_family("Menlo")
+                .text_color(Theme::text())
+                .child(if focused {
+                    format!("{value}▌")
+                } else if value.is_empty() {
+                    "…".into()
+                } else {
+                    value.to_string()
+                }),
+        )
+}
+
+fn cycle_btn(
+    id: impl Into<SharedString>,
+    label: String,
+    on_click: ClickFn,
+) -> impl IntoElement {
+    div()
+        .id(id.into())
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .border_1()
+        .border_color(Theme::border_light())
+        .bg(Theme::bg_app())
+        .text_xs()
+        .cursor_pointer()
+        .child(label)
+        .on_click(move |_, w, cx| on_click(w, cx))
+}
+
+/// Full routing dialog (main + nested overlays).
+pub fn routing_settings_view(
+    draft: &RoutingDraft,
+    on_event: impl Fn(RoutingEvent, &mut Window, &mut App) + 'static + Clone,
+) -> impl IntoElement {
+    let on_event = Rc::new(on_event);
+    let main = build_main(draft, on_event.clone());
+    let nested = build_nested(draft, on_event.clone());
+
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .child(main)
+        .children(nested)
+}
+
+#[derive(Clone, Debug)]
+pub enum RoutingEvent {
+    Close,
+    Ok,
+    SetTab(RoutingTab),
+    SetFocus(RtFocus),
+    Toggle(&'static str),
+    Cycle(&'static str),
+    SelectRoute(usize),
+    SelectActive(i64),
+    /// Route list actions: new-menu, clone, export, import, edit, delete, update-menu, …
+    Action(&'static str),
+    NestedClose,
+    NestedAction(&'static str),
+    ReFocus(ReFocus),
+    ReTab(RouteEditorTab),
+    ReSelectRule(usize),
+    ReCycleDefOut,
+    ReCycleRuleOut,
+    ReToggle(&'static str),
+}
+
+fn emit(
+    on_event: &Rc<dyn Fn(RoutingEvent, &mut Window, &mut App)>,
+    ev: RoutingEvent,
+) -> ClickFn {
+    let on_event = on_event.clone();
+    Rc::new(move |w, cx| on_event(ev.clone(), w, cx))
+}
+
+fn build_main(
+    draft: &RoutingDraft,
+    on_event: Rc<dyn Fn(RoutingEvent, &mut Window, &mut App)>,
+) -> impl IntoElement {
+    let mut tabs = div().id("rt-tabs").flex().gap_1().mb_3().flex_wrap();
+    for t in RoutingTab::ALL {
+        let sel = draft.tab == t;
+        let on = emit(&on_event, RoutingEvent::SetTab(t));
+        tabs = tabs.child(
+            div()
+                .id(SharedString::from(format!("rt-tab-{}", t.label())))
+                .px_2p5()
+                .py_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(if sel {
+                    Theme::accent()
+                } else {
+                    Theme::border_light()
+                })
+                .bg(if sel {
+                    Theme::bg_selected()
+                } else {
+                    Theme::bg_app()
+                })
+                .text_color(if sel {
+                    Theme::text_on_selected()
+                } else {
+                    Theme::text()
+                })
+                .text_xs()
+                .cursor_pointer()
+                .child(t.label())
+                .on_click(move |_, w, cx| on(w, cx)),
+        );
+    }
+
+    let content = match draft.tab {
+        RoutingTab::Common => tab_common(draft, &on_event).into_any_element(),
+        RoutingTab::Hijack => tab_hijack(draft, &on_event).into_any_element(),
+        RoutingTab::Warp => tab_warp(draft, &on_event).into_any_element(),
+        RoutingTab::Dns => tab_dns(draft, &on_event).into_any_element(),
+        RoutingTab::Route => tab_route(draft, &on_event).into_any_element(),
+    };
+
+    let on_ok = emit(&on_event, RoutingEvent::Ok);
+    let on_cancel = emit(&on_event, RoutingEvent::Close);
+    let notice = draft.notice.clone();
+
+    modal_shell_sized(
+        "Routes",
+        div()
+            .flex()
+            .flex_col()
+            .child(tabs)
+            .child(
+                div()
+                    .id("rt-tab-body")
+                    .flex_1()
+                    .min_h(px(320.))
+                    .max_h(px(400.))
+                    .overflow_y_scroll()
+                    .child(content),
+            )
+            .when(!notice.is_empty(), |d| {
+                d.child(
+                    div()
+                        .mt_1()
+                        .text_xs()
+                        .text_color(Theme::accent())
+                        .child(notice),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .mt_3()
+                    .child(secondary_btn("rt-cancel", "Cancel", {
+                        let on_cancel = on_cancel.clone();
+                        move |_, w, cx| on_cancel(w, cx)
+                    }))
+                    .child(primary_btn("rt-ok", "OK", move |_, w, cx| on_ok(w, cx))),
+            ),
+        px(740.),
+        px(580.),
+        move |_, w, cx| on_cancel(w, cx),
+    )
+}
+
+fn tab_common(
+    draft: &RoutingDraft,
+    on_event: &Rc<dyn Fn(RoutingEvent, &mut Window, &mut App)>,
+) -> impl IntoElement {
+    let s = &draft.settings;
+    let f = draft.focus;
+
+    // Active route combo as clickable list of names
+    let mut route_combo = div().id("rt-active-list").flex().flex_col().gap_1().mb_3();
+    for r in &draft.routes {
+        let id = r.id;
+        let sel = draft.active_id == id;
+        let on = emit(on_event, RoutingEvent::SelectActive(id));
+        route_combo = route_combo.child(
+            div()
+                .id(SharedString::from(format!("rt-act-{id}")))
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .bg(if sel {
+                    Theme::bg_selected()
+                } else {
+                    Theme::bg_app()
+                })
+                .text_color(if sel {
+                    Theme::text_on_selected()
+                } else {
+                    Theme::text()
+                })
+                .text_sm()
+                .child(format!(
+                    "{}{}",
+                    if sel { "● " } else { "○ " },
+                    r.name
+                ))
+                .on_click(move |_, w, cx| on(w, cx)),
+        );
+    }
+
+    div()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .text_xs()
+                .text_color(Theme::text_muted())
+                .mb_2()
+                .child("Common — domain strategy, active profile, rule-set mirror"),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .mb_2()
+                .child(
+                    div()
+                        .w(px(140.))
+                        .text_xs()
+                        .text_color(Theme::text_muted())
+                        .child("Resolve Domain Strategy"),
+                )
+                .child(cycle_btn(
+                    "rt-resolve",
+                    strategy_label(&s.resolve_domain_strategy),
+                    emit(on_event, RoutingEvent::Cycle("resolve")),
+                )),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .mb_2()
+                .child(
+                    div()
+                        .w(px(140.))
+                        .text_xs()
+                        .text_color(Theme::text_muted())
+                        .child("Default Domain Strategy"),
+                )
+                .child(cycle_btn(
+                    "rt-def-strat",
+                    strategy_label(&s.default_domain_strategy),
+                    emit(on_event, RoutingEvent::Cycle("default_strategy")),
+                )),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(Theme::text_muted())
+                .mb_1()
+                .child("Routing Profile (active)"),
+        )
+        .child(route_combo)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .mb_2()
+                .child(
+                    div()
+                        .w(px(140.))
+                        .text_xs()
+                        .text_color(Theme::text_muted())
+                        .child("Remote Rule-set Mirror"),
+                )
+                .child(cycle_btn(
+                    "rt-mirror",
+                    s.ruleset_mirror.label().to_string(),
+                    emit(on_event, RoutingEvent::Cycle("mirror")),
+                )),
+        )
+        .child(div().text_xs().text_color(Theme::text_muted()).child(
+            "Tip: double-click a profile on the Route tab (or Edit) to open the rule editor.",
+        ))
+        // silence unused
+        .when(f == RtFocus::None, |d| d)
+}
+
+fn tab_hijack(
+    draft: &RoutingDraft,
+    on_event: &Rc<dyn Fn(RoutingEvent, &mut Window, &mut App)>,
+) -> impl IntoElement {
+    let s = &draft.settings;
+    let f = draft.focus;
+    let enabled = s.enable_dns_server;
+    div()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .text_xs()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .mb_2()
+                .child("DNS Server"),
+        )
+        .child(
+            div().mb_2().child(mode_checkbox(
+                "rt-dns-en",
+                "Enable",
+                s.enable_dns_server,
+                {
+                    let on = emit(on_event, RoutingEvent::Toggle("dns_server"));
+                    move |_, w, cx| on(w, cx)
+                },
+            )),
+        )
+        .child(
+            div().mb_2().child(mode_checkbox(
+                "rt-dns-lan",
+                "Allow Lan to Connect",
+                s.dns_server_listen_lan,
+                {
+                    let on = emit(on_event, RoutingEvent::Toggle("dns_lan"));
+                    move |_, w, cx| on(w, cx)
+                },
+            )),
+        )
+        .when(enabled, |d| {
+            d.child(field_row(
+                "rt-dns-port",
+                "Listen Port",
+                s.dns_server_listen_port.to_string(),
+                f == RtFocus::DnsPort,
+                emit(on_event, RoutingEvent::SetFocus(RtFocus::DnsPort)),
+            ))
+            .child(field_row(
+                "rt-dns-v4",
+                "IPv4 Response",
+                s.dns_v4_resp.clone(),
+                f == RtFocus::DnsV4,
+                emit(on_event, RoutingEvent::SetFocus(RtFocus::DnsV4)),
+            ))
+            .child(field_row(
+                "rt-dns-v6",
+                "IPv6 Response",
+                s.dns_v6_resp.clone(),
+                f == RtFocus::DnsV6,
+                emit(on_event, RoutingEvent::SetFocus(RtFocus::DnsV6)),
+            ))
+            .child(multi_field(
+                "rt-dns-rules",
+                "Rules (domain: / suffix: / regex: / ruleset:)",
+                &draft.dns_rules_text(),
+                f == RtFocus::DnsRules,
+                80.,
+                emit(on_event, RoutingEvent::SetFocus(RtFocus::DnsRules)),
+            ))
+        })
+        .child(
+            div()
+                .text_xs()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .mt_3()
+                .mb_2()
+                .child("Redirect Settings"),
+        )
+        .child(
+            div().mb_2().child(mode_checkbox(
+                "rt-redir-en",
+                "Enable",
+                s.enable_redirect,
+                {
+                    let on = emit(on_event, RoutingEvent::Toggle("redirect"));
+                    move |_, w, cx| on(w, cx)
+                },
+            )),
+        )
+        .when(s.enable_redirect, |d| {
+            d.child(field_row(
+                "rt-redir-addr",
+                "Listen Address",
+                s.redirect_listen_address.clone(),
+                f == RtFocus::RedirectAddr,
+                emit(on_event, RoutingEvent::SetFocus(RtFocus::RedirectAddr)),
+            ))
+            .child(field_row(
+                "rt-redir-port",
+                "Listen Port",
+                s.redirect_listen_port.to_string(),
+                f == RtFocus::RedirectPort,
+                emit(on_event, RoutingEvent::SetFocus(RtFocus::RedirectPort)),
+            ))
+        })
+}
+
+fn tab_warp(
+    draft: &RoutingDraft,
+    on_event: &Rc<dyn Fn(RoutingEvent, &mut Window, &mut App)>,
+) -> impl IntoElement {
+    let s = &draft.settings;
+    let f = draft.focus;
+    div()
+        .flex()
+        .flex_col()
+        .child(
+            div().mb_2().child(mode_checkbox(
+                "rt-warp-en",
+                "Enable Warp",
+                s.enable_warp,
+                {
+                    let on = emit(on_event, RoutingEvent::Toggle("warp"));
+                    move |_, w, cx| on(w, cx)
+                },
+            )),
+        )
+        .child(field_row(
+            "rt-warp-ep",
+            "Endpoint",
+            s.warp_ep.clone(),
+            f == RtFocus::WarpEp,
+            emit(on_event, RoutingEvent::SetFocus(RtFocus::WarpEp)),
+        ))
+        .child(field_row(
+            "rt-warp-priv",
+            "Private Key",
+            s.warp_private_key.clone(),
+            f == RtFocus::WarpPriv,
+            emit(on_event, RoutingEvent::SetFocus(RtFocus::WarpPriv)),
+        ))
+        .child(field_row(
+            "rt-warp-pub",
+            "Public Key",
+            s.warp_public_key.clone(),
+            f == RtFocus::WarpPub,
+            emit(on_event, RoutingEvent::SetFocus(RtFocus::WarpPub)),
+        ))
+        .child(field_row(
+            "rt-warp-addr",
+            "Interface Addresses",
+            s.warp_ifc_addrs.join(","),
+            f == RtFocus::WarpAddrs,
+            emit(on_event, RoutingEvent::SetFocus(RtFocus::WarpAddrs)),
+        ))
+        .child(field_row(
+            "rt-warp-rsv",
+            "Reserved",
+            s.warp_reserved.join(","),
+            f == RtFocus::WarpReserved,
+            emit(on_event, RoutingEvent::SetFocus(RtFocus::WarpReserved)),
+        ))
+        .child(
+            div().mt_2().child(secondary_btn("rt-warp-gen", "Generate Warp Config", {
+                let on = emit(on_event, RoutingEvent::Action("warp-gen"));
+                move |_, w, cx| on(w, cx)
+            })),
+        )
+        .child(
+            div()
+                .mt_2()
+                .text_xs()
+                .text_color(Theme::text_muted())
+                .child(
+                    "Generate requires a running core (GenWgKeyPair RPC). Fill fields manually if offline.",
+                ),
+        )
+}
+
+fn tab_dns(
+    draft: &RoutingDraft,
+    on_event: &Rc<dyn Fn(RoutingEvent, &mut Window, &mut App)>,
+) -> impl IntoElement {
+    let s = &draft.settings;
+    let f = draft.focus;
+    let use_obj = s.use_dns_object;
+    div()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .text_xs()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .mb_2()
+                .child("Simple DNS Settings"),
+        )
+        .when(!use_obj, |d| {
+            d.child(field_row(
+                "rt-rdns",
+                "Remote DNS",
+                s.remote_dns.clone(),
+                f == RtFocus::RemoteDns,
+                emit(on_event, RoutingEvent::SetFocus(RtFocus::RemoteDns)),
+            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .mb_2()
+                    .child(
+                        div()
+                            .w(px(140.))
+                            .text_xs()
+                            .text_color(Theme::text_muted())
+                            .child("Remote Query Strategy"),
+                    )
+                    .child(cycle_btn(
+                        "rt-rdns-s",
+                        strategy_label(&s.remote_dns_strategy),
+                        emit(on_event, RoutingEvent::Cycle("remote_dns_strategy")),
+                    )),
+            )
+            .child(field_row(
+                "rt-ddns",
+                "Direct DNS",
+                s.direct_dns.clone(),
+                f == RtFocus::DirectDns,
+                emit(on_event, RoutingEvent::SetFocus(RtFocus::DirectDns)),
+            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .mb_2()
+                    .child(
+                        div()
+                            .w(px(140.))
+                            .text_xs()
+                            .text_color(Theme::text_muted())
+                            .child("Direct Query Strategy"),
+                    )
+                    .child(cycle_btn(
+                        "rt-ddns-s",
+                        strategy_label(&s.direct_dns_strategy),
+                        emit(on_event, RoutingEvent::Cycle("direct_dns_strategy")),
+                    )),
+            )
+            .child(field_row(
+                "rt-local",
+                "Local Override",
+                s.core_box_underlying_dns.clone(),
+                f == RtFocus::LocalOverride,
+                emit(on_event, RoutingEvent::SetFocus(RtFocus::LocalOverride)),
+            ))
+            .child(field_row(
+                "rt-final",
+                "Default DNS server",
+                s.dns_final_out.clone(),
+                f == RtFocus::DnsFinalOut,
+                emit(on_event, RoutingEvent::SetFocus(RtFocus::DnsFinalOut)),
+            ))
+            .child(
+                div()
+                    .flex()
+                    .gap_3()
+                    .mb_2()
+                    .child(mode_checkbox("rt-fakeip", "Enable FakeIP", s.fake_dns, {
+                        let on = emit(on_event, RoutingEvent::Toggle("fake_dns"));
+                        move |_, w, cx| on(w, cx)
+                    }))
+                    .child(mode_checkbox(
+                        "rt-dns-route",
+                        "Enable DNS Routing",
+                        s.enable_dns_routing,
+                        {
+                            let on = emit(on_event, RoutingEvent::Toggle("dns_routing"));
+                            move |_, w, cx| on(w, cx)
+                        },
+                    )),
+            )
+            .child(field_row(
+                "rt-cache",
+                "Cache Capacity",
+                s.dns_cache_capacity.to_string(),
+                f == RtFocus::CacheCap,
+                emit(on_event, RoutingEvent::SetFocus(RtFocus::CacheCap)),
+            ))
+            .child(
+                div()
+                    .flex()
+                    .gap_3()
+                    .mb_2()
+                    .flex_wrap()
+                    .child(mode_checkbox(
+                        "rt-dcache",
+                        "Disable Cache",
+                        s.dns_disable_cache,
+                        {
+                            let on = emit(on_event, RoutingEvent::Toggle("dns_disable_cache"));
+                            move |_, w, cx| on(w, cx)
+                        },
+                    ))
+                    .child(mode_checkbox(
+                        "rt-dexpire",
+                        "Disable Expire",
+                        s.dns_disable_expire,
+                        {
+                            let on = emit(on_event, RoutingEvent::Toggle("dns_disable_expire"));
+                            move |_, w, cx| on(w, cx)
+                        },
+                    ))
+                    .child(mode_checkbox(
+                        "rt-rmap",
+                        "Reverse Mapping",
+                        s.dns_reverse_mapping,
+                        {
+                            let on = emit(on_event, RoutingEvent::Toggle("dns_reverse_mapping"));
+                            move |_, w, cx| on(w, cx)
+                        },
+                    )),
+            )
+        })
+        .child(
+            div()
+                .text_xs()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .mt_2()
+                .mb_2()
+                .child("DNS Object Settings"),
+        )
+        .child(
+            div().mb_2().child(mode_checkbox(
+                "rt-use-obj",
+                "Use DNS Object",
+                s.use_dns_object,
+                {
+                    let on = emit(on_event, RoutingEvent::Toggle("use_dns_object"));
+                    move |_, w, cx| on(w, cx)
+                },
+            )),
+        )
+        .when(use_obj, |d| {
+            d.child(multi_field(
+                "rt-dns-obj",
+                "DNS Object (sing-box dns JSON)",
+                &s.dns_object,
+                f == RtFocus::DnsObject,
+                120.,
+                emit(on_event, RoutingEvent::SetFocus(RtFocus::DnsObject)),
+            ))
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(secondary_btn("rt-fmt", "Format", {
+                        let on = emit(on_event, RoutingEvent::Action("format-dns"));
+                        move |_, w, cx| on(w, cx)
+                    }))
+                    .child(secondary_btn("rt-doc", "Document", {
+                        let on = emit(on_event, RoutingEvent::Action("dns-doc"));
+                        move |_, w, cx| on(w, cx)
+                    })),
+            )
+        })
+}
+
+fn tab_route(
+    draft: &RoutingDraft,
+    on_event: &Rc<dyn Fn(RoutingEvent, &mut Window, &mut App)>,
+) -> impl IntoElement {
+    let mut list = div()
+        .id("rt-profiles")
+        .flex()
+        .flex_col()
+        .gap_1()
+        .mb_3()
+        .max_h(px(220.))
+        .overflow_y_scroll()
+        .border_1()
+        .border_color(Theme::border_light())
+        .rounded_sm()
+        .p_1();
+
+    for (i, r) in draft.routes.iter().enumerate() {
+        let sel = draft.selected_idx == i;
+        let on = emit(on_event, RoutingEvent::SelectRoute(i));
+        let on_edit = emit(on_event, RoutingEvent::Action("edit"));
+        let active = r.id == draft.active_id;
+        list = list.child(
+            div()
+                .id(SharedString::from(format!("rt-p-{i}")))
+                .px_2()
+                .py_1p5()
+                .rounded_sm()
+                .cursor_pointer()
+                .bg(if sel {
+                    Theme::bg_selected()
+                } else {
+                    Theme::bg_app()
+                })
+                .text_color(if sel {
+                    Theme::text_on_selected()
+                } else {
+                    Theme::text()
+                })
+                .text_sm()
+                .child(format!(
+                    "{}{}{}",
+                    if sel { "● " } else { "○ " },
+                    r.summary(),
+                    if active { "  ← active" } else { "" }
+                ))
+                .on_click(move |_, w, cx| on(w, cx))
+                .on_click(move |_, w, cx| {
+                    // double-click isn't available; single select. Edit via button.
+                    let _ = (&on_edit, w, cx);
+                }),
+        );
+    }
+
+    let btn = |id: &'static str, label: &'static str, action: &'static str| {
+        let on = emit(on_event, RoutingEvent::Action(action));
+        secondary_btn(id, label, move |_, w, cx| on(w, cx))
+    };
+
+    div()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .text_xs()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .mb_2()
+                .child("Routing Profiles"),
+        )
+        .child(list)
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .child(btn("rt-new", "New", "new-menu"))
+                .child(btn("rt-clone", "Clone", "clone"))
+                .child(btn("rt-export", "Export", "export"))
+                .child(btn("rt-import", "Import", "import"))
+                .child(btn("rt-edit", "Edit", "edit"))
+                .child(btn("rt-del", "Delete", "delete"))
+                .child(btn("rt-upd", "Update", "update-menu")),
+        )
+}
+
+fn build_nested(
+    draft: &RoutingDraft,
+    on_event: Rc<dyn Fn(RoutingEvent, &mut Window, &mut App)>,
+) -> Option<impl IntoElement> {
+    match &draft.nested {
+        RoutingNested::None => None,
+        RoutingNested::NewMenu => Some(
+            popup_menu(
+                "New route profile",
+                &[
+                    ("Structured profile", "new-structured"),
+                    ("Raw profile", "new-raw"),
+                    ("Remote profile", "new-remote"),
+                ],
+                on_event,
+            )
+            .into_any_element(),
+        ),
+        RoutingNested::UpdateMenu { sel_is_remote } => {
+            let mut items: Vec<(&str, &str)> = Vec::new();
+            if *sel_is_remote {
+                items.push(("Update selected", "update-selected"));
+            }
+            items.push(("Update all", "update-all"));
+            Some(
+                popup_menu("Update remote profiles", &items, on_event).into_any_element(),
+            )
+        }
+        RoutingNested::ImportPaste { text } => Some(
+            nested_shell(
+                "Import routing profile",
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(Theme::text_muted())
+                            .mb_2()
+                            .child(
+                                "Paste a Throne route link, a remoteRoute link, a base64 blob, or a JSON rule array",
+                            ),
+                    )
+                    .child(multi_field(
+                        "rt-imp-text",
+                        "Input",
+                        text,
+                        true,
+                        140.,
+                        emit(&on_event, RoutingEvent::NestedAction("focus-import")),
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .mt_2()
+                            .child(secondary_btn("rt-imp-c", "Cancel", {
+                                let on = emit(&on_event, RoutingEvent::NestedClose);
+                                move |_, w, cx| on(w, cx)
+                            }))
+                            .child(primary_btn("rt-imp-ok", "OK", {
+                                let on = emit(&on_event, RoutingEvent::NestedAction("import-ok"));
+                                move |_, w, cx| on(w, cx)
+                            })),
+                    ),
+                emit(&on_event, RoutingEvent::NestedClose),
+            )
+            .into_any_element(),
+        ),
+        RoutingNested::Notice { title, body } => Some(
+            nested_shell(
+                title.clone(),
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(Theme::text())
+                            .mb_3()
+                            .child(body.clone()),
+                    )
+                    .child(
+                        div().flex().justify_end().child(primary_btn("rt-n-ok", "OK", {
+                            let on = emit(&on_event, RoutingEvent::NestedClose);
+                            move |_, w, cx| on(w, cx)
+                        })),
+                    ),
+                emit(&on_event, RoutingEvent::NestedClose),
+            )
+            .into_any_element(),
+        ),
+        RoutingNested::RouteEditor(ed) => {
+            Some(route_editor_view(ed, on_event).into_any_element())
+        }
+        RoutingNested::RawEditor(ed) => Some(raw_editor_view(ed, on_event).into_any_element()),
+    }
+}
+
+fn popup_menu(
+    title: &'static str,
+    items: &[(&str, &str)],
+    on_event: Rc<dyn Fn(RoutingEvent, &mut Window, &mut App)>,
+) -> impl IntoElement {
+    let mut col = div().flex().flex_col().gap_1();
+    for (label, action) in items {
+        let action: &'static str = match *action {
+            "new-structured" => "new-structured",
+            "new-raw" => "new-raw",
+            "new-remote" => "new-remote",
+            "update-selected" => "update-selected",
+            "update-all" => "update-all",
+            other => {
+                // leak for static - only known actions above
+                Box::leak(other.to_string().into_boxed_str())
+            }
+        };
+        let on = emit(&on_event, RoutingEvent::NestedAction(action));
+        let label = (*label).to_string();
+        col = col.child(
+            div()
+                .id(SharedString::from(format!("rt-menu-{action}")))
+                .px_3()
+                .py_2()
+                .rounded_sm()
+                .cursor_pointer()
+                .hover(|e| e.bg(Theme::accent()).text_color(Theme::text_on_selected()))
+                .text_sm()
+                .child(label)
+                .on_click(move |_, w, cx| on(w, cx)),
+        );
+    }
+    nested_shell(
+        title,
+        div()
+            .flex()
+            .flex_col()
+            .child(col)
+            .child(
+                div().mt_2().flex().justify_end().child(secondary_btn(
+                    "rt-menu-c",
+                    "Cancel",
+                    {
+                        let on = emit(&on_event, RoutingEvent::NestedClose);
+                        move |_, w, cx| on(w, cx)
+                    },
+                )),
+            ),
+        emit(&on_event, RoutingEvent::NestedClose),
+    )
+}
+
+fn nested_shell(
+    title: impl Into<SharedString>,
+    body: impl IntoElement,
+    on_close: ClickFn,
+) -> impl IntoElement {
+    modal_shell_sized(
+        title,
+        body,
+        px(560.),
+        px(520.),
+        move |_, w, cx| on_close(w, cx),
+    )
+}
+
+fn route_editor_view(
+    ed: &RouteEditorDraft,
+    on_event: Rc<dyn Fn(RoutingEvent, &mut Window, &mut App)>,
+) -> impl IntoElement {
+    let f = ed.focus;
+    let mut tabs = div().flex().gap_1().mb_2();
+    for (tab, label) in [
+        (RouteEditorTab::Basic, "Basic"),
+        (RouteEditorTab::Advanced, "Advanced"),
+    ] {
+        let sel = ed.tab == tab;
+        let on = emit(&on_event, RoutingEvent::ReTab(tab));
+        tabs = tabs.child(
+            div()
+                .id(SharedString::from(format!("re-tab-{label}")))
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(if sel {
+                    Theme::accent()
+                } else {
+                    Theme::border_light()
+                })
+                .bg(if sel {
+                    Theme::bg_selected()
+                } else {
+                    Theme::bg_app()
+                })
+                .text_color(if sel {
+                    Theme::text_on_selected()
+                } else {
+                    Theme::text()
+                })
+                .text_xs()
+                .cursor_pointer()
+                .child(label)
+                .on_click(move |_, w, cx| on(w, cx)),
+        );
+    }
+
+    let general = div()
+        .flex()
+        .flex_col()
+        .mb_2()
+        .child(field_row(
+            "re-name",
+            "Name",
+            ed.profile.name.clone(),
+            f == ReFocus::Name,
+            emit(&on_event, RoutingEvent::ReFocus(ReFocus::Name)),
+        ))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .mb_2()
+                .child(
+                    div()
+                        .w(px(140.))
+                        .text_xs()
+                        .text_color(Theme::text_muted())
+                        .child("Default outbound"),
+                )
+                .child(cycle_btn(
+                    "re-defout",
+                    ed.profile.default_outbound.label(),
+                    emit(&on_event, RoutingEvent::ReCycleDefOut),
+                )),
+        );
+
+    let remote = if ed.profile.is_remote {
+        div()
+            .flex()
+            .flex_col()
+            .mb_2()
+            .p_2()
+            .border_1()
+            .border_color(Theme::border_light())
+            .rounded_sm()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .mb_1()
+                    .child("Remote source"),
+            )
+            .child(field_row(
+                "re-url",
+                "URL",
+                ed.profile.remote_url.clone(),
+                f == ReFocus::RemoteUrl,
+                emit(&on_event, RoutingEvent::ReFocus(ReFocus::RemoteUrl)),
+            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(mode_checkbox(
+                        "re-auto",
+                        "Auto update",
+                        ed.profile.auto_update,
+                        {
+                            let on = emit(&on_event, RoutingEvent::ReToggle("auto_update"));
+                            move |_, w, cx| on(w, cx)
+                        },
+                    ))
+                    .child(secondary_btn("re-prev", "Preview", {
+                        let on = emit(&on_event, RoutingEvent::NestedAction("remote-preview"));
+                        move |_, w, cx| on(w, cx)
+                    }))
+                    .child(secondary_btn("re-fetch", "Fetch", {
+                        let on = emit(&on_event, RoutingEvent::NestedAction("remote-fetch"));
+                        move |_, w, cx| on(w, cx)
+                    })),
+            )
+            .into_any_element()
+    } else {
+        div().into_any_element()
+    };
+
+    let body = match ed.tab {
+        RouteEditorTab::Basic => {
+            div()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(Theme::text_muted())
+                        .mb_1()
+                        .child(
+                            "Simple rules — domain:/suffix:/keyword:/regex:/ruleset:/ip:/processName:/processPath:",
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            div().flex_1().child(multi_field(
+                                "re-sd",
+                                "Direct",
+                                &ed.simple_direct,
+                                f == ReFocus::SimpleDirect,
+                                90.,
+                                emit(&on_event, RoutingEvent::ReFocus(ReFocus::SimpleDirect)),
+                            )),
+                        )
+                        .child(
+                            div().flex_1().child(multi_field(
+                                "re-sp",
+                                "Proxy",
+                                &ed.simple_proxy,
+                                f == ReFocus::SimpleProxy,
+                                90.,
+                                emit(&on_event, RoutingEvent::ReFocus(ReFocus::SimpleProxy)),
+                            )),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            div().flex_1().child(multi_field(
+                                "re-sb",
+                                "Block",
+                                &ed.simple_block,
+                                f == ReFocus::SimpleBlock,
+                                90.,
+                                emit(&on_event, RoutingEvent::ReFocus(ReFocus::SimpleBlock)),
+                            )),
+                        )
+                        .child(
+                            div().flex_1().child(multi_field(
+                                "re-sw",
+                                "Warp-bypass",
+                                &ed.simple_warp,
+                                f == ReFocus::SimpleWarp,
+                                90.,
+                                emit(&on_event, RoutingEvent::ReFocus(ReFocus::SimpleWarp)),
+                            )),
+                        ),
+                )
+                .into_any_element()
+        }
+        RouteEditorTab::Advanced => {
+            let mut list = div()
+                .id("re-rules")
+                .flex()
+                .flex_col()
+                .gap_1()
+                .max_h(px(120.))
+                .overflow_y_scroll()
+                .mb_2()
+                .border_1()
+                .border_color(Theme::border_light())
+                .rounded_sm()
+                .p_1();
+            for (i, r) in ed.profile.rules.iter().enumerate() {
+                let sel = ed.selected_rule == Some(i);
+                let on = emit(&on_event, RoutingEvent::ReSelectRule(i));
+                let label = format!(
+                    "{} {} → {}",
+                    if sel { "●" } else { "○" },
+                    if r.name.is_empty() {
+                        format!("rule_{i}")
+                    } else {
+                        r.name.clone()
+                    },
+                    DefaultOutbound::from_id(r.outbound_id).label()
+                );
+                list = list.child(
+                    div()
+                        .id(SharedString::from(format!("re-r-{i}")))
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .bg(if sel {
+                            Theme::bg_selected()
+                        } else {
+                            Theme::bg_app()
+                        })
+                        .text_color(if sel {
+                            Theme::text_on_selected()
+                        } else {
+                            Theme::text()
+                        })
+                        .text_xs()
+                        .child(label)
+                        .on_click(move |_, w, cx| on(w, cx)),
+                );
+            }
+
+            let detail = if let Some(i) = ed.selected_rule {
+                if let Some(r) = ed.profile.rules.get(i) {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(field_row(
+                            "re-rn",
+                            "Rule name",
+                            r.name.clone(),
+                            f == ReFocus::RuleName,
+                            emit(&on_event, RoutingEvent::ReFocus(ReFocus::RuleName)),
+                        ))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .mb_1()
+                                .child(
+                                    div()
+                                        .w(px(140.))
+                                        .text_xs()
+                                        .text_color(Theme::text_muted())
+                                        .child("Outbound"),
+                                )
+                                .child(cycle_btn(
+                                    "re-rout",
+                                    DefaultOutbound::from_id(r.outbound_id).label(),
+                                    emit(&on_event, RoutingEvent::ReCycleRuleOut),
+                                )),
+                        )
+                        .child(field_row(
+                            "re-rp",
+                            "Protocol",
+                            r.protocol.clone(),
+                            f == ReFocus::RuleProtocol,
+                            emit(&on_event, RoutingEvent::ReFocus(ReFocus::RuleProtocol)),
+                        ))
+                        .child(multi_field(
+                            "re-rd",
+                            "domain (one per line)",
+                            &r.domain.join("\n"),
+                            f == ReFocus::RuleDomain,
+                            48.,
+                            emit(&on_event, RoutingEvent::ReFocus(ReFocus::RuleDomain)),
+                        ))
+                        .child(multi_field(
+                            "re-rs",
+                            "domain_suffix",
+                            &r.domain_suffix.join("\n"),
+                            f == ReFocus::RuleSuffix,
+                            48.,
+                            emit(&on_event, RoutingEvent::ReFocus(ReFocus::RuleSuffix)),
+                        ))
+                        .child(multi_field(
+                            "re-ri",
+                            "ip_cidr",
+                            &r.ip_cidr.join("\n"),
+                            f == ReFocus::RuleIp,
+                            48.,
+                            emit(&on_event, RoutingEvent::ReFocus(ReFocus::RuleIp)),
+                        ))
+                        .into_any_element()
+                } else {
+                    div().into_any_element()
+                }
+            } else {
+                div()
+                    .text_xs()
+                    .text_color(Theme::text_muted())
+                    .child("Select a rule to edit attributes")
+                    .into_any_element()
+            };
+
+            div()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .mb_2()
+                        .child(secondary_btn("re-new-r", "New rule", {
+                            let on = emit(&on_event, RoutingEvent::NestedAction("rule-new"));
+                            move |_, w, cx| on(w, cx)
+                        }))
+                        .child(secondary_btn("re-del-r", "Delete", {
+                            let on = emit(&on_event, RoutingEvent::NestedAction("rule-del"));
+                            move |_, w, cx| on(w, cx)
+                        }))
+                        .child(secondary_btn("re-up-r", "Up", {
+                            let on = emit(&on_event, RoutingEvent::NestedAction("rule-up"));
+                            move |_, w, cx| on(w, cx)
+                        }))
+                        .child(secondary_btn("re-dn-r", "Down", {
+                            let on = emit(&on_event, RoutingEvent::NestedAction("rule-down"));
+                            move |_, w, cx| on(w, cx)
+                        })),
+                )
+                .child(list)
+                .child(detail)
+                .into_any_element()
+        }
+    };
+
+    nested_shell(
+        "Route Profile",
+        div()
+            .flex()
+            .flex_col()
+            .child(general)
+            .child(remote)
+            .child(tabs)
+            .child(body)
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .mt_2()
+                    .child(secondary_btn("re-c", "Cancel", {
+                        let on = emit(&on_event, RoutingEvent::NestedClose);
+                        move |_, w, cx| on(w, cx)
+                    }))
+                    .child(primary_btn("re-ok", "OK", {
+                        let on = emit(&on_event, RoutingEvent::NestedAction("editor-ok"));
+                        move |_, w, cx| on(w, cx)
+                    })),
+            ),
+        emit(&on_event, RoutingEvent::NestedClose),
+    )
+}
+
+fn raw_editor_view(
+    ed: &RawEditorDraft,
+    on_event: Rc<dyn Fn(RoutingEvent, &mut Window, &mut App)>,
+) -> impl IntoElement {
+    let f = ed.focus;
+    nested_shell(
+        "Raw Route Profile",
+        div()
+            .flex()
+            .flex_col()
+            .child(field_row(
+                "raw-name",
+                "Name",
+                ed.name.clone(),
+                f == ReFocus::Name,
+                emit(&on_event, RoutingEvent::ReFocus(ReFocus::Name)),
+            ))
+            .child(
+                div().mb_2().child(mode_checkbox(
+                    "raw-prev",
+                    "Prevent modifications (use verbatim)",
+                    ed.prevent_modifications,
+                    {
+                        let on = emit(&on_event, RoutingEvent::ReToggle("prevent_mod"));
+                        move |_, w, cx| on(w, cx)
+                    },
+                )),
+            )
+            .child(multi_field(
+                "raw-json",
+                "sing-box route JSON",
+                &ed.raw_route,
+                f == ReFocus::RawJson || f != ReFocus::Name,
+                200.,
+                emit(&on_event, RoutingEvent::ReFocus(ReFocus::RawJson)),
+            ))
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .mt_2()
+                    .child(secondary_btn("raw-c", "Cancel", {
+                        let on = emit(&on_event, RoutingEvent::NestedClose);
+                        move |_, w, cx| on(w, cx)
+                    }))
+                    .child(primary_btn("raw-ok", "OK", {
+                        let on = emit(&on_event, RoutingEvent::NestedAction("raw-ok"));
+                        move |_, w, cx| on(w, cx)
+                    })),
+            ),
+        emit(&on_event, RoutingEvent::NestedClose),
+    )
+}
+
+// ── Event application (pure draft mutations) ────────────────────────────────
+
+impl RoutingDraft {
+    pub fn apply_event(&mut self, ev: RoutingEvent) -> RoutingSideEffect {
+        match ev {
+            RoutingEvent::Close => RoutingSideEffect::Close,
+            RoutingEvent::Ok => RoutingSideEffect::Commit,
+            RoutingEvent::SetTab(t) => {
+                self.tab = t;
+                self.focus = RtFocus::None;
+                RoutingSideEffect::None
+            }
+            RoutingEvent::SetFocus(f) => {
+                self.focus = f;
+                RoutingSideEffect::None
+            }
+            RoutingEvent::Toggle(name) => {
+                self.toggle(name);
+                RoutingSideEffect::None
+            }
+            RoutingEvent::Cycle(name) => {
+                self.cycle(name);
+                RoutingSideEffect::None
+            }
+            RoutingEvent::SelectRoute(i) => {
+                if i < self.routes.len() {
+                    self.selected_idx = i;
+                }
+                RoutingSideEffect::None
+            }
+            RoutingEvent::SelectActive(id) => {
+                self.active_id = id;
+                if let Some(i) = self.routes.iter().position(|r| r.id == id) {
+                    self.selected_idx = i;
+                }
+                RoutingSideEffect::None
+            }
+            RoutingEvent::Action(a) => self.handle_action(a),
+            RoutingEvent::NestedClose => {
+                self.nested = RoutingNested::None;
+                RoutingSideEffect::None
+            }
+            RoutingEvent::NestedAction(a) => self.handle_nested_action(a),
+            RoutingEvent::ReFocus(f) => {
+                if let RoutingNested::RouteEditor(ed) = &mut self.nested {
+                    ed.focus = f;
+                } else if let RoutingNested::RawEditor(ed) = &mut self.nested {
+                    ed.focus = f;
+                }
+                RoutingSideEffect::None
+            }
+            RoutingEvent::ReTab(t) => {
+                if let RoutingNested::RouteEditor(ed) = &mut self.nested {
+                    if ed.tab == RouteEditorTab::Basic && t == RouteEditorTab::Advanced {
+                        let err = ed.apply_simple_to_profile();
+                        if !err.is_empty() {
+                            self.notice = err;
+                        }
+                        ed.selected_rule = None;
+                    } else if ed.tab == RouteEditorTab::Advanced && t == RouteEditorTab::Basic {
+                        ed.reload_simple_from_profile();
+                    }
+                    ed.tab = t;
+                }
+                RoutingSideEffect::None
+            }
+            RoutingEvent::ReSelectRule(i) => {
+                if let RoutingNested::RouteEditor(ed) = &mut self.nested {
+                    ed.selected_rule = Some(i);
+                    ed.focus = ReFocus::RuleName;
+                }
+                RoutingSideEffect::None
+            }
+            RoutingEvent::ReCycleDefOut => {
+                if let RoutingNested::RouteEditor(ed) = &mut self.nested {
+                    // proxy → direct → block → warp-bypass → proxy
+                    ed.profile.default_outbound = match ed.profile.default_outbound {
+                        DefaultOutbound::Proxy => DefaultOutbound::Direct,
+                        DefaultOutbound::Direct => DefaultOutbound::Block,
+                        DefaultOutbound::Block => DefaultOutbound::WarpBypass,
+                        DefaultOutbound::WarpBypass | DefaultOutbound::Profile(_) => {
+                            DefaultOutbound::Proxy
+                        }
+                    };
+                }
+                RoutingSideEffect::None
+            }
+            RoutingEvent::ReCycleRuleOut => {
+                if let RoutingNested::RouteEditor(ed) = &mut self.nested {
+                    if let Some(i) = ed.selected_rule {
+                        if let Some(r) = ed.profile.rules.get_mut(i) {
+                            let cur = DefaultOutbound::from_id(r.outbound_id);
+                            let next = match cur {
+                                DefaultOutbound::Proxy => DefaultOutbound::Direct,
+                                DefaultOutbound::Direct => DefaultOutbound::Block,
+                                DefaultOutbound::Block => DefaultOutbound::WarpBypass,
+                                DefaultOutbound::WarpBypass | DefaultOutbound::Profile(_) => {
+                                    DefaultOutbound::Proxy
+                                }
+                            };
+                            r.outbound_id = next.as_id();
+                        }
+                    }
+                }
+                RoutingSideEffect::None
+            }
+            RoutingEvent::ReToggle(name) => {
+                match name {
+                    "auto_update" => {
+                        if let RoutingNested::RouteEditor(ed) = &mut self.nested {
+                            ed.profile.auto_update = !ed.profile.auto_update;
+                        }
+                    }
+                    "prevent_mod" => {
+                        if let RoutingNested::RawEditor(ed) = &mut self.nested {
+                            ed.prevent_modifications = !ed.prevent_modifications;
+                        }
+                    }
+                    _ => {}
+                }
+                RoutingSideEffect::None
+            }
+        }
+    }
+
+    fn toggle(&mut self, name: &str) {
+        let s = &mut self.settings;
+        match name {
+            "dns_server" => s.enable_dns_server = !s.enable_dns_server,
+            "dns_lan" => s.dns_server_listen_lan = !s.dns_server_listen_lan,
+            "redirect" => s.enable_redirect = !s.enable_redirect,
+            "warp" => s.enable_warp = !s.enable_warp,
+            "fake_dns" => s.fake_dns = !s.fake_dns,
+            "dns_routing" => s.enable_dns_routing = !s.enable_dns_routing,
+            "dns_disable_cache" => s.dns_disable_cache = !s.dns_disable_cache,
+            "dns_disable_expire" => s.dns_disable_expire = !s.dns_disable_expire,
+            "dns_reverse_mapping" => s.dns_reverse_mapping = !s.dns_reverse_mapping,
+            "use_dns_object" => s.use_dns_object = !s.use_dns_object,
+            _ => {}
+        }
+    }
+
+    fn cycle(&mut self, name: &str) {
+        let s = &mut self.settings;
+        match name {
+            "resolve" => {
+                s.resolve_domain_strategy = cycle_strategy(&s.resolve_domain_strategy);
+            }
+            "default_strategy" => {
+                s.default_domain_strategy = cycle_strategy(&s.default_domain_strategy);
+            }
+            "mirror" => s.ruleset_mirror = s.ruleset_mirror.cycle(),
+            "remote_dns_strategy" => {
+                s.remote_dns_strategy = cycle_strategy(&s.remote_dns_strategy);
+            }
+            "direct_dns_strategy" => {
+                s.direct_dns_strategy = cycle_strategy(&s.direct_dns_strategy);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_action(&mut self, a: &str) -> RoutingSideEffect {
+        match a {
+            "new-menu" => {
+                self.nested = RoutingNested::NewMenu;
+            }
+            "update-menu" => {
+                let sel_is_remote = self.selected().map(|r| r.is_remote).unwrap_or(false);
+                self.nested = RoutingNested::UpdateMenu { sel_is_remote };
+            }
+            "clone" => {
+                if let Some(r) = self.selected().cloned() {
+                    let mut c = r;
+                    c.name = format!("{} clone", c.name);
+                    c.id = -1;
+                    self.routes.push(c);
+                    self.selected_idx = self.routes.len() - 1;
+                    self.notice = "Cloned (save with OK)".into();
+                }
+            }
+            "export" => {
+                if let Some(r) = self.selected() {
+                    let link = throne_import::to_share_link(r);
+                    return RoutingSideEffect::CopyClipboard(link);
+                }
+            }
+            "import" => return RoutingSideEffect::TryClipboardImport,
+            "edit" => {
+                if let Some(r) = self.selected().cloned() {
+                    let idx = self.selected_idx;
+                    if r.is_raw {
+                        self.nested =
+                            RoutingNested::RawEditor(RawEditorDraft::from_profile(Some(idx), &r));
+                    } else {
+                        self.nested = RoutingNested::RouteEditor(RouteEditorDraft::from_profile(
+                            Some(idx),
+                            r,
+                        ));
+                    }
+                }
+            }
+            "delete" => {
+                if self.routes.len() <= 1 {
+                    self.nested = RoutingNested::Notice {
+                        title: "Invalid operation".into(),
+                        body: "Routing Profiles cannot be empty, try adding another profile or editing this one".into(),
+                    };
+                } else if self.selected_idx < self.routes.len() {
+                    let removed = self.routes.remove(self.selected_idx);
+                    if removed.id == self.active_id {
+                        self.active_id = self.routes[0].id;
+                    }
+                    if self.selected_idx >= self.routes.len() {
+                        self.selected_idx = self.routes.len() - 1;
+                    }
+                }
+            }
+            "format-dns" => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&self.settings.dns_object) {
+                    if let Ok(pretty) = serde_json::to_string_pretty(&v) {
+                        self.settings.dns_object = pretty;
+                        self.notice = "DNS object formatted".into();
+                    }
+                } else {
+                    self.nested = RoutingNested::Notice {
+                        title: "DNS".into(),
+                        body: "Invalid json".into(),
+                    };
+                }
+            }
+            "dns-doc" => {
+                self.nested = RoutingNested::Notice {
+                    title: "DNS".into(),
+                    body: "https://sing-box.sagernet.org/configuration/dns/".into(),
+                };
+            }
+            "warp-gen" => return RoutingSideEffect::WarpGenerate,
+            _ => {}
+        }
+        RoutingSideEffect::None
+    }
+
+    fn handle_nested_action(&mut self, a: &str) -> RoutingSideEffect {
+        match a {
+            "new-structured" => {
+                let mut p = RouteProfile::new(-1, "New profile");
+                p.ensure_default_dns_hijack();
+                self.nested =
+                    RoutingNested::RouteEditor(RouteEditorDraft::from_profile(None, p));
+            }
+            "new-raw" => {
+                let p = RouteProfile {
+                    is_raw: true,
+                    ..RouteProfile::new(-1, "New raw profile")
+                };
+                self.nested = RoutingNested::RawEditor(RawEditorDraft::from_profile(None, &p));
+            }
+            "new-remote" => {
+                let mut p = RouteProfile::new(-1, "New remote");
+                p.is_remote = true;
+                p.ensure_default_dns_hijack();
+                self.nested =
+                    RoutingNested::RouteEditor(RouteEditorDraft::from_profile(None, p));
+            }
+            "update-selected" => {
+                self.nested = RoutingNested::None;
+                if let Some(r) = self.selected() {
+                    if r.is_remote && !r.remote_url.trim().is_empty() {
+                        return RoutingSideEffect::UpdateRemotes(vec![r.clone()]);
+                    }
+                }
+            }
+            "update-all" => {
+                self.nested = RoutingNested::None;
+                let remotes: Vec<_> = self
+                    .routes
+                    .iter()
+                    .filter(|r| r.is_remote && !r.remote_url.trim().is_empty())
+                    .cloned()
+                    .collect();
+                if remotes.is_empty() {
+                    self.nested = RoutingNested::Notice {
+                        title: "No remote profiles".into(),
+                        body: "There are no remote routing profiles to update.".into(),
+                    };
+                } else {
+                    return RoutingSideEffect::UpdateRemotes(remotes);
+                }
+            }
+            "import-ok" => {
+                if let RoutingNested::ImportPaste { text } = &self.nested {
+                    let text = text.clone();
+                    self.nested = RoutingNested::None;
+                    return RoutingSideEffect::ImportText(text);
+                }
+            }
+            "editor-ok" => {
+                if let RoutingNested::RouteEditor(mut ed) = std::mem::take(&mut self.nested) {
+                    if ed.tab == RouteEditorTab::Basic {
+                        let err = ed.apply_simple_to_profile();
+                        if !err.is_empty() {
+                            self.nested = RoutingNested::RouteEditor(ed);
+                            self.notice = err;
+                            return RoutingSideEffect::None;
+                        }
+                    }
+                    let mut p = ed.profile;
+                    if p.is_remote {
+                        p.is_remote = true;
+                    }
+                    if let Some(idx) = ed.edit_idx {
+                        if idx < self.routes.len() {
+                            let id = self.routes[idx].id;
+                            p.id = id;
+                            if self.active_id == id || self.active_id == self.routes[idx].id {
+                                self.active_id = id;
+                            }
+                            self.routes[idx] = p;
+                        }
+                    } else {
+                        p.id = -1;
+                        self.routes.push(p);
+                        self.selected_idx = self.routes.len() - 1;
+                    }
+                    self.nested = RoutingNested::None;
+                    self.notice = "Profile updated (save with OK)".into();
+                }
+            }
+            "raw-ok" => {
+                if let RoutingNested::RawEditor(ed) = std::mem::take(&mut self.nested) {
+                    // validate JSON
+                    if serde_json::from_str::<serde_json::Value>(&ed.raw_route).is_err() {
+                        self.nested = RoutingNested::RawEditor(ed);
+                        self.notice = "Invalid JSON in raw route".into();
+                        return RoutingSideEffect::None;
+                    }
+                    if let Some(idx) = ed.edit_idx {
+                        let id = self.routes.get(idx).map(|r| r.id).unwrap_or(-1);
+                        let p = ed.into_profile(id);
+                        if idx < self.routes.len() {
+                            self.routes[idx] = p;
+                        }
+                    } else {
+                        self.routes.push(ed.into_profile(-1));
+                        self.selected_idx = self.routes.len() - 1;
+                    }
+                    self.nested = RoutingNested::None;
+                }
+            }
+            "rule-new" => {
+                if let RoutingNested::RouteEditor(ed) = &mut self.nested {
+                    let n = ed.profile.rules.len();
+                    ed.profile.rules.push(RouteRule {
+                        name: format!("rule_{n}"),
+                        action: "route".into(),
+                        outbound_id: DefaultOutbound::Proxy.as_id(),
+                        ..Default::default()
+                    });
+                    ed.selected_rule = Some(n);
+                }
+            }
+            "rule-del" => {
+                if let RoutingNested::RouteEditor(ed) = &mut self.nested {
+                    if let Some(i) = ed.selected_rule {
+                        if i < ed.profile.rules.len() {
+                            ed.profile.rules.remove(i);
+                            ed.selected_rule = None;
+                        }
+                    }
+                }
+            }
+            "rule-up" => {
+                if let RoutingNested::RouteEditor(ed) = &mut self.nested {
+                    if let Some(i) = ed.selected_rule {
+                        if i > 0 && i < ed.profile.rules.len() {
+                            ed.profile.rules.swap(i, i - 1);
+                            ed.selected_rule = Some(i - 1);
+                        }
+                    }
+                }
+            }
+            "rule-down" => {
+                if let RoutingNested::RouteEditor(ed) = &mut self.nested {
+                    if let Some(i) = ed.selected_rule {
+                        if i + 1 < ed.profile.rules.len() {
+                            ed.profile.rules.swap(i, i + 1);
+                            ed.selected_rule = Some(i + 1);
+                        }
+                    }
+                }
+            }
+            "remote-preview" | "remote-fetch" => {
+                if let RoutingNested::RouteEditor(ed) = &self.nested {
+                    let url = ed.profile.remote_url.clone();
+                    let apply = a == "remote-fetch";
+                    if !url.trim().is_empty() {
+                        return RoutingSideEffect::FetchRemote { url, apply };
+                    }
+                    self.notice = "Set a remote URL first".into();
+                }
+            }
+            "focus-import" => {}
+            _ => {}
+        }
+        RoutingSideEffect::None
+    }
+
+    pub fn apply_imported_profile(&mut self, mut p: RouteProfile, was_legacy_array: bool) {
+        if was_legacy_array {
+            // open editor pre-filled
+            p.name = if p.name.is_empty() {
+                "Imported rules".into()
+            } else {
+                p.name
+            };
+            self.nested =
+                RoutingNested::RouteEditor(RouteEditorDraft::from_profile(None, p));
+        } else {
+            p.id = -1;
+            let name = p.name.clone();
+            self.routes.push(p);
+            self.selected_idx = self.routes.len() - 1;
+            self.notice = format!("Imported «{name}»");
+        }
+    }
+
+    pub fn apply_remote_fetch_to_editor(&mut self, incoming: RouteProfile, apply: bool) {
+        if let RoutingNested::RouteEditor(ed) = &mut self.nested {
+            if apply {
+                let name = ed.profile.name.clone();
+                let url = ed.profile.remote_url.clone();
+                let auto = ed.profile.auto_update;
+                ed.profile.rules = incoming.rules;
+                ed.profile.is_raw = incoming.is_raw;
+                ed.profile.raw_route = incoming.raw_route;
+                if ed.profile.name.is_empty() {
+                    ed.profile.name = name;
+                }
+                ed.profile.remote_url = url;
+                ed.profile.auto_update = auto;
+                ed.profile.is_remote = true;
+                ed.reload_simple_from_profile();
+                self.notice = "Remote rules applied".into();
+            } else {
+                self.notice = format!(
+                    "Preview: «{}» · {} rules",
+                    incoming.name,
+                    incoming.rules.len()
+                );
+            }
+        }
+    }
+
+    pub fn apply_remote_update_results(&mut self, updated: Vec<(i64, RouteProfile, String)>) {
+        for (id, incoming, url_key) in updated {
+            let slot = if id > 0 {
+                self.routes.iter_mut().find(|r| r.id == id)
+            } else {
+                self.routes
+                    .iter_mut()
+                    .find(|r| r.is_remote && r.remote_url == url_key)
+            };
+            if let Some(slot) = slot {
+                let name = slot.name.clone();
+                let url = slot.remote_url.clone();
+                let auto = slot.auto_update;
+                let keep_id = slot.id;
+                *slot = incoming;
+                slot.id = keep_id;
+                if slot.name.is_empty() {
+                    slot.name = name;
+                }
+                slot.remote_url = url;
+                slot.auto_update = auto;
+                slot.is_remote = true;
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum RoutingSideEffect {
+    None,
+    Close,
+    Commit,
+    CopyClipboard(String),
+    TryClipboardImport,
+    ImportText(String),
+    UpdateRemotes(Vec<RouteProfile>),
+    FetchRemote { url: String, apply: bool },
+    WarpGenerate,
+}
+
+// Fix Default for RoutingNested take
+impl Default for RouteEditorDraft {
+    fn default() -> Self {
+        Self::from_profile(None, RouteProfile::new(-1, ""))
+    }
+}
+impl Default for RawEditorDraft {
+    fn default() -> Self {
+        Self {
+            edit_idx: None,
+            name: String::new(),
+            raw_route: String::new(),
+            prevent_modifications: false,
+            focus: ReFocus::Name,
+        }
+    }
+}

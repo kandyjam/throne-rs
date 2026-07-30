@@ -22,5 +22,6 @@ gpui = { workspace = true, features = ["runtime_shaders"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+serde_json = { workspace = true }
 smol = "2"
 tray-icon = "0.24.1"

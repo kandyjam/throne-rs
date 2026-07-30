@@ -5993,6 +5993,7 @@ version = "1.2.2"
 dependencies = [
  "anyhow",
  "gpui",
+ "serde_json",
  "smol",
  "throne-core-client",
  "throne-domain",

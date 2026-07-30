@@ -502,6 +502,94 @@ pub struct AppSettings {
     pub hk_url_test: String,
     #[serde(default)]
     pub hk_copy_logs: String,
+
+    // ── Routing dialog (DialogManageRoutes) settings ─────────────────────
+    #[serde(default)]
+    pub remote_dns_strategy: String,
+    #[serde(default)]
+    pub direct_dns_strategy: String,
+    #[serde(default = "default_dns_cache_capacity")]
+    pub dns_cache_capacity: i32,
+    #[serde(default)]
+    pub dns_disable_cache: bool,
+    #[serde(default)]
+    pub dns_disable_expire: bool,
+    #[serde(default)]
+    pub dns_reverse_mapping: bool,
+    #[serde(default = "default_true")]
+    pub enable_dns_routing: bool,
+    #[serde(default)]
+    pub use_dns_object: bool,
+    #[serde(default)]
+    pub dns_object: String,
+    #[serde(default = "default_dns_final_out")]
+    pub dns_final_out: String,
+    #[serde(default)]
+    pub resolve_domain_strategy: String,
+    #[serde(default)]
+    pub default_domain_strategy: String,
+    #[serde(default)]
+    pub core_box_underlying_dns: String,
+    #[serde(default)]
+    pub fake_dns: bool,
+    /// DNS hijack / embedded DNS server.
+    #[serde(default)]
+    pub enable_dns_server: bool,
+    #[serde(default = "default_dns_listen_port")]
+    pub dns_server_listen_port: i32,
+    #[serde(default = "default_dns_v4_resp")]
+    pub dns_v4_resp: String,
+    #[serde(default = "default_dns_v6_resp")]
+    pub dns_v6_resp: String,
+    #[serde(default)]
+    pub dns_server_rules: Vec<String>,
+    #[serde(default)]
+    pub dns_server_listen_lan: bool,
+    /// Transparent redirect inbound.
+    #[serde(default)]
+    pub enable_redirect: bool,
+    #[serde(default = "default_redirect_addr")]
+    pub redirect_listen_address: String,
+    #[serde(default = "default_redirect_port")]
+    pub redirect_listen_port: i32,
+    /// Cloudflare WARP egress (warp-bypass outbound).
+    #[serde(default)]
+    pub enable_warp: bool,
+    #[serde(default)]
+    pub warp_ep: String,
+    #[serde(default)]
+    pub warp_private_key: String,
+    #[serde(default)]
+    pub warp_public_key: String,
+    #[serde(default)]
+    pub warp_ifc_addrs: Vec<String>,
+    #[serde(default)]
+    pub warp_reserved: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_dns_cache_capacity() -> i32 {
+    65536
+}
+fn default_dns_final_out() -> String {
+    "remote".into()
+}
+fn default_dns_listen_port() -> i32 {
+    53
+}
+fn default_dns_v4_resp() -> String {
+    "198.18.0.2".into()
+}
+fn default_dns_v6_resp() -> String {
+    "fc00::2".into()
+}
+fn default_redirect_addr() -> String {
+    "127.0.0.1".into()
+}
+fn default_redirect_port() -> i32 {
+    12345
 }
 
 impl Default for AppSettings {
@@ -536,6 +624,35 @@ impl Default for AppSettings {
             hk_save: "Cmd/Ctrl+S".into(),
             hk_url_test: "Cmd/Ctrl+T".into(),
             hk_copy_logs: "Cmd/Ctrl+Shift+C".into(),
+            remote_dns_strategy: String::new(),
+            direct_dns_strategy: String::new(),
+            dns_cache_capacity: default_dns_cache_capacity(),
+            dns_disable_cache: false,
+            dns_disable_expire: false,
+            dns_reverse_mapping: false,
+            enable_dns_routing: true,
+            use_dns_object: false,
+            dns_object: String::new(),
+            dns_final_out: default_dns_final_out(),
+            resolve_domain_strategy: String::new(),
+            default_domain_strategy: String::new(),
+            core_box_underlying_dns: String::new(),
+            fake_dns: false,
+            enable_dns_server: false,
+            dns_server_listen_port: default_dns_listen_port(),
+            dns_v4_resp: default_dns_v4_resp(),
+            dns_v6_resp: default_dns_v6_resp(),
+            dns_server_rules: Vec::new(),
+            dns_server_listen_lan: false,
+            enable_redirect: false,
+            redirect_listen_address: default_redirect_addr(),
+            redirect_listen_port: default_redirect_port(),
+            enable_warp: false,
+            warp_ep: String::new(),
+            warp_private_key: String::new(),
+            warp_public_key: String::new(),
+            warp_ifc_addrs: Vec::new(),
+            warp_reserved: Vec::new(),
         }
     }
 }

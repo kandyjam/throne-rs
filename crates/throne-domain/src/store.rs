@@ -771,6 +771,158 @@ impl AppState {
         Ok(())
     }
 
+    /// Delete a route profile. Refuses when it is the last remaining profile.
+    pub fn delete_route(&mut self, id: i64) -> Result<(), StoreError> {
+        if self.routes.len() <= 1 {
+            return Err(StoreError::Msg(
+                "Routing Profiles cannot be empty, try adding another profile or editing this one"
+                    .into(),
+            ));
+        }
+        if !self.routes.contains_key(&id) {
+            return Err(StoreError::Msg(format!("route {id} not found")));
+        }
+        self.routes.remove(&id);
+        self.route_order.retain(|x| *x != id);
+        if self.active_route_id == Some(id) {
+            let next = self.route_order.first().copied();
+            self.active_route_id = next;
+            self.settings.current_route_id = next.unwrap_or(-1);
+        }
+        self.push_log(format!("Route {id} deleted"));
+        Ok(())
+    }
+
+    /// Clone a route profile (`name + " clone"`, fresh id).
+    pub fn clone_route(&mut self, id: i64) -> Result<i64, StoreError> {
+        let mut copy = self
+            .routes
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| StoreError::Msg(format!("route {id} not found")))?;
+        copy.name = format!("{} clone", copy.name);
+        copy.id = 0;
+        Ok(self.add_route(copy))
+    }
+
+    /// Insert or replace a full route profile (editor save). Keeps id when > 0.
+    pub fn upsert_route(&mut self, mut route: RouteProfile) -> i64 {
+        if route.id > 0 && self.routes.contains_key(&route.id) {
+            let id = route.id;
+            self.routes.insert(id, route);
+            id
+        } else {
+            route.id = 0;
+            self.add_route(route)
+        }
+    }
+
+    /// Replace the entire route set from a routing-settings draft (accept()).
+    /// `active_id` becomes the current route; ids ≤ 0 get fresh numbers.
+    pub fn commit_routes(
+        &mut self,
+        routes: Vec<RouteProfile>,
+        active_id: i64,
+    ) -> Result<(), StoreError> {
+        if routes.is_empty() {
+            return Err(StoreError::Msg("Routing profile cannot be empty".into()));
+        }
+        self.routes.clear();
+        self.route_order.clear();
+        let mut max_id = 0i64;
+        let mut mapped_active = None;
+        for mut r in routes {
+            let wanted = r.id;
+            if r.id <= 0 {
+                r.id = 0;
+            }
+            let id = self.add_route(r);
+            max_id = max_id.max(id);
+            if wanted > 0 && wanted == active_id {
+                mapped_active = Some(id);
+            }
+        }
+        self.next_route_id = max_id + 1;
+        let active = mapped_active
+            .or_else(|| {
+                if self.routes.contains_key(&active_id) {
+                    Some(active_id)
+                } else {
+                    self.route_order.first().copied()
+                }
+            })
+            .unwrap_or(1);
+        self.active_route_id = Some(active);
+        self.settings.current_route_id = active;
+        Ok(())
+    }
+
+    /// Apply routing-dialog settings fields (DNS / Hijack / Warp / Common).
+    pub fn apply_routing_dialog_settings(&mut self, s: AppSettings) {
+        // Keep non-routing fields from current settings; overlay routing-related ones.
+        let cur = self.settings.clone();
+        self.settings = AppSettings {
+            // preserve main/basic settings not owned by this dialog
+            inbound_socks_port: cur.inbound_socks_port,
+            inbound_address: cur.inbound_address,
+            test_latency_url: cur.test_latency_url,
+            vpn_strict_route: cur.vpn_strict_route,
+            vpn_mtu: cur.vpn_mtu,
+            vpn_tun_ipv4_cidr: cur.vpn_tun_ipv4_cidr,
+            disable_private_range_bypass: cur.disable_private_range_bypass,
+            sub_show_change_popup: cur.sub_show_change_popup,
+            allow_stopping_active_profile: cur.allow_stopping_active_profile,
+            show_config_security: cur.show_config_security,
+            remember_id: cur.remember_id,
+            system_proxy_enabled: cur.system_proxy_enabled,
+            tun_mode_enabled: cur.tun_mode_enabled,
+            system_dns_set: cur.system_dns_set,
+            theme: cur.theme,
+            log_level: cur.log_level,
+            adblock_enable: cur.adblock_enable,
+            hk_start_stop: cur.hk_start_stop,
+            hk_import: cur.hk_import,
+            hk_save: cur.hk_save,
+            hk_url_test: cur.hk_url_test,
+            hk_copy_logs: cur.hk_copy_logs,
+            // from dialog draft
+            remote_dns: s.remote_dns,
+            direct_dns: s.direct_dns,
+            current_route_id: s.current_route_id,
+            ruleset_mirror: s.ruleset_mirror,
+            remote_dns_strategy: s.remote_dns_strategy,
+            direct_dns_strategy: s.direct_dns_strategy,
+            dns_cache_capacity: s.dns_cache_capacity,
+            dns_disable_cache: s.dns_disable_cache,
+            dns_disable_expire: s.dns_disable_expire,
+            dns_reverse_mapping: s.dns_reverse_mapping,
+            enable_dns_routing: s.enable_dns_routing,
+            use_dns_object: s.use_dns_object,
+            dns_object: s.dns_object,
+            dns_final_out: s.dns_final_out,
+            resolve_domain_strategy: s.resolve_domain_strategy,
+            default_domain_strategy: s.default_domain_strategy,
+            core_box_underlying_dns: s.core_box_underlying_dns,
+            fake_dns: s.fake_dns,
+            enable_dns_server: s.enable_dns_server,
+            dns_server_listen_port: s.dns_server_listen_port,
+            dns_v4_resp: s.dns_v4_resp,
+            dns_v6_resp: s.dns_v6_resp,
+            dns_server_rules: s.dns_server_rules,
+            dns_server_listen_lan: s.dns_server_listen_lan,
+            enable_redirect: s.enable_redirect,
+            redirect_listen_address: s.redirect_listen_address,
+            redirect_listen_port: s.redirect_listen_port,
+            enable_warp: s.enable_warp,
+            warp_ep: s.warp_ep,
+            warp_private_key: s.warp_private_key,
+            warp_public_key: s.warp_public_key,
+            warp_ifc_addrs: s.warp_ifc_addrs,
+            warp_reserved: s.warp_reserved,
+        };
+        self.push_log("Routing settings applied");
+    }
+
     pub fn apply_tun_settings(
         &mut self,
         vpn_mtu: i32,

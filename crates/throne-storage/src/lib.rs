@@ -646,7 +646,7 @@ fn merge_settings_tx(
     tx: &rusqlite::Transaction<'_>,
     s: &AppSettings,
 ) -> Result<(), StorageError> {
-    let pairs: [(&str, String); 26] = [
+    let pairs: Vec<(&str, String)> = vec![
         ("inbound_socks_port", s.inbound_socks_port.to_string()),
         ("inbound_address", s.inbound_address.clone()),
         ("test_url", s.test_latency_url.clone()),
@@ -679,6 +679,36 @@ fn merge_settings_tx(
         ("hk_save", s.hk_save.clone()),
         ("hk_url_test", s.hk_url_test.clone()),
         ("hk_copy_logs", s.hk_copy_logs.clone()),
+        // Routing dialog
+        ("remote_dns_strategy", s.remote_dns_strategy.clone()),
+        ("direct_dns_strategy", s.direct_dns_strategy.clone()),
+        ("dns_cache_capacity", s.dns_cache_capacity.to_string()),
+        ("dns_disable_cache", bool_str(s.dns_disable_cache)),
+        ("dns_disable_expire", bool_str(s.dns_disable_expire)),
+        ("dns_reverse_mapping", bool_str(s.dns_reverse_mapping)),
+        ("enable_dns_routing", bool_str(s.enable_dns_routing)),
+        ("use_dns_object", bool_str(s.use_dns_object)),
+        ("dns_object", s.dns_object.clone()),
+        ("dns_final_out", s.dns_final_out.clone()),
+        ("resolve_domain_strategy", s.resolve_domain_strategy.clone()),
+        ("default_domain_strategy", s.default_domain_strategy.clone()),
+        ("core_box_underlying_dns", s.core_box_underlying_dns.clone()),
+        ("fake_dns", bool_str(s.fake_dns)),
+        ("enable_dns_server", bool_str(s.enable_dns_server)),
+        ("dns_server_listen_port", s.dns_server_listen_port.to_string()),
+        ("dns_v4_resp", s.dns_v4_resp.clone()),
+        ("dns_v6_resp", s.dns_v6_resp.clone()),
+        ("dns_server_rules", to_json_array(&s.dns_server_rules)),
+        ("dns_server_listen_lan", bool_str(s.dns_server_listen_lan)),
+        ("enable_redirect", bool_str(s.enable_redirect)),
+        ("redirect_listen_address", s.redirect_listen_address.clone()),
+        ("redirect_listen_port", s.redirect_listen_port.to_string()),
+        ("enable_warp", bool_str(s.enable_warp)),
+        ("warp_ep", s.warp_ep.clone()),
+        ("warp_private_key", s.warp_private_key.clone()),
+        ("warp_public_key", s.warp_public_key.clone()),
+        ("warp_ifc_addrs", to_json_array(&s.warp_ifc_addrs)),
+        ("warp_reserved", to_json_array(&s.warp_reserved)),
     ];
     for (k, v) in pairs {
         tx.execute(
@@ -761,6 +791,47 @@ fn apply_setting(s: &mut AppSettings, key: &str, value: &str) {
         "hk_save" => s.hk_save = value.to_string(),
         "hk_url_test" => s.hk_url_test = value.to_string(),
         "hk_copy_logs" => s.hk_copy_logs = value.to_string(),
+        "remote_dns_strategy" => s.remote_dns_strategy = value.to_string(),
+        "direct_dns_strategy" => s.direct_dns_strategy = value.to_string(),
+        "dns_cache_capacity" => {
+            if let Ok(n) = value.parse() {
+                s.dns_cache_capacity = n;
+            }
+        }
+        "dns_disable_cache" => s.dns_disable_cache = parse_bool(value),
+        "dns_disable_expire" => s.dns_disable_expire = parse_bool(value),
+        "dns_reverse_mapping" => s.dns_reverse_mapping = parse_bool(value),
+        "enable_dns_routing" => s.enable_dns_routing = parse_bool(value),
+        "use_dns_object" => s.use_dns_object = parse_bool(value),
+        "dns_object" => s.dns_object = value.to_string(),
+        "dns_final_out" => s.dns_final_out = value.to_string(),
+        "resolve_domain_strategy" => s.resolve_domain_strategy = value.to_string(),
+        "default_domain_strategy" => s.default_domain_strategy = value.to_string(),
+        "core_box_underlying_dns" => s.core_box_underlying_dns = value.to_string(),
+        "fake_dns" => s.fake_dns = parse_bool(value),
+        "enable_dns_server" => s.enable_dns_server = parse_bool(value),
+        "dns_server_listen_port" => {
+            if let Ok(n) = value.parse() {
+                s.dns_server_listen_port = n;
+            }
+        }
+        "dns_v4_resp" => s.dns_v4_resp = value.to_string(),
+        "dns_v6_resp" => s.dns_v6_resp = value.to_string(),
+        "dns_server_rules" => s.dns_server_rules = json_str_list(Some(value.to_string())),
+        "dns_server_listen_lan" => s.dns_server_listen_lan = parse_bool(value),
+        "enable_redirect" => s.enable_redirect = parse_bool(value),
+        "redirect_listen_address" => s.redirect_listen_address = value.to_string(),
+        "redirect_listen_port" => {
+            if let Ok(n) = value.parse() {
+                s.redirect_listen_port = n;
+            }
+        }
+        "enable_warp" => s.enable_warp = parse_bool(value),
+        "warp_ep" => s.warp_ep = value.to_string(),
+        "warp_private_key" => s.warp_private_key = value.to_string(),
+        "warp_public_key" => s.warp_public_key = value.to_string(),
+        "warp_ifc_addrs" => s.warp_ifc_addrs = json_str_list(Some(value.to_string())),
+        "warp_reserved" => s.warp_reserved = json_str_list(Some(value.to_string())),
         _ => {}
     }
 }
