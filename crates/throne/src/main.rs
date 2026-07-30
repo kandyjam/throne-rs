@@ -1,4 +1,5 @@
 mod theme;
+mod tray;
 mod ui;
 
 use gpui::{
@@ -24,7 +25,8 @@ fn main() {
 
         // Upstream mainwindow.ui minimum 800×600
         let bounds = Bounds::centered(None, size(px(960.), px(640.)), cx);
-        cx.open_window(
+        let window_handle = cx
+            .open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
@@ -38,7 +40,69 @@ fn main() {
                 ..Default::default()
             },
             |_window, cx| cx.new(MainWindow::new),
-        )
-        .expect("open main window");
+            )
+            .expect("open main window");
+
+        match tray::install() {
+            Ok(()) => {
+                cx.spawn(move |cx: &mut gpui::AsyncApp| {
+                    let async_cx = cx.clone();
+                    async move {
+                        loop {
+                            smol::Timer::after(std::time::Duration::from_millis(100)).await;
+                            while let Some(command) = tray::next_command() {
+                                if async_cx
+                                    .update(|cx| match command {
+                                        tray::TrayCommand::ShowWindow => {
+                                            cx.activate(true);
+                                            let _ = window_handle.update(cx, |_, window, _| {
+                                                window.activate_window();
+                                            });
+                                        }
+                                        tray::TrayCommand::ToggleProxy => {
+                                            let _ = window_handle.update(cx, |view, _, cx| {
+                                                view.toggle_proxy(cx);
+                                            });
+                                        }
+                                        tray::TrayCommand::Quit => cx.quit(),
+                                    })
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                })
+                .detach();
+            }
+            Err(error) => tracing::warn!(%error, "desktop tray unavailable"),
+        }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tray::{TrayCommand, command_from_menu_id};
+
+    #[test]
+    fn original_group_actions_have_original_shortcuts_and_confirmation() {
+        let source = include_str!("ui/main_window.rs");
+
+        assert!(source.contains("cmd-shift-g"));
+        assert!(source.contains("ctrl-shift-g"));
+        assert!(source.contains("cmd-shift-r"));
+        assert!(source.contains("ctrl-shift-r"));
+        assert_eq!(source.matches("cmd-shift-r").count(), 1);
+        assert_eq!(source.matches("ctrl-shift-r").count(), 1);
+        assert!(source.contains("ConfirmDeleteUnavailable"));
+    }
+
+    #[test]
+    fn tray_menu_ids_map_to_their_application_actions() {
+        assert_eq!(command_from_menu_id("throne.show"), Some(TrayCommand::ShowWindow));
+        assert_eq!(command_from_menu_id("throne.toggle"), Some(TrayCommand::ToggleProxy));
+        assert_eq!(command_from_menu_id("throne.quit"), Some(TrayCommand::Quit));
+        assert_eq!(command_from_menu_id("unrelated"), None);
+    }
 }

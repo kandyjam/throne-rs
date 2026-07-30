@@ -8,5 +8,5 @@ mod store;
 mod version;
 
 pub use models::*;
-pub use store::{AppState, StoreError};
+pub use store::{AppState, StoreError, SubUpdateSummary};
 pub use version::{NKR_VERSION, display_name, user_agent};

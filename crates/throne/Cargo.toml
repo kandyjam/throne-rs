@@ -4,10 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Throne desktop client — Rust + GPUI rewrite"
-default-run = "throne"
+# Binary must be named `Throne` — Go ThroneCore parentcheck requires
+# parent basename == "Throne" and ThroneCore living in the same directory.
+default-run = "Throne"
 
 [[bin]]
-name = "throne"
+name = "Throne"
 path = "src/main.rs"
 
 [dependencies]
@@ -20,3 +22,5 @@ gpui = { workspace = true, features = ["runtime_shaders"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+smol = "2"
+tray-icon = "0.24.1"

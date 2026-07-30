@@ -2,9 +2,9 @@
 
 **Rust + [GPUI](https://github.com/zed-industries/zed) rewrite** of [Throne](https://github.com/throneproj/Throne) (formerly Nekoray) — a cross-platform desktop GUI proxy client powered by Sing-box / Xray.
 
-**Version:** `4.3.7` (aligned with upstream release tag / `NKR_VERSION`; see root [`VERSION`](./VERSION) and workspace `Cargo.toml`)
+**Version:** `1.2.2` (aligned with `upstream/dev` tip tag / `NKR_VERSION` — `git describe upstream/dev --tags`; see root [`VERSION`](./VERSION))
 
-> Status: **Wave B+** — upstream-compatible `throne.db` + main-window layout/ops aligned with Qt Throne.  
+> Status: **Wave C+** — Start/Stop with **route + MetaCubeX srslist + jsDelivr mirror + optional adblock** + URL Test/Stats/Connections + HTTP sub diff + macOS system proxy + Edit Profile rename.  
 > Upstream remote: `upstream` → [throneproj/Throne](https://github.com/throneproj/Throne) (`dev`).  
 > Parity matrix: [docs/UPSTREAM_TRACKING.md](./docs/UPSTREAM_TRACKING.md).
 
@@ -28,13 +28,13 @@
 ┌────────────▼─────────────┐
 │  throne-domain           │
 └────────────┬─────────────┘
-             │ LoadConfig / Stats RPC (TODO)
+             │ build config + Start/Stop
 ┌────────────▼─────────────┐
 │  throne-core-client      │
 └────────────┬─────────────┘
-             │ local socket + protobuf
+             │ unix socket + length-prefixed protobuf
 ┌────────────▼─────────────┐
-│  core/server (Go)        │
+│  ThroneCore (Go)         │
 │  sing-box · xray · TUN   │
 └──────────────────────────┘
 ```
@@ -45,24 +45,32 @@ Legacy Qt/C++ GUI was removed on branch `rewrite/rust-gpui`. History remains on 
 
 - Rust 1.85+ (edition 2021)
 - macOS / Linux / Windows (GPUI)
-- Optional: Go 1.26+ to build `core/server`
+- **Go core binary** for real proxy: `ThroneCore` (or `Core`) next to the GUI, on `PATH`, or `THRONE_CORE=/path/to/ThroneCore`
 
 ## Build & run
 
 ```bash
-# GUI (demo data)
+# 1) Build Go core (required for Start to work)
+cd core/server
+go build -o ../../target/debug/ThroneCore .
+cd ../..
+
+# 2) GUI (binary is named `Throne` — required by ThroneCore parentcheck)
 cargo run -p throne
+# On Start, ThroneCore is auto-copied next to target/debug/Throne from
+# /Applications/Throne.app or THRONE_CORE=...
 
 # Unit tests
 cargo test --workspace
 ```
 
-Build the Go core (unchanged upstream flow; scripts were removed and will return as `cargo xtask`):
+On **Start**:
+1. Builds a minimal sing-box config (mixed inbound + selected outbound)
+2. Spawns `ThroneCore` with `THRONE_CORE_SOCKET`
+3. Sends `Start` RPC (same framing as Qt Throne)
+4. If **System Proxy** is checked, enables macOS HTTP/HTTPS/SOCKS via `networksetup`
 
-```bash
-cd core/server
-go build -o ../../target/Core .
-```
+Without a core binary, Start shows a clear error instead of a fake “Running” state.
 
 ## Upstream sync
 
@@ -103,8 +111,8 @@ cargo run -p throne
 1. **M0** — GPUI shell, domain models, demo store ✅
 2. **Wave A** — SQLite + share-link import + upstream tracking doc ✅
 3. **Wave B** — Clash/JSON/SIP008/WG sub + route share import ✅
-4. **Wave C** — `libcore.proto` RPC Start/Stop/QueryStats + URL test
-5. **Wave D** — System proxy / TUN, tray, traffic stats UI
+4. **Wave C** — `libcore.proto` RPC Start/Stop/QueryStats + URL test + route rules/rule_set compile ✅
+5. **Wave D** — System proxy ✅ / TUN (needs privileges) · tray · traffic stats UI
 6. **Wave E** — Feature parity polish + packaging
 
 ## License

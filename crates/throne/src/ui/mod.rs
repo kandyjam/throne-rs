@@ -1,3 +1,4 @@
+mod dialogs;
 mod main_window;
 mod widgets;
 

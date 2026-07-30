@@ -25,10 +25,6 @@ impl Theme {
         rgb(0x3d7eff).into()
     }
 
-    pub fn bg_selected_text() -> Hsla {
-        rgb(0xffffff).into()
-    }
-
     pub fn bg_toolbar_btn() -> Hsla {
         rgb(0xf7f7f7).into()
     }

@@ -221,34 +221,41 @@ impl Profile {
         }
     }
 
-    /// Upstream table "Test Result" cell (latency + optional speed/country).
+    /// Upstream ColTestResult: latency (+ country code). Speeds live in Traffic.
     pub fn display_test_result(&self) -> String {
-        let mut parts = Vec::new();
         let lat = self.display_latency();
-        if !lat.is_empty() {
-            parts.push(lat);
+        if lat.is_empty() {
+            if self.test_country.is_empty() {
+                String::new()
+            } else {
+                self.test_country.clone()
+            }
+        } else if self.test_country.is_empty() {
+            lat
+        } else {
+            format!("{lat} · {}", self.test_country)
         }
-        if !self.test_country.is_empty() {
-            parts.push(self.test_country.clone());
-        }
-        if !self.download_speed.is_empty() {
-            parts.push(format!("↓{}", self.download_speed));
-        }
-        if !self.upload_speed.is_empty() {
-            parts.push(format!("↑{}", self.upload_speed));
-        }
-        parts.join(" ")
     }
 
+    /// Upstream ColTraffic: cumulative ↓uplink / ↑ — or last speed-test rates if no bytes yet.
     pub fn display_traffic(&self) -> String {
-        if self.traffic_downlink == 0 && self.traffic_uplink == 0 {
-            return String::new();
+        if self.traffic_downlink != 0 || self.traffic_uplink != 0 {
+            return format!(
+                "↓{} ↑{}",
+                human_bytes(self.traffic_downlink),
+                human_bytes(self.traffic_uplink)
+            );
         }
-        format!(
-            "↓{} ↑{}",
-            human_bytes(self.traffic_downlink),
-            human_bytes(self.traffic_uplink)
-        )
+        // Fall back to speed-test strings when cumulative counters are empty.
+        match (
+            self.download_speed.is_empty(),
+            self.upload_speed.is_empty(),
+        ) {
+            (true, true) => String::new(),
+            (false, true) => format!("↓{}", self.download_speed),
+            (true, false) => format!("↑{}", self.upload_speed),
+            (false, false) => format!("↓{} ↑{}", self.download_speed, self.upload_speed),
+        }
     }
 
     /// Upstream ColAddress: `host:port` from outbound.
@@ -374,12 +381,78 @@ impl CoreStatus {
 }
 
 /// Live traffic counters from the core.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrafficSnapshot {
     pub proxy_up: i64,
     pub proxy_down: i64,
     pub direct_down: i64,
     pub direct_up: i64,
+}
+
+/// Rule-set CDN mirror — matches upstream `Configs::Mirrors`.
+///
+/// Default is Cloudflare testing CF (`testingcf.jsdelivr.net`), same as Qt Throne.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RulesetMirror {
+    Github = 0,
+    #[default]
+    Cloudflare = 1,
+    Gcore = 2,
+    Quantil = 3,
+    Fastly = 4,
+    Cdn = 5,
+}
+
+impl RulesetMirror {
+    pub fn from_id(id: i32) -> Self {
+        match id {
+            0 => Self::Github,
+            2 => Self::Gcore,
+            3 => Self::Quantil,
+            4 => Self::Fastly,
+            5 => Self::Cdn,
+            _ => Self::Cloudflare,
+        }
+    }
+
+    pub fn as_id(self) -> i32 {
+        self as i32
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Github => "GitHub raw",
+            Self::Cloudflare => "jsDelivr (Cloudflare)",
+            Self::Gcore => "jsDelivr (Gcore)",
+            Self::Quantil => "jsDelivr (Quantil)",
+            Self::Fastly => "jsDelivr (Fastly)",
+            Self::Cdn => "jsDelivr (cdn)",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Github => Self::Cloudflare,
+            Self::Cloudflare => Self::Gcore,
+            Self::Gcore => Self::Quantil,
+            Self::Quantil => Self::Fastly,
+            Self::Fastly => Self::Cdn,
+            Self::Cdn => Self::Github,
+        }
+    }
+
+    /// jsDelivr `/gh` base host for this mirror (empty when using GitHub raw).
+    pub fn jsdelivr_gh_base(self) -> Option<&'static str> {
+        match self {
+            Self::Github => None,
+            Self::Cloudflare => Some("https://testingcf.jsdelivr.net/gh"),
+            Self::Gcore => Some("https://gcore.jsdelivr.net/gh"),
+            Self::Quantil => Some("https://quantil.jsdelivr.net/gh"),
+            Self::Fastly => Some("https://fastly.jsdelivr.net/gh"),
+            Self::Cdn => Some("https://cdn.jsdelivr.net/gh"),
+        }
+    }
 }
 
 /// Subset of upstream `SettingsRepo` defaults used by the Rust client.
@@ -404,6 +477,23 @@ pub struct AppSettings {
     pub system_dns_set: bool,
     pub theme: String,
     pub log_level: String,
+    /// CDN for remote `.srs` rule-sets (`ruleset_mirror` in SettingsRepo).
+    #[serde(default)]
+    pub ruleset_mirror: RulesetMirror,
+    /// Inject throne-adblocksingbox rule-set on Start when true.
+    #[serde(default)]
+    pub adblock_enable: bool,
+    /// Hotkey chords (display + future binding). Empty = use built-in defaults.
+    #[serde(default)]
+    pub hk_start_stop: String,
+    #[serde(default)]
+    pub hk_import: String,
+    #[serde(default)]
+    pub hk_save: String,
+    #[serde(default)]
+    pub hk_url_test: String,
+    #[serde(default)]
+    pub hk_copy_logs: String,
 }
 
 impl Default for AppSettings {
@@ -428,6 +518,14 @@ impl Default for AppSettings {
             system_dns_set: false,
             theme: "dark".into(),
             log_level: "info".into(),
+            // upstream default: Mirrors::CLOUDFLARE
+            ruleset_mirror: RulesetMirror::Cloudflare,
+            adblock_enable: false,
+            hk_start_stop: "Cmd/Ctrl+R".into(),
+            hk_import: "Cmd/Ctrl+V".into(),
+            hk_save: "Cmd/Ctrl+S".into(),
+            hk_url_test: "Cmd/Ctrl+T".into(),
+            hk_copy_logs: "Cmd/Ctrl+Shift+C".into(),
         }
     }
 }
@@ -496,6 +594,25 @@ impl DefaultOutbound {
             Self::Block => "block".into(),
             Self::WarpBypass => "warp-bypass".into(),
             Self::Profile(id) => id.to_string(),
+        }
+    }
+
+    pub fn label(self) -> String {
+        match self {
+            Self::Proxy => "proxy".into(),
+            Self::Direct => "direct".into(),
+            Self::Block => "block".into(),
+            Self::WarpBypass => "warp-bypass".into(),
+            Self::Profile(id) => format!("profile:{id}"),
+        }
+    }
+
+    /// Cycle among built-in defaults (proxy → direct → block → proxy).
+    pub fn cycle_builtin(self) -> Self {
+        match self {
+            Self::Proxy => Self::Direct,
+            Self::Direct => Self::Block,
+            Self::Block | Self::WarpBypass | Self::Profile(_) => Self::Proxy,
         }
     }
 }

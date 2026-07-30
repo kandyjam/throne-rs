@@ -2,24 +2,35 @@ use gpui::{App, ClickEvent, SharedString, Window, div, prelude::*, px};
 
 use crate::theme::Theme;
 
-/// Top toolbar menu button: icon glyph + label under (text-under-icon style).
-pub fn toolbar_menu_btn(
+/// Toolbar button width (keep in sync with main_window menu overlay offsets).
+pub const TOOLBAR_BTN_W: f32 = 68.;
+/// Gap between toolbar menu buttons.
+pub const TOOLBAR_BTN_GAP: f32 = 4.;
+/// Top padding of the top bar + button height — menu overlay top edge.
+pub const TOOLBAR_MENU_TOP: f32 = 66.;
+/// Left padding of the top bar.
+pub const TOOLBAR_PAD_X: f32 = 8.;
+
+/// Toolbar button. Dropdown content is rendered as a **root-level overlay**
+/// (see `MainWindow::render_toolbar_menu_overlay`) so it is not clipped or
+/// painted under the profile table / group tabs.
+pub fn toolbar_btn(
     id: impl Into<SharedString>,
     glyph: &'static str,
     label: &'static str,
     open: bool,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
+    let id: SharedString = id.into();
     div()
-        .id(id.into())
+        .id(id)
         .flex()
         .flex_col()
         .items_center()
         .justify_center()
         .gap_0p5()
-        .px_2()
-        .py_1()
-        .min_w(px(64.))
+        .w(px(TOOLBAR_BTN_W))
+        .h(px(56.))
         .rounded_sm()
         .border_1()
         .border_color(if open {
@@ -41,16 +52,36 @@ pub fn toolbar_menu_btn(
                 .text_color(Theme::text())
                 .child(glyph),
         )
-        .child(
-            div()
-                .text_xs()
-                .text_color(Theme::text())
-                .child(label),
-        )
-        .on_click(on_click)
+        .child(div().text_xs().text_color(Theme::text()).child(label))
+        .on_click(on_toggle)
 }
 
-/// Large Start / Stop control (upstream StartStopButton).
+/// Floating dropdown panel for toolbar menus (absolute, caller sets top/left).
+pub fn toolbar_menu_panel(
+    id: impl Into<SharedString>,
+    top: f32,
+    left: f32,
+    menu: impl IntoElement,
+) -> impl IntoElement {
+    div()
+        .id(id.into())
+        .absolute()
+        .top(px(top))
+        .left(px(left))
+        .min_w(px(230.))
+        .max_h(px(360.))
+        .overflow_y_scroll()
+        .py_1()
+        .bg(Theme::bg_elevated())
+        .border_1()
+        .border_color(Theme::border_light())
+        .rounded_sm()
+        .shadow_lg()
+        // Capture clicks so they don't fall through to the table.
+        .occlude()
+        .child(menu)
+}
+
 pub fn start_stop_btn(
     running: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
@@ -66,7 +97,7 @@ pub fn start_stop_btn(
         .flex_col()
         .items_center()
         .justify_center()
-        .w(px(72.))
+        .w(px(64.))
         .h(px(56.))
         .rounded_md()
         .border_1()
@@ -74,12 +105,7 @@ pub fn start_stop_btn(
         .bg(Theme::bg_elevated())
         .hover(|e| e.bg(Theme::bg_hover()))
         .cursor_pointer()
-        .child(
-            div()
-                .text_xl()
-                .text_color(color)
-                .child(glyph),
-        )
+        .child(div().text_xl().text_color(color).child(glyph))
         .child(
             div()
                 .text_xs()
@@ -90,7 +116,6 @@ pub fn start_stop_btn(
         .on_click(on_click)
 }
 
-/// Checkbox row matching Tun / System DNS / System Proxy.
 pub fn mode_checkbox(
     id: impl Into<SharedString>,
     label: &'static str,
@@ -102,6 +127,7 @@ pub fn mode_checkbox(
         .flex()
         .items_center()
         .gap_1p5()
+        .h(px(18.))
         .cursor_pointer()
         .on_click(on_click)
         .child(
@@ -122,12 +148,7 @@ pub fn mode_checkbox(
                 .text_color(Theme::text_on_selected())
                 .child(if checked { "✓" } else { "" }),
         )
-        .child(
-            div()
-                .text_xs()
-                .text_color(Theme::text())
-                .child(label),
-        )
+        .child(div().text_xs().text_color(Theme::text()).child(label))
 }
 
 pub fn menu_item(
@@ -137,6 +158,7 @@ pub fn menu_item(
 ) -> impl IntoElement {
     div()
         .id(id.into())
+        .w_full()
         .px_3()
         .py_1p5()
         .text_sm()
@@ -162,4 +184,165 @@ pub fn menu_label(text: impl Into<SharedString>) -> impl IntoElement {
         .text_xs()
         .text_color(Theme::text_muted())
         .child(text.into())
+}
+
+/// Modal dialog chrome (secondary features).
+///
+/// GPUI hit-testing is multi-hit by default: without [`.occlude()`], a click on
+/// the panel still marks the backdrop as hovered and fires its close handler.
+/// That is why "click field to type" used to dismiss the dialog immediately.
+pub fn modal_shell(
+    title: impl Into<SharedString>,
+    body: impl IntoElement,
+    on_close: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let on_close = std::rc::Rc::new(on_close);
+    let on_close_bg = on_close.clone();
+    let on_close_x = on_close;
+    div()
+        .id("modal-root")
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        // Block interaction with the main window under the modal.
+        .occlude()
+        .child(
+            // dim backdrop — click outside the panel closes
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .bg(gpui::rgba(0x00000080))
+                .id("modal-backdrop")
+                .on_click(move |ev, w, cx| on_close_bg(ev, w, cx)),
+        )
+        .child(
+            div()
+                .id("modal-panel")
+                .relative()
+                .w(px(520.))
+                .max_h(px(480.))
+                .flex()
+                .flex_col()
+                .bg(Theme::bg_elevated())
+                .border_1()
+                .border_color(Theme::border())
+                .rounded_md()
+                .shadow_lg()
+                // Critical: absorb hits so the backdrop under the panel does not close us.
+                .occlude()
+                // Swallow clicks on empty panel chrome (title bar padding, gaps).
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .px_4()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(Theme::border_light())
+                        .bg(Theme::bg_panel())
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(Theme::text())
+                                .child(title.into()),
+                        )
+                        .child(
+                            div()
+                                .id("modal-x")
+                                .px_2()
+                                .cursor_pointer()
+                                .text_color(Theme::text_muted())
+                                .child("✕")
+                                .on_click(move |ev, w, cx| {
+                                    on_close_x(ev, w, cx);
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("modal-body")
+                        .flex_1()
+                        .overflow_y_scroll()
+                        .p_4()
+                        .child(body),
+                ),
+        )
+}
+
+pub fn form_row(label: &'static str, value: impl Into<SharedString>) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap_3()
+        .mb_2()
+        .child(
+            div()
+                .w(px(160.))
+                .text_xs()
+                .text_color(Theme::text_muted())
+                .child(label),
+        )
+        .child(
+            div()
+                .flex_1()
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(Theme::border_light())
+                .bg(Theme::bg_app())
+                .text_sm()
+                .text_color(Theme::text())
+                .child(value.into()),
+        )
+}
+
+pub fn primary_btn(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id.into())
+        .px_3()
+        .py_1p5()
+        .rounded_sm()
+        .bg(Theme::accent())
+        .text_sm()
+        .text_color(Theme::text_on_selected())
+        .cursor_pointer()
+        .hover(|e| e.opacity(0.9))
+        .child(label.into())
+        .on_click(on_click)
+}
+
+pub fn secondary_btn(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id.into())
+        .px_3()
+        .py_1p5()
+        .rounded_sm()
+        .border_1()
+        .border_color(Theme::border_light())
+        .bg(Theme::bg_toolbar_btn())
+        .text_sm()
+        .text_color(Theme::text())
+        .cursor_pointer()
+        .hover(|e| e.bg(Theme::bg_hover()))
+        .child(label.into())
+        .on_click(on_click)
 }

@@ -14,6 +14,8 @@ base64 = { workspace = true }
 url = { workspace = true }
 urlencoding = { workspace = true }
 serde_yaml = { workspace = true }
+ureq = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+

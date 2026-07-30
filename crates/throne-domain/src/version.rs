@@ -3,7 +3,7 @@
 //! Upstream injects the release tag via CMake `INPUT_VERSION` / `NKR_VERSION`
 //! (see `cmake/nkr.cmake`). We use the Cargo package version for the same role.
 
-/// Full version string, e.g. `4.3.7` or `4.3.7-rs.1` if a pre-release suffix is set.
+/// Full version string, e.g. `1.2.2` (must match upstream `dev` tip tag / NKR_VERSION).
 pub const NKR_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// User-Agent / compact product id: `Throne/<version>` (upstream SettingsRepo).

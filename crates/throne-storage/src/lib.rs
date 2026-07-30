@@ -646,7 +646,7 @@ fn merge_settings_tx(
     tx: &rusqlite::Transaction<'_>,
     s: &AppSettings,
 ) -> Result<(), StorageError> {
-    let pairs: [(&str, String); 18] = [
+    let pairs: [(&str, String); 25] = [
         ("inbound_socks_port", s.inbound_socks_port.to_string()),
         ("inbound_address", s.inbound_address.clone()),
         ("test_url", s.test_latency_url.clone()),
@@ -671,6 +671,13 @@ fn merge_settings_tx(
         ("system_dns_set", bool_str(s.system_dns_set)),
         ("theme", s.theme.clone()),
         ("log_level", s.log_level.clone()),
+        ("ruleset_mirror", s.ruleset_mirror.as_id().to_string()),
+        ("adblock_enable", bool_str(s.adblock_enable)),
+        ("hk_start_stop", s.hk_start_stop.clone()),
+        ("hk_import", s.hk_import.clone()),
+        ("hk_save", s.hk_save.clone()),
+        ("hk_url_test", s.hk_url_test.clone()),
+        ("hk_copy_logs", s.hk_copy_logs.clone()),
     ];
     for (k, v) in pairs {
         tx.execute(
@@ -726,6 +733,27 @@ fn apply_setting(s: &mut AppSettings, key: &str, value: &str) {
         "system_dns_set" => s.system_dns_set = parse_bool(value),
         "theme" => s.theme = value.to_string(),
         "log_level" => s.log_level = value.to_string(),
+        "ruleset_mirror" => {
+            if let Ok(n) = value.parse::<i32>() {
+                s.ruleset_mirror = throne_domain::RulesetMirror::from_id(n);
+            } else {
+                // Accept labels / snake names from hand-edited DBs.
+                s.ruleset_mirror = match value.trim().to_ascii_lowercase().as_str() {
+                    "github" | "gh" => throne_domain::RulesetMirror::Github,
+                    "gcore" => throne_domain::RulesetMirror::Gcore,
+                    "quantil" => throne_domain::RulesetMirror::Quantil,
+                    "fastly" => throne_domain::RulesetMirror::Fastly,
+                    "cdn" => throne_domain::RulesetMirror::Cdn,
+                    _ => throne_domain::RulesetMirror::Cloudflare,
+                };
+            }
+        }
+        "adblock_enable" => s.adblock_enable = parse_bool(value),
+        "hk_start_stop" => s.hk_start_stop = value.to_string(),
+        "hk_import" => s.hk_import = value.to_string(),
+        "hk_save" => s.hk_save = value.to_string(),
+        "hk_url_test" => s.hk_url_test = value.to_string(),
+        "hk_copy_logs" => s.hk_copy_logs = value.to_string(),
         _ => {}
     }
 }

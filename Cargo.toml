@@ -10,9 +10,9 @@ members = [
 default-members = ["crates/throne"]
 
 [workspace.package]
-# Keep in lockstep with upstream throneproj/Throne release tags (NKR_VERSION / INPUT_VERSION).
-# Latest audited: https://github.com/throneproj/Throne/releases → 4.3.7
-version = "4.3.7"
+# Keep in lockstep with upstream throneproj/Throne `dev` tip tag (NKR_VERSION / INPUT_VERSION).
+# `git describe upstream/dev --tags` → 1.2.2 (tip == tag). Do NOT use max 4.x tags; those are older ancestors.
+version = "1.2.2"
 edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/kandyjam/throne-rs"
@@ -34,6 +34,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 anyhow = "1"
+ureq = { version = "2", default-features = false, features = ["tls"] }
 base64 = "0.22"
 url = "2"
 urlencoding = "2"

@@ -3,7 +3,7 @@
 Remote: `upstream` → `https://github.com/throneproj/Throne.git`  
 Baseline branch: `upstream/dev`  
 Last audited tip: `fb68b742` (*update xray core*) — same as local `dev` tip at fork time.  
-**Product version:** `4.3.7` (= latest upstream release tag / `NKR_VERSION`; root `VERSION` + workspace `Cargo.toml`)
+**Product version:** `1.2.2` (= `git describe upstream/dev --tags`; tip commit is tagged `1.2.2`. Older `4.x` tags are ancestors, not the current product line.)
 
 ## How to refresh
 
@@ -29,25 +29,28 @@ Status legend: ✅ done · 🧩 partial · ⏳ planned · ❌ out of scope (Go c
 | SIP008 / WireGuard file | `updateSIP008` / `updateWireguardFileConfig` | ✅ | `throne-import` |
 | `throne://add/` · `throne://route/` · `throne://remoteRoute/` · `throne://addsub/` | `e7eb0438` deeplink schemes | ✅ | `throne-import` |
 | SQLite profiles/groups/settings/routes | `*Repo.cpp` | ✅ **wire-compatible** `throne.db` (incl. `route_rules`, path discovery) | `throne-storage` |
-| Route profiles (raw + remote + auto-update) | `5b1482c3`, `54dde90e`, `4eeef231` | 🧩 import/share + persist; no HTTP fetch | `throne-domain` |
-| System proxy / TUN modes | MainWindow + settings | 🧩 UI mode cycle (no OS hooks) | `throne` |
-| TUN private-range bypass flag | `3c344f78` | 🧩 settings field | `throne-domain` |
-| Runtime stats UI | `bac76b83` | ⏳ | `throne` |
-| Traffic stats aggregation | `ff3d3c10`, `11373611` | ⏳ | `throne-storage` |
-| URL / speed / IP / country tests | core RPC + menus | ⏳ | `throne-core-client` |
+| Route profiles (raw + remote + auto-update) | `5b1482c3`, `54dde90e`, `4eeef231` | 🧩 dialog + remote HTTP fetch; rule editor partial | `throne-domain` |
+| System proxy / TUN modes | MainWindow + settings | 🧩 system proxy OS; TUN config on Start (needs privileges) | `throne` |
+| TUN private-range bypass flag | `3c344f78` | ✅ Tun Settings dialog + config | `throne-domain` |
+| Runtime stats UI | `bac76b83` | 🧩 live rates + Connections tab | `throne` |
+| Traffic stats aggregation | `ff3d3c10`, `11373611` | 🧩 QueryStats rates (no throne_stats.db yet) | `throne-core-client` |
+| URL / speed / IP / country tests | core RPC + menus | 🧩 URL/IP/simple Speedtest; full multi-thread speed later | `throne-core-client` |
 | Xray geo asset download | `5206254a`, `1bd3a321` | ⏳ | `throne` / tools |
 | WARP generate | `0957b8d5`, `61ff7a37` | ⏳ | `throne-import` |
 | Mieru | `64f74878` | 🧩 type enum | `throne-import` |
 | Config security / remove insecure | `cd7cb259` | 🧩 `security` field | `throne-domain` |
-| Tray profile + route selector | `688d1cb4`, `c632c4e9` | ⏳ | `throne` |
-| Sub update diff popup | `58276dd2`, `a05cc8fd` | ⏳ | `throne` |
+| Tray profile + route selector | `688d1cb4`, `c632c4e9` | 🧩 tray icon + show/start-stop/quit; profile and route selector later | `throne` |
+| Sub update diff popup | `58276dd2`, `a05cc8fd` | 🧩 status bar `+added −removed · kept` (no modal list yet) | `throne` / `throne-domain` |
 | Proxy list search UX | `8e726191` | 🧩 text filter | `throne` |
-| Hotkeys | Settings `hk_*` | 🧩 Start/Stop + search | `throne` |
+| Hotkeys | Settings `hk_*` | 🧩 dialog + saved labels; global rebind later | `throne` |
 | i18n | `zh_CN` / `ru_RU` / `fa_IR` | ⏳ | `throne` |
 | Linux CLI installer | `89f3ec1d` | ⏳ | `script/` / xtask |
-| Core: sing-box / xray / TUN / DNS | Go `core/server` | ❌ keep Go | `core/server` |
+| Core: sing-box / xray / TUN / DNS | Go `core/server` | ❌ keep Go binary (`ThroneCore`) | `core/server` |
+| Core IPC Start/Stop | `dispatch.go` + Qt `RPC.cpp` framing | 🧩 Start/Stop/Test/QueryStats/QueryConnections; route compile + **srslist (2178) + jsDelivr mirror + optional adblock**; full BuildSingBoxConfig DNS/xray parity still open | `throne-core-client` |
+| System proxy | `QvProxyConfigurator` | 🧩 macOS `networksetup` on Start when checkbox on | `throne-core-client` |
 | GPUI shell | — | ✅ M0 | `throne` |
-| Main window layout / ops | `mainwindow.ui` | 🧩 toolbar menus, Start/Stop, Tun/DNS/Proxy, group tabs, 5-col table, logs/conn panel, status bar | `throne` |
+| Main window layout / ops | `mainwindow.ui` | 🧩 relative toolbar menus (under each btn), Start/Stop, Tun/DNS/Proxy, group tabs, 5-col table, logs/conn, status + **v1.2.2** | `throne` |
+| Secondary dialogs | BasicSettings / GroupItem / ProfileEdit | 🧩 Basic/Groups/Add/Routing/Tun/Hotkey/**Edit Profile (rename)** modals; deep ProfileEdit (outbound JSON) later | `throne` |
 
 ## Defaults synced from upstream
 
@@ -62,9 +65,9 @@ Status legend: ✅ done · 🧩 partial · ⏳ planned · ❌ out of scope (Go c
 
 1. **Wave A** — tracking doc, share-link import, SQLite load/save, settings skeleton, UI Import ✅  
 2. **Wave B (this drop)** — Clash/JSON/SIP008/WG sub, route share import, route_profiles table, UI route cycle ✅  
-3. **Wave C** — core RPC Start/Stop/QueryStats, URL test  
-4. **Wave D** — TUN/system proxy OS integration, tray, stats charts  
-5. **Wave B+** — HTTP fetch for `addsub`/remote routes, full Clash option parity, OS deeplink registration
+3. **Wave C** — Start/Stop/URL/IP/Speed(simple)/Stats/Connections ✅; active route + MetaCubeX `srslist` + jsDelivr mirror + adblock ✅; full BuildSingBoxConfig DNS/xray parity still open  
+4. **Wave D** — TUN privilege helper, tray, stats charts / `throne_stats.db`  
+5. **Wave B+** — HTTP sub ✅; remote route fetch ✅; full Clash option parity / OS deeplink registration
 
 ## Commit triage notes (recent upstream themes)
 

@@ -6,6 +6,7 @@
 mod clash;
 mod decode;
 mod deeplink;
+mod fetch;
 mod json_sub;
 mod links;
 mod route_share;
@@ -13,8 +14,32 @@ mod route_share;
 use throne_domain::{ParsedOutbound, ProfileType, RouteProfile};
 
 pub use deeplink::{Deeplink, parse_deeplink};
+pub use fetch::{fetch_url, fetch_url_with_timeout};
 pub use links::parse_share_link;
 pub use route_share::{RouteImportReport, to_share_object, try_import_routes};
+
+/// Fetch `url` and run [`import_text`] on the body.
+pub fn import_from_url(url: &str) -> ImportReport {
+    match fetch_url(url) {
+        Ok(body) => {
+            let mut report = import_text(&body);
+            if report.profiles.is_empty()
+                && report.routes.is_empty()
+                && report.errors.is_empty()
+            {
+                report
+                    .errors
+                    .push("fetched body but no profiles/routes recognized".into());
+            }
+            report.notes.push(format!("fetched {}", url.trim()));
+            report
+        }
+        Err(e) => ImportReport {
+            errors: vec![e],
+            ..Default::default()
+        },
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportedProfile {
@@ -146,7 +171,7 @@ fn import_deeplink(dl: Deeplink) -> ImportReport {
         }
         Deeplink::AddSub { url } => ImportReport {
             pending_sub_url: Some(url),
-            notes: vec!["throne://addsub/ — HTTP fetch not implemented yet".into()],
+            notes: vec!["throne://addsub/ — call import_from_url with the pending URL".into()],
             ..Default::default()
         },
         Deeplink::Route { payload } => {
