@@ -99,6 +99,17 @@ mod tests {
     }
 
     #[test]
+    fn main_window_omits_non_original_dns_and_runtime_summary_regions() {
+        let source = include_str!("ui/main_window.rs");
+
+        assert!(source.contains("mode_checkbox(\"tun\", \"Tun Mode\""));
+        assert!(source.contains("mode_checkbox(\"proxy\", \"System Proxy\""));
+        assert!(!source.contains("mode_checkbox(\"dns\", \"System DNS\""));
+        assert!(!source.contains("fn render_data_view(&self)"));
+        assert!(!source.contains(".child(self.render_data_view())"));
+    }
+
+    #[test]
     fn tray_menu_ids_map_to_their_application_actions() {
         assert_eq!(command_from_menu_id("throne.show"), Some(TrayCommand::ShowWindow));
         assert_eq!(command_from_menu_id("throne.toggle"), Some(TrayCommand::ToggleProxy));

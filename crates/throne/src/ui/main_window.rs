@@ -1690,16 +1690,6 @@ impl MainWindow {
                     })
                     .child({
                         let e = entity.clone();
-                        let on = self.state.settings().system_dns_set;
-                        mode_checkbox("dns", "System DNS", on, move |_, _, cx| {
-                            e.update(cx, |this, cx| {
-                                let next = !this.state.settings().system_dns_set;
-                                this.set_sys_dns(next, cx);
-                            });
-                        })
-                    })
-                    .child({
-                        let e = entity.clone();
                         let on = self.state.settings().system_proxy_enabled;
                         mode_checkbox("proxy", "System Proxy", on, move |_, _, cx| {
                             e.update(cx, |this, cx| {
@@ -1709,7 +1699,6 @@ impl MainWindow {
                         })
                     }),
             )
-            .child(self.render_data_view())
     }
 
     fn menu_items_for(&self, menu: OpenMenu, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1970,50 +1959,6 @@ impl MainWindow {
             items,
         )
         .into_any_element()
-    }
-
-    fn render_data_view(&self) -> impl IntoElement {
-        let running = self.state.running_label();
-        let inbound = self.state.inbound_label();
-        let route = self
-            .state
-            .active_route()
-            .map(|r| r.name.clone())
-            .unwrap_or_else(|| "—".into());
-        let msg = self.state.status_message().to_string();
-
-        div()
-            .flex_1()
-            .min_w(px(160.))
-            .h(px(56.))
-            .px_3()
-            .py_1()
-            .bg(Theme::bg_elevated())
-            .border_1()
-            .border_color(Theme::border_light())
-            .rounded_sm()
-            .flex()
-            .flex_col()
-            .justify_center()
-            .gap_0p5()
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(if self.state.core_status().is_running() {
-                        Theme::success()
-                    } else {
-                        Theme::text()
-                    })
-                    .child(running),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(Theme::text_muted())
-                    .child(format!("{inbound}  ·  Route: {route}")),
-            )
-            .child(div().text_xs().text_color(Theme::text_muted()).child(msg))
     }
 
     fn render_ctx_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
