@@ -2,6 +2,8 @@
 
 **Rust + [GPUI](https://github.com/zed-industries/zed) rewrite** of [Throne](https://github.com/throneproj/Throne) (formerly Nekoray) — a cross-platform desktop GUI proxy client powered by Sing-box / Xray.
 
+**Version:** `4.3.7` (aligned with upstream release tag / `NKR_VERSION`; see root [`VERSION`](./VERSION) and workspace `Cargo.toml`)
+
 > Status: **Wave B+** — upstream-compatible `throne.db` + main-window layout/ops aligned with Qt Throne.  
 > Upstream remote: `upstream` → [throneproj/Throne](https://github.com/throneproj/Throne) (`dev`).  
 > Parity matrix: [docs/UPSTREAM_TRACKING.md](./docs/UPSTREAM_TRACKING.md).

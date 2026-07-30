@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Domain models and in-memory store for Throne-rs"
+# version comes from workspace (= upstream NKR_VERSION / release tag)
 
 [dependencies]
 serde = { workspace = true }

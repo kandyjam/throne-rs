@@ -5472,7 +5472,7 @@ dependencies = [
 
 [[package]]
 name = "throne"
-version = "0.1.0"
+version = "4.3.7"
 dependencies = [
  "anyhow",
  "gpui",
@@ -5486,7 +5486,7 @@ dependencies = [
 
 [[package]]
 name = "throne-core-client"
-version = "0.1.0"
+version = "4.3.7"
 dependencies = [
  "anyhow",
  "serde",
@@ -5499,7 +5499,7 @@ dependencies = [
 
 [[package]]
 name = "throne-domain"
-version = "0.1.0"
+version = "4.3.7"
 dependencies = [
  "serde",
  "serde_json",
@@ -5509,7 +5509,7 @@ dependencies = [
 
 [[package]]
 name = "throne-import"
-version = "0.1.0"
+version = "4.3.7"
 dependencies = [
  "base64",
  "serde",
@@ -5523,7 +5523,7 @@ dependencies = [
 
 [[package]]
 name = "throne-storage"
-version = "0.1.0"
+version = "4.3.7"
 dependencies = [
  "dirs 6.0.0",
  "rusqlite",

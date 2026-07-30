@@ -622,11 +622,18 @@ impl MainWindow {
                     cx.notify();
                 });
                 item!("t-update", "Check For Update", |t, cx| {
-                    t.state
-                        .set_status_message("Check For Update — not yet ported");
+                    t.state.set_status_message(format!(
+                        "Current version {} — update check not yet ported",
+                        throne_domain::NKR_VERSION
+                    ));
                     t.close_menus();
                     cx.notify();
                 });
+                panel = panel.child(menu_separator());
+                panel = panel.child(menu_label(format!(
+                    "Version {}",
+                    throne_domain::NKR_VERSION
+                )));
             }
             OpenMenu::ProfileCtx => {
                 panel = panel.child(menu_label("Server"));
@@ -958,6 +965,12 @@ impl MainWindow {
                             .unwrap_or("throne.db")
                             .to_string()
                     }),
+            )
+            // Upstream refresh_status appends NKR_VERSION on the window title / tray
+            .child(
+                div()
+                    .text_color(Theme::text_muted())
+                    .child(throne_domain::NKR_VERSION),
             )
     }
 }

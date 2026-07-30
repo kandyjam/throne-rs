@@ -2,7 +2,8 @@
 
 Remote: `upstream` → `https://github.com/throneproj/Throne.git`  
 Baseline branch: `upstream/dev`  
-Last audited tip: `fb68b742` (*update xray core*) — same as local `dev` tip at fork time.
+Last audited tip: `fb68b742` (*update xray core*) — same as local `dev` tip at fork time.  
+**Product version:** `4.3.7` (= latest upstream release tag / `NKR_VERSION`; root `VERSION` + workspace `Cargo.toml`)
 
 ## How to refresh
 

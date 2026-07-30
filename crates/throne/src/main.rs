@@ -7,6 +7,7 @@ use gpui::{
 };
 use tracing_subscriber::EnvFilter;
 
+use throne_domain::{NKR_VERSION, display_name};
 use ui::MainWindow;
 
 fn main() {
@@ -15,6 +16,8 @@ fn main() {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+
+    tracing::info!(version = NKR_VERSION, "Throne starting");
 
     Application::new().run(|cx: &mut App| {
         cx.activate(true);
@@ -25,7 +28,8 @@ fn main() {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("Throne".into()),
+                    // Upstream tray/title includes NKR_VERSION
+                    title: Some(display_name().into()),
                     appears_transparent: false,
                     traffic_light_position: Some(point(px(9.), px(9.))),
                 }),
