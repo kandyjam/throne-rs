@@ -27,7 +27,7 @@ Status legend: ✅ done · 🧩 partial · ⏳ planned · ❌ out of scope (Go c
 | Full Xray subscription | `2fc64c51` | 🧩 config array → custom | `throne-import` |
 | SIP008 / WireGuard file | `updateSIP008` / `updateWireguardFileConfig` | ✅ | `throne-import` |
 | `throne://add/` · `throne://route/` · `throne://remoteRoute/` · `throne://addsub/` | `e7eb0438` deeplink schemes | ✅ | `throne-import` |
-| SQLite profiles/groups/settings/routes | `*Repo.cpp` | ✅ profiles+groups+settings+routes | `throne-storage` |
+| SQLite profiles/groups/settings/routes | `*Repo.cpp` | ✅ **wire-compatible** `throne.db` (incl. `route_rules`, path discovery) | `throne-storage` |
 | Route profiles (raw + remote + auto-update) | `5b1482c3`, `54dde90e`, `4eeef231` | 🧩 import/share + persist; no HTTP fetch | `throne-domain` |
 | System proxy / TUN modes | MainWindow + settings | 🧩 UI mode cycle (no OS hooks) | `throne` |
 | TUN private-range bypass flag | `3c344f78` | 🧩 settings field | `throne-domain` |

@@ -30,7 +30,7 @@ pub fn try_import_routes(input: &str) -> Option<RouteImportReport> {
                 return Some(report);
             }
             Deeplink::RemoteRoute { payload } => {
-                let mut report = import_remote_route_payload(&payload);
+                let mut report = import_route_payload_as_remote(&payload);
                 report.notes.push("throne://remoteRoute/ deep link".into());
                 return Some(report);
             }
@@ -38,7 +38,6 @@ pub fn try_import_routes(input: &str) -> Option<RouteImportReport> {
         }
     }
 
-    // Only claim tagged route share objects — never bare sing-box/xray JSON.
     if trimmed.contains("throne-route-profile") {
         return Some(import_route_payload(trimmed));
     }
@@ -79,7 +78,6 @@ pub fn import_route_payload(text: &str) -> RouteImportReport {
     }
 
     if let Some(arr) = doc.as_array() {
-        // Legacy bare rule array
         let mut p = RouteProfile::new(0, "Imported rules");
         p.rules = rules_from_array(arr, &mut report.warnings);
         report.notes.push("legacy bare rule array".into());
@@ -97,7 +95,6 @@ pub fn import_route_payload_as_remote(payload: &str) -> RouteImportReport {
 
 fn import_remote_route_payload(payload: &str) -> RouteImportReport {
     let mut report = RouteImportReport::default();
-    // Payload is JSON array of { url, name?, autoUpdate? } or a single URL string.
     if let Ok(doc) = serde_json::from_str::<Value>(payload) {
         if let Some(arr) = doc.as_array() {
             for item in arr {
@@ -111,7 +108,6 @@ fn import_remote_route_payload(payload: &str) -> RouteImportReport {
             report.routes.push(remote_profile(url, None, true));
         }
     } else {
-        // plain URL list
         for line in payload.lines() {
             let u = line.trim();
             if u.starts_with("http://") || u.starts_with("https://") {
@@ -198,40 +194,75 @@ fn rules_from_array(arr: &[Value], warnings: &mut Vec<String>) -> Vec<RouteRule>
             warnings.push(format!("rule[{i}] is not an object"));
             continue;
         };
+        let token = obj
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("custom")
+            .to_string();
+        let type_int = obj
+            .get("type")
+            .and_then(|v| v.as_i64())
+            .map(|n| n as i32)
+            .unwrap_or_else(|| RouteRule::type_from_token(&token));
+        let outbound_id = obj
+            .get("outbound")
+            .and_then(|v| v.as_str())
+            .map(|s| DefaultOutbound::from_share_token(s).as_id())
+            .or_else(|| {
+                obj.get("outbound")
+                    .or_else(|| obj.get("outboundID"))
+                    .and_then(|v| v.as_i64())
+            })
+            .unwrap_or(DefaultOutbound::Proxy.as_id());
+
         let mut rule = RouteRule {
             name: obj
                 .get("name")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| format!("rule_{}", i + 1)),
-            rule_type: obj
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("advanced")
-                .to_string(),
-            outbound: obj
-                .get("outbound")
-                .and_then(|v| v.as_str())
-                .map(DefaultOutbound::from_share_token)
-                .or_else(|| {
-                    obj.get("outbound")
-                        .and_then(|v| v.as_i64())
-                        .map(DefaultOutbound::from_id)
-                })
-                .unwrap_or(DefaultOutbound::Proxy),
+            rule_type: type_int,
+            rule_type_token: if token.parse::<i64>().is_ok() {
+                RouteRule::token_from_type(type_int).to_string()
+            } else {
+                token
+            },
+            outbound_id,
             invert: obj
                 .get("invert")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
-            extra: Value::Object(obj.clone()),
+            action: obj
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("route")
+                .to_string(),
+            network: obj
+                .get("network")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            protocol: obj
+                .get("protocol")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            ip_version: obj
+                .get("ip_version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
             ..Default::default()
         };
         rule.domain = string_list(obj.get("domain"));
         rule.domain_suffix = string_list(obj.get("domain_suffix"));
         rule.domain_keyword = string_list(obj.get("domain_keyword"));
+        rule.domain_regex = string_list(obj.get("domain_regex"));
         rule.ip_cidr = string_list(obj.get("ip_cidr"));
         rule.process_name = string_list(obj.get("process_name"));
-        rule.network = string_list(obj.get("network"));
+        rule.process_path = string_list(obj.get("process_path"));
+        rule.inbound = string_list(obj.get("inbound"));
+        rule.rule_set = string_list(obj.get("rule_set"));
         rules.push(rule);
     }
     rules
@@ -278,10 +309,15 @@ pub fn to_share_object(profile: &RouteProfile) -> Value {
         .rules
         .iter()
         .map(|r| {
+            let token = if r.rule_type_token.is_empty() {
+                RouteRule::token_from_type(r.rule_type).to_string()
+            } else {
+                r.rule_type_token.clone()
+            };
             serde_json::json!({
                 "name": r.name,
-                "type": r.rule_type,
-                "outbound": r.outbound.to_share_token(),
+                "type": token,
+                "outbound": DefaultOutbound::from_id(r.outbound_id).to_share_token(),
                 "domain": r.domain,
                 "domain_suffix": r.domain_suffix,
                 "domain_keyword": r.domain_keyword,
@@ -314,7 +350,7 @@ mod tests {
             "name":"Home",
             "default_outbound":"proxy",
             "rules":[
-                {"name":"ads","type":"simple","outbound":"block","domain_suffix":["ads.example"]}
+                {"name":"ads","type":"simple_address_block","outbound":"block","domain_suffix":["ads.example"]}
             ]
         }"#;
         let r = import_route_payload(json);
@@ -322,6 +358,7 @@ mod tests {
         assert_eq!(r.routes[0].name, "Home");
         assert_eq!(r.routes[0].rules.len(), 1);
         assert_eq!(r.routes[0].rules[0].domain_suffix[0], "ads.example");
+        assert_eq!(r.routes[0].rules[0].outbound_id, DefaultOutbound::Block.as_id());
     }
 
     #[test]

@@ -564,8 +564,18 @@ fn load_initial_state() -> (AppState, String) {
     match throne_storage::open_default() {
         Ok(db) => {
             let path = db.path().display().to_string();
+            let legacy = throne_storage::Database::looks_like_throne_db(&path);
             match throne_storage::load_or_seed_demo(&db) {
-                Ok(state) => (state, path),
+                Ok(mut state) => {
+                    if legacy {
+                        let n = state.all_profiles().len();
+                        let g = state.all_groups().len();
+                        state.set_status_message(format!(
+                            "Opened Throne DB · {g} groups · {n} profiles · {path}"
+                        ));
+                    }
+                    (state, path)
+                }
                 Err(e) => {
                     let mut s = AppState::with_demo_data();
                     s.set_status_message(format!("DB load failed ({e}); using demo"));

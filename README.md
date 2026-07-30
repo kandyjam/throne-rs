@@ -70,6 +70,24 @@ git log --oneline upstream/dev -30
 # refresh parity notes after reading commits
 ```
 
+### Use an existing Throne database
+
+The client opens **original** `throne.db` when found (same layout as Qt Throne):
+
+| Priority | Path |
+|----------|------|
+| 1 | `$THRONE_DB` |
+| 2 | Discovered: `<app>/config/throne.db`, `~/Library/Application Support/Throne/config/throne.db`, `~/.config/Throne/config/throne.db`, … |
+| 3 | New: OS data dir `…/throne-rs/throne.db` |
+
+```bash
+# Point at a portable install
+export THRONE_DB="/path/to/Throne/config/throne.db"
+cargo run -p throne
+```
+
+Schema is wire-compatible (`profiles` / `groups` / `groups_order` / `route_profiles` + `route_rules` / `settings` / `entity_ids`). Unknown settings keys are preserved on save. Traffic stats stay in sibling `throne_stats.db` (not rewritten yet).
+
 Import share links (clipboard or env):
 
 ```bash

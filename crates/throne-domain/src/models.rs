@@ -1,4 +1,3 @@
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Stable numeric id used across UI and persistence (matches legacy SQLite ids).
@@ -231,7 +230,7 @@ impl Profile {
     }
 }
 
-/// Subscription / manual group of profiles.
+/// Subscription / manual group of profiles (columns match upstream `groups` table).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Group {
     pub id: GroupId,
@@ -240,9 +239,19 @@ pub struct Group {
     pub info: String,
     pub archive: bool,
     pub skip_auto_update: bool,
-    pub sub_last_update: Option<DateTime<Utc>>,
-    /// Ordered profile ids in this group.
+    pub auto_clear_unavailable: bool,
+    /// Epoch seconds (`sub_last_update` column).
+    pub sub_last_update: i64,
+    pub front_proxy_id: i64,
+    pub landing_proxy_id: i64,
+    pub column_width_json: String,
+    /// Ordered profile ids (`profiles_json` column).
     pub profile_ids: Vec<ProfileId>,
+    pub scroll_last_profile: i64,
+    pub test_sort_by: i32,
+    pub traffic_sort_by: i32,
+    pub test_items_to_show: i32,
+    pub type_sort_by: i32,
 }
 
 impl Group {
@@ -254,8 +263,17 @@ impl Group {
             info: String::new(),
             archive: false,
             skip_auto_update: false,
-            sub_last_update: None,
+            auto_clear_unavailable: false,
+            sub_last_update: 0,
+            front_proxy_id: -1,
+            landing_proxy_id: -1,
+            column_width_json: String::new(),
             profile_ids: Vec::new(),
+            scroll_last_profile: -1,
+            test_sort_by: 0,
+            traffic_sort_by: 0,
+            test_items_to_show: 0,
+            type_sort_by: 0,
         }
     }
 }
@@ -355,12 +373,13 @@ impl Default for AppSettings {
     }
 }
 
-/// Predefined outbound ids used by upstream route rules.
+/// Predefined outbound ids used by upstream route rules (`RouteRule.h`).
+/// Note: warp-bypass is **-5** (−4 is reserved for DNS hijack internally).
 pub mod outbound_ids {
     pub const PROXY: i64 = -1;
     pub const DIRECT: i64 = -2;
     pub const BLOCK: i64 = -3;
-    pub const WARP_BYPASS: i64 = -4;
+    pub const WARP_BYPASS: i64 = -5;
 }
 
 /// Default outbound token as stored in share JSON (`proxy` / `direct` / …).
@@ -422,23 +441,92 @@ impl DefaultOutbound {
     }
 }
 
-/// One route rule (simplified share schema).
+/// One route rule — fields map 1:1 to upstream `route_rules` columns.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteRule {
     pub name: String,
-    /// `simple` | `advanced` | domain/ip/process tokens from share JSON.
-    pub rule_type: String,
-    pub outbound: DefaultOutbound,
+    /// Persisted as raw int enum (`ruleType` in RouteRule.h).
+    pub rule_type: i32,
+    /// Share-schema token when imported from JSON (not stored in SQLite).
+    #[serde(default)]
+    pub rule_type_token: String,
+    pub outbound_id: i64,
     pub domain: Vec<String>,
     pub domain_suffix: Vec<String>,
     pub domain_keyword: Vec<String>,
+    pub domain_regex: Vec<String>,
     pub ip_cidr: Vec<String>,
+    pub ip_is_private: bool,
+    pub source_ip_cidr: Vec<String>,
+    pub source_ip_is_private: bool,
     pub process_name: Vec<String>,
-    pub network: Vec<String>,
+    pub process_path: Vec<String>,
+    pub process_path_regex: Vec<String>,
+    pub network: String,
+    pub protocol: String,
+    pub ip_version: String,
+    pub inbound: Vec<String>,
+    pub source_port: Vec<String>,
+    pub source_port_range: Vec<String>,
+    pub port: Vec<String>,
+    pub port_range: Vec<String>,
+    pub rule_set: Vec<String>,
     pub invert: bool,
-    /// Opaque leftover fields for round-trip.
-    #[serde(default)]
-    pub extra: serde_json::Value,
+    pub action: String,
+    pub reject_method: String,
+    pub no_drop: bool,
+    pub override_address: String,
+    pub override_port: String,
+    pub sniffers: Vec<String>,
+    pub sniff_override_dest: bool,
+    pub strategy: String,
+    pub wifi_ssid: Vec<String>,
+    pub wifi_bssid: Vec<String>,
+}
+
+impl RouteRule {
+    pub fn outbound(&self) -> DefaultOutbound {
+        DefaultOutbound::from_id(self.outbound_id)
+    }
+
+    /// Map share-schema type token → persisted int (`ruleType` enum order).
+    pub fn type_from_token(token: &str) -> i32 {
+        match token {
+            "simple_address_proxy" => 1,
+            "simple_address_bypass" => 2,
+            "simple_address_block" => 3,
+            "simple_process_name_proxy" => 4,
+            "simple_process_name_bypass" => 5,
+            "simple_process_name_block" => 6,
+            "simple_process_path_proxy" => 7,
+            "simple_process_path_bypass" => 8,
+            "simple_process_path_block" => 9,
+            "simple_address_warp_bypass" => 10,
+            "simple_process_name_warp_bypass" => 11,
+            "simple_process_path_warp_bypass" => 12,
+            // legacy / loose tokens
+            "simple" | "custom" | "" => 0,
+            _ => 0,
+        }
+    }
+
+    pub fn token_from_type(t: i32) -> &'static str {
+        match t {
+            1 => "simple_address_proxy",
+            2 => "simple_address_bypass",
+            3 => "simple_address_block",
+            4 => "simple_process_name_proxy",
+            5 => "simple_process_name_bypass",
+            6 => "simple_process_name_block",
+            7 => "simple_process_path_proxy",
+            8 => "simple_process_path_bypass",
+            9 => "simple_process_path_block",
+            10 => "simple_address_warp_bypass",
+            11 => "simple_process_name_warp_bypass",
+            12 => "simple_process_path_warp_bypass",
+            _ => "custom",
+        }
+    }
 }
 
 /// Route profile — structured or raw sing-box `route` object.
