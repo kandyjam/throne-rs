@@ -1,18 +1,20 @@
-//! Share-link / subscription importers.
+//! Share-link / subscription / route importers.
 //!
-//! Behaviour is intentionally aligned with upstream
-//! `Subscription::RawUpdater` in `throneproj/Throne` (`GroupUpdater.cpp`):
-//! scheme dispatch, multi-line bodies, optional whole-body base64, and
-//! `throne://add|route|remoteRoute|addsub/` deep links (`e7eb0438`).
+//! Pipeline mirrors upstream `Subscription::RawUpdater::update`
+//! (`GroupUpdater.cpp`) and route share helpers on `RouteProfile`.
 
+mod clash;
 mod decode;
 mod deeplink;
+mod json_sub;
 mod links;
+mod route_share;
 
-use throne_domain::{ProfileType, ParsedOutbound};
+use throne_domain::{ParsedOutbound, ProfileType, RouteProfile};
 
 pub use deeplink::{Deeplink, parse_deeplink};
 pub use links::parse_share_link;
+pub use route_share::{RouteImportReport, to_share_object, try_import_routes};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportedProfile {
@@ -26,9 +28,9 @@ pub struct ImportedProfile {
 #[derive(Debug, Clone, Default)]
 pub struct ImportReport {
     pub profiles: Vec<ImportedProfile>,
+    pub routes: Vec<RouteProfile>,
     pub skipped: usize,
     pub errors: Vec<String>,
-    /// When the input was a subscription URL deep link, the URL to fetch later.
     pub pending_sub_url: Option<String>,
     pub notes: Vec<String>,
 }
@@ -37,10 +39,13 @@ impl ImportReport {
     pub fn ok_count(&self) -> usize {
         self.profiles.len()
     }
+
+    pub fn route_count(&self) -> usize {
+        self.routes.len()
+    }
 }
 
-/// Import a blob the same way upstream `RawUpdater::update` starts:
-/// try JSON later; for now handle deeplinks, multi-line links, and base64 bodies.
+/// Import a blob the same way upstream `RawUpdater::update` starts.
 pub fn import_text(input: &str) -> ImportReport {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -50,12 +55,69 @@ pub fn import_text(input: &str) -> ImportReport {
         };
     }
 
-    // Deep links first (throne://…)
+    // Deep links first
     if let Some(dl) = parse_deeplink(trimmed) {
         return import_deeplink(dl);
     }
 
-    // Multi-line subscription / clipboard dump
+    // Route share object (tagged only — not bare JSON subs)
+    if let Some(route_report) = try_import_routes(trimmed) {
+        return ImportReport {
+            routes: route_report.routes,
+            errors: route_report.errors,
+            notes: route_report.notes,
+            ..Default::default()
+        };
+    }
+
+    // Whole-body base64 (subscription endpoint style)
+    if !trimmed.contains('\n')
+        && !trimmed.contains("://")
+        && !trimmed.starts_with('{')
+        && !trimmed.starts_with('[')
+        && !trimmed.contains("proxies:")
+    {
+        if let Some(decoded) = decode::decode_b64_flexible(trimmed) {
+            let mut report = import_text_inner(&decoded);
+            report.notes.push("decoded base64 body".into());
+            return report;
+        }
+    }
+
+    import_text_inner(trimmed)
+}
+
+fn import_text_inner(trimmed: &str) -> ImportReport {
+    // JSON (sing-box / xray / SIP008 / custom)
+    if let Some(list) = json_sub::try_import_json(trimmed) {
+        return ImportReport {
+            profiles: list,
+            notes: vec!["json subscription".into()],
+            ..Default::default()
+        };
+    }
+
+    // Clash YAML
+    if let Some(list) = clash::try_import_clash(trimmed) {
+        return ImportReport {
+            profiles: list,
+            notes: vec!["clash proxies".into()],
+            ..Default::default()
+        };
+    }
+
+    // WireGuard conf file
+    if trimmed.contains("[Interface]") && trimmed.contains("[Peer]") {
+        if let Some(p) = parse_wireguard_file(trimmed) {
+            return ImportReport {
+                profiles: vec![p],
+                notes: vec!["wireguard conf".into()],
+                ..Default::default()
+            };
+        }
+    }
+
+    // Multi-line share links
     if trimmed.lines().count() > 1 {
         return import_lines(trimmed);
     }
@@ -66,22 +128,6 @@ pub fn import_text(input: &str) -> ImportReport {
             profiles: vec![p],
             ..Default::default()
         };
-    }
-
-    // Whole-body base64 (common for subscription endpoints)
-    if let Some(decoded) = decode::decode_b64_flexible(trimmed) {
-        if decoded.contains('\n') || looks_like_link_list(&decoded) {
-            let mut report = import_lines(&decoded);
-            report.notes.push("decoded base64 subscription body".into());
-            return report;
-        }
-        if let Some(p) = parse_share_link(decoded.trim()) {
-            return ImportReport {
-                profiles: vec![p],
-                notes: vec!["decoded base64 single link".into()],
-                ..Default::default()
-            };
-        }
     }
 
     ImportReport {
@@ -100,23 +146,35 @@ fn import_deeplink(dl: Deeplink) -> ImportReport {
         }
         Deeplink::AddSub { url } => ImportReport {
             pending_sub_url: Some(url),
-            notes: vec!["throne://addsub/ — fetch URL not implemented yet".into()],
+            notes: vec!["throne://addsub/ — HTTP fetch not implemented yet".into()],
             ..Default::default()
         },
-        Deeplink::Route { payload } => ImportReport {
-            notes: vec![format!(
-                "throne://route/ payload received ({} bytes) — route import WIP",
-                payload.len()
-            )],
-            ..Default::default()
-        },
-        Deeplink::RemoteRoute { payload } => ImportReport {
-            notes: vec![format!(
-                "throne://remoteRoute/ payload received ({} bytes) — remote route WIP",
-                payload.len()
-            )],
-            ..Default::default()
-        },
+        Deeplink::Route { payload } => {
+            let r = route_share::import_route_payload(&payload);
+            ImportReport {
+                routes: r.routes,
+                errors: r.errors,
+                notes: {
+                    let mut n = r.notes;
+                    n.push("throne://route/ deep link".into());
+                    n
+                },
+                ..Default::default()
+            }
+        }
+        Deeplink::RemoteRoute { payload } => {
+            let r = route_share::import_route_payload_as_remote(&payload);
+            ImportReport {
+                routes: r.routes,
+                errors: r.errors,
+                notes: {
+                    let mut n = r.notes;
+                    n.push("throne://remoteRoute/ deep link".into());
+                    n
+                },
+                ..Default::default()
+            }
+        }
     }
 }
 
@@ -124,8 +182,15 @@ fn import_lines(text: &str) -> ImportReport {
     let mut report = ImportReport::default();
     for raw in text.lines() {
         let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
+        if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
             continue;
+        }
+        // Nested JSON object line
+        if line.starts_with('{') {
+            if let Some(list) = json_sub::try_import_json(line) {
+                report.profiles.extend(list);
+                continue;
+            }
         }
         match parse_share_link(line) {
             Some(p) => report.profiles.push(p),
@@ -141,13 +206,52 @@ fn import_lines(text: &str) -> ImportReport {
     report
 }
 
-fn looks_like_link_list(s: &str) -> bool {
-    s.lines().any(|l| {
-        let t = l.trim();
-        t.contains("://")
-            || t.starts_with("ss://")
-            || t.starts_with("vmess://")
-            || t.starts_with("vless://")
+fn parse_wireguard_file(text: &str) -> Option<ImportedProfile> {
+    let mut private_key = None;
+    let mut address = None;
+    let mut public_key = None;
+    let mut endpoint = None;
+    let mut section = "";
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            section = line;
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            let k = k.trim().to_ascii_lowercase();
+            let v = v.trim().to_string();
+            match (section, k.as_str()) {
+                ("[Interface]", "privatekey") => private_key = Some(v),
+                ("[Interface]", "address") => address = Some(v),
+                ("[Peer]", "publickey") => public_key = Some(v),
+                ("[Peer]", "endpoint") => endpoint = Some(v),
+                _ => {}
+            }
+        }
+    }
+    let endpoint = endpoint?;
+    let (host, port) = match endpoint.rsplit_once(':') {
+        Some((h, p)) => (h.trim_matches('[').trim_matches(']').to_string(), p.parse().ok()?),
+        None => return None,
+    };
+    let name = "WireGuard".to_string();
+    let mut outbound = ParsedOutbound {
+        tag: Some(name.clone()),
+        server: Some(host),
+        server_port: Some(port),
+        password: private_key,
+        username: public_key,
+        path: address,
+        raw_json: Some(text.to_string()),
+        ..Default::default()
+    };
+    outbound.raw_json = Some(text.to_string());
+    Some(ImportedProfile {
+        name,
+        profile_type: ProfileType::Wireguard,
+        outbound,
+        source: "wg-conf".into(),
     })
 }
 
@@ -199,5 +303,35 @@ not-a-link
         let r = import_text(&format!("throne://add/{b64}"));
         assert_eq!(r.ok_count(), 1);
         assert!(r.notes.iter().any(|n| n.contains("throne://add")));
+    }
+
+    #[test]
+    fn import_singbox_outbound_array() {
+        let json = r#"[
+          {"type":"vless","tag":"a","server":"1.1.1.1","server_port":443,"uuid":"u"},
+          {"type":"direct","tag":"direct"}
+        ]"#;
+        let r = import_text(json);
+        assert_eq!(r.ok_count(), 1);
+        assert_eq!(r.profiles[0].name, "a");
+    }
+
+    #[test]
+    fn import_clash_yaml() {
+        let yaml = r#"
+proxies:
+  - { name: "c1", type: ss, server: 9.9.9.9, port: 1234, cipher: aes-128-gcm, password: x }
+"#;
+        let r = import_text(yaml);
+        assert_eq!(r.ok_count(), 1);
+        assert!(r.notes.iter().any(|n| n.contains("clash")));
+    }
+
+    #[test]
+    fn import_route_share() {
+        let json = r#"{"kind":"throne-route-profile","v":1,"name":"R1","default_outbound":"proxy","rules":[]}"#;
+        let r = import_text(json);
+        assert_eq!(r.route_count(), 1);
+        assert_eq!(r.routes[0].name, "R1");
     }
 }

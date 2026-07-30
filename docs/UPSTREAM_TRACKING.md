@@ -20,15 +20,15 @@ Status legend: ✅ done · 🧩 partial · ⏳ planned · ❌ out of scope (Go c
 | Area | Upstream signal (commits / modules) | Rust status | Target crate |
 |------|-------------------------------------|-------------|--------------|
 | Protocol catalog (SS/VMess/VLESS/Trojan/HY2/TUIC/…) | README + `OutboundFactory` | 🧩 types exist; full beans partial | `throne-domain`, `throne-import` |
-| Share-link import | `GroupUpdater::RawUpdater` | 🧩 common schemes | `throne-import` |
-| Multi-line / base64 subscription body | `RawUpdater::update` | 🧩 line + b64 split | `throne-import` |
-| Clash YAML sub | `updateClash` | ⏳ | `throne-import` |
-| Sing-box / Xray JSON sub | `updateSingBox` / `updateXray` | ⏳ | `throne-import` |
-| Full Xray subscription | `2fc64c51` | ⏳ | `throne-import` |
-| SIP008 / WireGuard file | `updateSIP008` / `updateWireguardFileConfig` | ⏳ | `throne-import` |
-| `throne://add/` · `throne://route/` · `throne://remoteRoute/` · `throne://addsub/` | `e7eb0438` deeplink schemes | 🧩 path parse | `throne-import` |
-| SQLite profiles/groups/settings/routes | `*Repo.cpp` | 🧩 profiles+groups+settings | `throne-storage` |
-| Route profiles (raw + remote + auto-update) | `5b1482c3`, `54dde90e`, `4eeef231` | 🧩 model only | `throne-domain` |
+| Share-link import | `GroupUpdater::RawUpdater` | ✅ common schemes | `throne-import` |
+| Multi-line / base64 subscription body | `RawUpdater::update` | ✅ line + b64 split | `throne-import` |
+| Clash YAML sub | `updateClash` | 🧩 proxies list (core types) | `throne-import` |
+| Sing-box / Xray JSON sub | `updateSingBox` / `updateXray` | 🧩 outbounds + custom full | `throne-import` |
+| Full Xray subscription | `2fc64c51` | 🧩 config array → custom | `throne-import` |
+| SIP008 / WireGuard file | `updateSIP008` / `updateWireguardFileConfig` | ✅ | `throne-import` |
+| `throne://add/` · `throne://route/` · `throne://remoteRoute/` · `throne://addsub/` | `e7eb0438` deeplink schemes | ✅ | `throne-import` |
+| SQLite profiles/groups/settings/routes | `*Repo.cpp` | ✅ profiles+groups+settings+routes | `throne-storage` |
+| Route profiles (raw + remote + auto-update) | `5b1482c3`, `54dde90e`, `4eeef231` | 🧩 import/share + persist; no HTTP fetch | `throne-domain` |
 | System proxy / TUN modes | MainWindow + settings | 🧩 UI mode cycle (no OS hooks) | `throne` |
 | TUN private-range bypass flag | `3c344f78` | 🧩 settings field | `throne-domain` |
 | Runtime stats UI | `bac76b83` | ⏳ | `throne` |
@@ -58,10 +58,11 @@ Status legend: ✅ done · 🧩 partial · ⏳ planned · ❌ out of scope (Go c
 
 ## Implementation waves
 
-1. **Wave A (this drop)** — tracking doc, share-link import, SQLite load/save, settings skeleton, UI Import  
-2. **Wave B** — Clash/JSON sub, route profile CRUD, deeplink OS registration  
+1. **Wave A** — tracking doc, share-link import, SQLite load/save, settings skeleton, UI Import ✅  
+2. **Wave B (this drop)** — Clash/JSON/SIP008/WG sub, route share import, route_profiles table, UI route cycle ✅  
 3. **Wave C** — core RPC Start/Stop/QueryStats, URL test  
 4. **Wave D** — TUN/system proxy OS integration, tray, stats charts  
+5. **Wave B+** — HTTP fetch for `addsub`/remote routes, full Clash option parity, OS deeplink registration
 
 ## Commit triage notes (recent upstream themes)
 

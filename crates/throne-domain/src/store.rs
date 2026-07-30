@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::models::{
     AppSettings, CoreStatus, Group, GroupId, ParsedOutbound, Profile, ProfileId, ProfileType,
-    SystemMode, TrafficSnapshot,
+    RouteProfile, SystemMode, TrafficSnapshot,
 };
 
 #[derive(Debug, Error)]
@@ -15,6 +15,8 @@ pub enum StoreError {
     ProfileNotFound(ProfileId),
     #[error("no profile selected")]
     NoSelection,
+    #[error("{0}")]
+    Msg(String),
 }
 
 /// Application state shared between UI and services.
@@ -34,6 +36,10 @@ pub struct AppState {
     next_group_id: GroupId,
     status_message: String,
     settings: AppSettings,
+    routes: HashMap<i64, RouteProfile>,
+    route_order: Vec<i64>,
+    active_route_id: Option<i64>,
+    next_route_id: i64,
 }
 
 impl Default for AppState {
@@ -59,6 +65,10 @@ impl AppState {
             next_group_id: 1,
             status_message: "Ready".into(),
             settings: AppSettings::default(),
+            routes: HashMap::new(),
+            route_order: Vec::new(),
+            active_route_id: None,
+            next_route_id: 1,
         }
     }
 
@@ -68,6 +78,9 @@ impl AppState {
 
         let g1 = state.add_group("Default");
         let g2 = state.add_group("Subscriptions");
+        let rid = state.add_route(RouteProfile::new(0, "Default"));
+        state.active_route_id = Some(rid);
+        state.settings.current_route_id = rid;
 
         let samples = [
             ("HK-01 · Edge", ProfileType::Vless, 48),
@@ -311,18 +324,29 @@ impl AppState {
         profiles: Vec<Profile>,
         group_order: Vec<GroupId>,
         settings: AppSettings,
+        routes: Vec<RouteProfile>,
     ) {
         self.groups = groups.into_iter().map(|g| (g.id, g)).collect();
         self.profiles = profiles.into_iter().map(|p| (p.id, p)).collect();
         self.group_order = group_order;
         self.settings = settings;
+        self.route_order = routes.iter().map(|r| r.id).collect();
+        self.routes = routes.into_iter().map(|r| (r.id, r)).collect();
         self.next_group_id = self.groups.keys().copied().max().unwrap_or(0) + 1;
         self.next_profile_id = self.profiles.keys().copied().max().unwrap_or(0) + 1;
+        self.next_route_id = self.routes.keys().copied().max().unwrap_or(0) + 1;
         self.active_group_id = self.group_order.first().copied().unwrap_or(0);
         self.selected_profile_id = self
             .groups
             .get(&self.active_group_id)
             .and_then(|g| g.profile_ids.first().copied());
+        self.active_route_id = if self.settings.current_route_id > 0
+            && self.routes.contains_key(&self.settings.current_route_id)
+        {
+            Some(self.settings.current_route_id)
+        } else {
+            self.route_order.first().copied()
+        };
         self.core_status = CoreStatus::Stopped;
         self.system_mode = if self.settings.tun_mode_enabled {
             SystemMode::VpnTun
@@ -332,10 +356,81 @@ impl AppState {
             SystemMode::Off
         };
         self.status_message = format!(
-            "Loaded {} groups · {} profiles",
+            "Loaded {} groups · {} profiles · {} routes",
             self.groups.len(),
-            self.profiles.len()
+            self.profiles.len(),
+            self.routes.len()
         );
+    }
+
+    pub fn add_route(&mut self, mut route: RouteProfile) -> i64 {
+        let id = if route.id > 0 {
+            route.id
+        } else {
+            let id = self.next_route_id;
+            self.next_route_id += 1;
+            id
+        };
+        route.id = id;
+        if !self.route_order.contains(&id) {
+            self.route_order.push(id);
+        }
+        self.routes.insert(id, route);
+        if self.active_route_id.is_none() {
+            self.active_route_id = Some(id);
+            self.settings.current_route_id = id;
+        }
+        id
+    }
+
+    pub fn import_routes(&mut self, routes: impl IntoIterator<Item = RouteProfile>) -> usize {
+        let mut n = 0usize;
+        for mut r in routes {
+            r.id = 0; // assign fresh ids
+            self.add_route(r);
+            n += 1;
+        }
+        if n > 0 {
+            self.status_message = format!("Imported {n} route profile(s)");
+        }
+        n
+    }
+
+    pub fn all_routes(&self) -> Vec<&RouteProfile> {
+        self.route_order
+            .iter()
+            .filter_map(|id| self.routes.get(id))
+            .collect()
+    }
+
+    pub fn active_route(&self) -> Option<&RouteProfile> {
+        self.active_route_id.and_then(|id| self.routes.get(&id))
+    }
+
+    pub fn set_active_route(&mut self, id: i64) -> Result<(), StoreError> {
+        if !self.routes.contains_key(&id) {
+            return Err(StoreError::Msg(format!("route {id} not found")));
+        }
+        self.active_route_id = Some(id);
+        self.settings.current_route_id = id;
+        if let Some(r) = self.routes.get(&id) {
+            self.status_message = format!("Active route · {}", r.name);
+        }
+        Ok(())
+    }
+
+    pub fn cycle_active_route(&mut self) {
+        if self.route_order.is_empty() {
+            return;
+        }
+        let cur = self.active_route_id.unwrap_or(self.route_order[0]);
+        let idx = self
+            .route_order
+            .iter()
+            .position(|id| *id == cur)
+            .unwrap_or(0);
+        let next = self.route_order[(idx + 1) % self.route_order.len()];
+        let _ = self.set_active_route(next);
     }
 
     pub fn all_groups(&self) -> Vec<&Group> {

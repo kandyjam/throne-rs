@@ -10,7 +10,7 @@ use throne_domain::{AppState, CoreStatus, GroupId, Profile, ProfileId, SystemMod
 use crate::theme::{Theme, latency_color};
 use crate::ui::widgets::{h_rule, pill, search_field, section_label, spacer, status_dot, toolbar_button};
 
-actions!(throne, [ToggleProxy, FocusSearch, ImportClipboard, SaveDb, Quit]);
+actions!(throne, [ToggleProxy, FocusSearch, ImportClipboard, SaveDb, CycleRoute, Quit]);
 
 pub struct MainWindow {
     state: AppState,
@@ -32,6 +32,8 @@ impl MainWindow {
             gpui::KeyBinding::new("ctrl-v", ImportClipboard, None),
             gpui::KeyBinding::new("cmd-s", SaveDb, None),
             gpui::KeyBinding::new("ctrl-s", SaveDb, None),
+            gpui::KeyBinding::new("cmd-shift-r", CycleRoute, None),
+            gpui::KeyBinding::new("ctrl-shift-r", CycleRoute, None),
             gpui::KeyBinding::new("cmd-q", Quit, None),
         ]);
 
@@ -71,7 +73,8 @@ impl MainWindow {
             (p.name, p.profile_type, p.outbound, insecure)
         });
         let n = self.state.import_profiles(items);
-        let mut msg = format!("Imported {n} · skipped {}", report.skipped);
+        let nr = self.state.import_routes(report.routes);
+        let mut msg = format!("Imported {n} node(s) · {nr} route(s) · skipped {}", report.skipped);
         if let Some(url) = report.pending_sub_url {
             msg.push_str(&format!(" · pending sub fetch: {url}"));
         }
@@ -79,14 +82,20 @@ impl MainWindow {
             msg.push_str(" · ");
             msg.push_str(note);
         }
-        if n == 0 && !report.errors.is_empty() {
+        if n == 0 && nr == 0 && !report.errors.is_empty() {
             msg = report.errors.first().cloned().unwrap_or(msg);
         }
         self.state.set_status_message(msg);
         // Auto-persist after successful import
-        if n > 0 {
+        if n > 0 || nr > 0 {
             let _ = self.persist_db();
         }
+        cx.notify();
+    }
+
+    fn cycle_route(&mut self, cx: &mut Context<Self>) {
+        self.state.cycle_active_route();
+        let _ = self.persist_db();
         cx.notify();
     }
 
@@ -227,6 +236,17 @@ impl MainWindow {
                         };
                         this.set_mode(next, cx);
                     });
+                })
+            })
+            .child({
+                let entity = cx.entity().clone();
+                let route_label = self
+                    .state
+                    .active_route()
+                    .map(|r| format!("Route: {}", r.name))
+                    .unwrap_or_else(|| "Route: —".into());
+                toolbar_button("route", route_label, false, move |_, _, cx| {
+                    entity.update(cx, |this, cx| this.cycle_route(cx));
                 })
             })
             .child({
@@ -482,15 +502,27 @@ impl MainWindow {
                     .text_color(Theme::text_muted())
                     .child("Protobuf: core/server/gen/libcore.proto"),
             )
+            .child(section_label("ROUTES"))
+            .children(self.state.all_routes().into_iter().take(6).map(|r| {
+                let active = self
+                    .state
+                    .active_route()
+                    .is_some_and(|a| a.id == r.id);
+                div()
+                    .text_xs()
+                    .text_color(if active {
+                        Theme::accent()
+                    } else {
+                        Theme::text_muted()
+                    })
+                    .child(r.summary())
+            }))
             .child(section_label("SETTINGS (upstream defaults)"))
             .child(
                 div()
                     .text_xs()
                     .text_color(Theme::text_muted())
-                    .child(format!(
-                        "DNS {}",
-                        self.state.settings().remote_dns
-                    )),
+                    .child(format!("DNS {}", self.state.settings().remote_dns)),
             )
             .child(
                 div()
@@ -506,6 +538,7 @@ impl MainWindow {
             .child(shortcut_row("⌘/Ctrl+R", "Start / Stop"))
             .child(shortcut_row("⌘/Ctrl+V", "Import clipboard"))
             .child(shortcut_row("⌘/Ctrl+S", "Save DB"))
+            .child(shortcut_row("⌘⇧R", "Cycle route"))
             .child(shortcut_row("Double-click", "Start profile"))
             .child(spacer())
             .child(
@@ -522,7 +555,7 @@ impl MainWindow {
                 div()
                     .text_xs()
                     .text_color(Theme::text_muted())
-                    .child("Wave A · upstream-synced import + SQLite"),
+                    .child("Wave B · Clash/JSON sub + routes"),
             )
     }
 }
@@ -621,6 +654,7 @@ impl Render for MainWindow {
                 this.import_clipboard(cx)
             }))
             .on_action(cx.listener(|this, _: &SaveDb, _, cx| this.save_db(cx)))
+            .on_action(cx.listener(|this, _: &CycleRoute, _, cx| this.cycle_route(cx)))
             .on_action(cx.listener(|_this, _: &Quit, _, cx| cx.quit()))
             .on_action(cx.listener(|this, _: &FocusSearch, _, cx| {
                 this.state

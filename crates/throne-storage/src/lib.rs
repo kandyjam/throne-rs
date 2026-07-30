@@ -8,7 +8,8 @@ use thiserror::Error;
 use tracing::info;
 
 use throne_domain::{
-    AppSettings, AppState, Group, GroupId, ParsedOutbound, Profile, ProfileId, ProfileType,
+    AppSettings, AppState, DefaultOutbound, Group, GroupId, ParsedOutbound, Profile, ProfileId,
+    ProfileType, RouteProfile, RouteRule,
 };
 
 #[derive(Debug, Error)]
@@ -106,6 +107,22 @@ impl Database {
                 profile_last_id INTEGER NOT NULL DEFAULT 0,
                 group_last_id INTEGER NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS route_profiles (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                default_outbound_id INTEGER NOT NULL DEFAULT -1,
+                is_raw INTEGER NOT NULL DEFAULT 0,
+                raw_route TEXT NOT NULL DEFAULT '',
+                prevent_modifications INTEGER NOT NULL DEFAULT 0,
+                is_remote INTEGER NOT NULL DEFAULT 0,
+                remote_url TEXT NOT NULL DEFAULT '',
+                auto_update INTEGER NOT NULL DEFAULT 0,
+                remote_last_update INTEGER NOT NULL DEFAULT 0,
+                rules_json TEXT NOT NULL DEFAULT '[]',
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            );
             "#,
         )?;
         // Ensure single row for entity_ids
@@ -125,12 +142,13 @@ impl Database {
         let profiles = self.load_profiles()?;
         let order = self.load_group_order()?;
         let settings = self.load_settings()?;
+        let routes = self.load_routes()?;
         let order = if order.is_empty() {
             groups.iter().map(|g| g.id).collect()
         } else {
             order
         };
-        state.load_snapshot(groups, profiles, order, settings);
+        state.load_snapshot(groups, profiles, order, settings, routes);
         Ok(state)
     }
 
@@ -139,6 +157,7 @@ impl Database {
         tx.execute("DELETE FROM profiles", [])?;
         tx.execute("DELETE FROM groups_order", [])?;
         tx.execute("DELETE FROM groups", [])?;
+        tx.execute("DELETE FROM route_profiles", [])?;
 
         for g in state.all_groups() {
             let profiles_json = serde_json::to_string(&g.profile_ids)?;
@@ -194,6 +213,30 @@ impl Database {
             )?;
         }
 
+        for r in state.all_routes() {
+            let rules_json = serde_json::to_string(&r.rules)?;
+            tx.execute(
+                r#"INSERT INTO route_profiles (
+                    id, name, default_outbound_id, is_raw, raw_route,
+                    prevent_modifications, is_remote, remote_url, auto_update,
+                    remote_last_update, rules_json
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
+                params![
+                    r.id,
+                    r.name,
+                    r.default_outbound.as_id(),
+                    r.is_raw as i32,
+                    r.raw_route,
+                    r.prevent_modifications as i32,
+                    r.is_remote as i32,
+                    r.remote_url,
+                    r.auto_update as i32,
+                    r.remote_last_update,
+                    rules_json,
+                ],
+            )?;
+        }
+
         // entity id counters
         let max_p = state
             .all_profiles()
@@ -211,6 +254,47 @@ impl Database {
         tx.commit()?;
         info!(path = %self.path.display(), "database saved");
         Ok(())
+    }
+
+    fn load_routes(&self) -> Result<Vec<RouteProfile>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            r#"SELECT id, name, default_outbound_id, is_raw, raw_route,
+                      prevent_modifications, is_remote, remote_url, auto_update,
+                      remote_last_update, rules_json
+               FROM route_profiles ORDER BY id ASC"#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let name: String = row.get(1)?;
+            let def_id: i64 = row.get(2)?;
+            let is_raw: i32 = row.get(3)?;
+            let raw_route: String = row.get(4)?;
+            let prevent: i32 = row.get(5)?;
+            let is_remote: i32 = row.get(6)?;
+            let remote_url: String = row.get(7)?;
+            let auto_update: i32 = row.get(8)?;
+            let remote_last: i64 = row.get(9)?;
+            let rules_json: String = row.get(10)?;
+            let rules: Vec<RouteRule> = serde_json::from_str(&rules_json).unwrap_or_default();
+            Ok(RouteProfile {
+                id,
+                name,
+                default_outbound: DefaultOutbound::from_id(def_id),
+                rules,
+                is_raw: is_raw != 0,
+                raw_route,
+                prevent_modifications: prevent != 0,
+                is_remote: is_remote != 0,
+                remote_url,
+                auto_update: auto_update != 0,
+                remote_last_update: remote_last,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     fn load_groups(&self) -> Result<Vec<Group>, StorageError> {

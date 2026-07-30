@@ -355,17 +355,106 @@ impl Default for AppSettings {
     }
 }
 
-/// Route profile skeleton (full rule graph lands with storage wave B).
+/// Predefined outbound ids used by upstream route rules.
+pub mod outbound_ids {
+    pub const PROXY: i64 = -1;
+    pub const DIRECT: i64 = -2;
+    pub const BLOCK: i64 = -3;
+    pub const WARP_BYPASS: i64 = -4;
+}
+
+/// Default outbound token as stored in share JSON (`proxy` / `direct` / …).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum DefaultOutbound {
+    #[default]
+    Proxy,
+    Direct,
+    Block,
+    WarpBypass,
+    /// Positive profile id when resolved.
+    Profile(i64),
+}
+
+impl DefaultOutbound {
+    pub fn as_id(self) -> i64 {
+        match self {
+            Self::Proxy => outbound_ids::PROXY,
+            Self::Direct => outbound_ids::DIRECT,
+            Self::Block => outbound_ids::BLOCK,
+            Self::WarpBypass => outbound_ids::WARP_BYPASS,
+            Self::Profile(id) => id,
+        }
+    }
+
+    pub fn from_id(id: i64) -> Self {
+        match id {
+            outbound_ids::PROXY => Self::Proxy,
+            outbound_ids::DIRECT => Self::Direct,
+            outbound_ids::BLOCK => Self::Block,
+            outbound_ids::WARP_BYPASS => Self::WarpBypass,
+            other if other >= 0 => Self::Profile(other),
+            _ => Self::Proxy,
+        }
+    }
+
+    pub fn from_share_token(s: &str) -> Self {
+        match s {
+            "proxy" | "" => Self::Proxy,
+            "direct" => Self::Direct,
+            "block" => Self::Block,
+            "warp-bypass" => Self::WarpBypass,
+            other => other
+                .parse::<i64>()
+                .map(Self::Profile)
+                .unwrap_or(Self::Proxy),
+        }
+    }
+
+    pub fn to_share_token(self) -> String {
+        match self {
+            Self::Proxy => "proxy".into(),
+            Self::Direct => "direct".into(),
+            Self::Block => "block".into(),
+            Self::WarpBypass => "warp-bypass".into(),
+            Self::Profile(id) => id.to_string(),
+        }
+    }
+}
+
+/// One route rule (simplified share schema).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RouteRule {
+    pub name: String,
+    /// `simple` | `advanced` | domain/ip/process tokens from share JSON.
+    pub rule_type: String,
+    pub outbound: DefaultOutbound,
+    pub domain: Vec<String>,
+    pub domain_suffix: Vec<String>,
+    pub domain_keyword: Vec<String>,
+    pub ip_cidr: Vec<String>,
+    pub process_name: Vec<String>,
+    pub network: Vec<String>,
+    pub invert: bool,
+    /// Opaque leftover fields for round-trip.
+    #[serde(default)]
+    pub extra: serde_json::Value,
+}
+
+/// Route profile — structured or raw sing-box `route` object.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteProfile {
     pub id: i64,
     pub name: String,
-    pub default_outbound_id: i64,
+    pub default_outbound: DefaultOutbound,
+    pub rules: Vec<RouteRule>,
     pub is_raw: bool,
     pub raw_route: String,
+    pub prevent_modifications: bool,
     pub is_remote: bool,
     pub remote_url: String,
     pub auto_update: bool,
+    pub remote_last_update: i64,
 }
 
 impl RouteProfile {
@@ -373,12 +462,37 @@ impl RouteProfile {
         Self {
             id,
             name: name.into(),
-            default_outbound_id: -1,
+            default_outbound: DefaultOutbound::Proxy,
+            rules: Vec::new(),
             is_raw: false,
             raw_route: String::new(),
+            prevent_modifications: false,
             is_remote: false,
             remote_url: String::new(),
             auto_update: false,
+            remote_last_update: 0,
+        }
+    }
+
+    pub fn rule_count(&self) -> usize {
+        if self.is_raw {
+            if self.raw_route.trim().is_empty() {
+                0
+            } else {
+                1
+            }
+        } else {
+            self.rules.len()
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        if self.is_raw {
+            format!("{} · raw route", self.name)
+        } else if self.is_remote {
+            format!("{} · remote · {} rules", self.name, self.rules.len())
+        } else {
+            format!("{} · {} rules", self.name, self.rules.len())
         }
     }
 }
