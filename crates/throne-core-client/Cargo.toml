@@ -1,0 +1,15 @@
+[package]
+name = "throne-core-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Client for the Throne Go core process (libcore RPC)"
+
+[dependencies]
+throne-domain = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
