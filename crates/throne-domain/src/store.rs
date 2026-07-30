@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use thiserror::Error;
 
 use crate::models::{
-    CoreStatus, Group, GroupId, Profile, ProfileId, ProfileType, SystemMode, TrafficSnapshot,
+    AppSettings, CoreStatus, Group, GroupId, ParsedOutbound, Profile, ProfileId, ProfileType,
+    SystemMode, TrafficSnapshot,
 };
 
 #[derive(Debug, Error)]
@@ -32,6 +33,7 @@ pub struct AppState {
     next_profile_id: ProfileId,
     next_group_id: GroupId,
     status_message: String,
+    settings: AppSettings,
 }
 
 impl Default for AppState {
@@ -56,6 +58,7 @@ impl AppState {
             next_profile_id: 1,
             next_group_id: 1,
             status_message: "Ready".into(),
+            settings: AppSettings::default(),
         }
     }
 
@@ -287,6 +290,108 @@ impl AppState {
 
     pub fn set_traffic(&mut self, traffic: TrafficSnapshot) {
         self.traffic = traffic;
+    }
+
+    pub fn settings(&self) -> &AppSettings {
+        &self.settings
+    }
+
+    pub fn settings_mut(&mut self) -> &mut AppSettings {
+        &mut self.settings
+    }
+
+    pub fn set_settings(&mut self, settings: AppSettings) {
+        self.settings = settings;
+    }
+
+    /// Replace store contents from persistence (keeps runtime fields reset).
+    pub fn load_snapshot(
+        &mut self,
+        groups: Vec<Group>,
+        profiles: Vec<Profile>,
+        group_order: Vec<GroupId>,
+        settings: AppSettings,
+    ) {
+        self.groups = groups.into_iter().map(|g| (g.id, g)).collect();
+        self.profiles = profiles.into_iter().map(|p| (p.id, p)).collect();
+        self.group_order = group_order;
+        self.settings = settings;
+        self.next_group_id = self.groups.keys().copied().max().unwrap_or(0) + 1;
+        self.next_profile_id = self.profiles.keys().copied().max().unwrap_or(0) + 1;
+        self.active_group_id = self.group_order.first().copied().unwrap_or(0);
+        self.selected_profile_id = self
+            .groups
+            .get(&self.active_group_id)
+            .and_then(|g| g.profile_ids.first().copied());
+        self.core_status = CoreStatus::Stopped;
+        self.system_mode = if self.settings.tun_mode_enabled {
+            SystemMode::VpnTun
+        } else if self.settings.system_proxy_enabled {
+            SystemMode::SystemProxy
+        } else {
+            SystemMode::Off
+        };
+        self.status_message = format!(
+            "Loaded {} groups · {} profiles",
+            self.groups.len(),
+            self.profiles.len()
+        );
+    }
+
+    pub fn all_groups(&self) -> Vec<&Group> {
+        self.group_order
+            .iter()
+            .filter_map(|id| self.groups.get(id))
+            .collect()
+    }
+
+    pub fn all_profiles(&self) -> Vec<&Profile> {
+        self.profiles.values().collect()
+    }
+
+    /// Insert imported profiles into the active group.
+    pub fn import_profiles(
+        &mut self,
+        items: impl IntoIterator<Item = (String, ProfileType, ParsedOutbound, bool)>,
+    ) -> usize {
+        let gid = if self.active_group_id == 0 {
+            self.add_group("Imported")
+        } else {
+            self.active_group_id
+        };
+        let mut n = 0usize;
+        for (name, ty, outbound, insecure) in items {
+            let id = self.next_profile_id;
+            self.next_profile_id += 1;
+            let outbound_json = outbound.to_db_json();
+            let mut profile = Profile::new(id, gid, name, ty);
+            profile.outbound = outbound;
+            profile.outbound_json = outbound_json;
+            profile.insecure = insecure;
+            self.profiles.insert(id, profile);
+            if let Some(g) = self.groups.get_mut(&gid) {
+                g.profile_ids.push(id);
+            }
+            n += 1;
+        }
+        if n > 0 {
+            self.active_group_id = gid;
+            self.status_message = format!("Imported {n} profile(s)");
+        }
+        n
+    }
+
+    pub fn delete_selected_profiles(&mut self, ids: &[ProfileId]) {
+        for id in ids {
+            if let Some(p) = self.profiles.remove(id) {
+                if let Some(g) = self.groups.get_mut(&p.group_id) {
+                    g.profile_ids.retain(|x| x != id);
+                }
+            }
+            if self.selected_profile_id == Some(*id) {
+                self.selected_profile_id = None;
+            }
+        }
     }
 }
 

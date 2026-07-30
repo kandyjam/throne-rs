@@ -13,6 +13,8 @@ path = "src/main.rs"
 [dependencies]
 throne-domain = { workspace = true }
 throne-core-client = { workspace = true }
+throne-import = { workspace = true }
+throne-storage = { workspace = true }
 # runtime_shaders: avoid requiring `xcrun metal` (full Xcode) at build time.
 gpui = { workspace = true, features = ["runtime_shaders"] }
 tracing = { workspace = true }

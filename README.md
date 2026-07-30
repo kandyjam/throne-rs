@@ -2,14 +2,18 @@
 
 **Rust + [GPUI](https://github.com/zed-industries/zed) rewrite** of [Throne](https://github.com/throneproj/Throne) (formerly Nekoray) — a cross-platform desktop GUI proxy client powered by Sing-box / Xray.
 
-> Status: **Milestone 0 — UI shell**. Domain models and a GPUI main window run with demo data. The Go core is retained; the local-socket protobuf RPC client is stubbed.
+> Status: **Wave A** — UI shell + upstream-aligned share-link import + SQLite.  
+> Upstream remote: `upstream` → [throneproj/Throne](https://github.com/throneproj/Throne) (`dev`).  
+> Parity matrix: [docs/UPSTREAM_TRACKING.md](./docs/UPSTREAM_TRACKING.md).
 
 ## Architecture
 
 | Layer | Crate / path | Role |
 |-------|----------------|------|
 | UI | `crates/throne` | GPUI application (main window, lists, actions) |
-| Domain | `crates/throne-domain` | Profiles, groups, runtime status, in-memory store |
+| Domain | `crates/throne-domain` | Profiles, groups, settings, runtime status |
+| Import | `crates/throne-import` | Share links + `throne://` deeplinks (GroupUpdater-aligned) |
+| Storage | `crates/throne-storage` | SQLite schema compatible with upstream repos |
 | Core client | `crates/throne-core-client` | Async API toward the Go `ThroneCore` process |
 | Data plane | `core/server` | Existing Go core (sing-box / xray, TUN, DNS, tests) |
 
@@ -58,15 +62,30 @@ cd core/server
 go build -o ../../target/Core .
 ```
 
+## Upstream sync
+
+```bash
+git fetch upstream --prune
+git log --oneline upstream/dev -30
+# refresh parity notes after reading commits
+```
+
+Import share links (clipboard or env):
+
+```bash
+export THRONE_IMPORT='vless://uuid@host:443?security=tls&type=ws&path=%2F#demo'
+cargo run -p throne
+# then press Import / ⌘V
+```
+
 ## Roadmap
 
 1. **M0** — GPUI shell, domain models, demo store ✅
-2. **M1** — SQLite persistence (profiles / groups / settings)
-3. **M2** — `libcore.proto` Rust client + core process lifecycle
-4. **M3** — Subscription import, share-link parse, config build
-5. **M4** — System proxy / TUN elevation, tray, hotkeys
-6. **M5** — Latency / speed tests, traffic charts, connections view
-7. **M6** — Feature parity polish + packaging
+2. **Wave A** — SQLite + share-link import + upstream tracking doc ✅
+3. **Wave B** — Clash/JSON sub, route profiles, OS deeplink registration
+4. **Wave C** — `libcore.proto` RPC Start/Stop/QueryStats + URL test
+5. **Wave D** — System proxy / TUN, tray, traffic stats UI
+6. **Wave E** — Feature parity polish + packaging
 
 ## License
 

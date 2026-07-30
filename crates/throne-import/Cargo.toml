@@ -1,0 +1,18 @@
+[package]
+name = "throne-import"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Share-link and subscription importers aligned with upstream Throne GroupUpdater"
+
+[dependencies]
+throne-domain = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+base64 = { workspace = true }
+url = { workspace = true }
+urlencoding = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

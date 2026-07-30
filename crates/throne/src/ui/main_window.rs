@@ -10,13 +10,15 @@ use throne_domain::{AppState, CoreStatus, GroupId, Profile, ProfileId, SystemMod
 use crate::theme::{Theme, latency_color};
 use crate::ui::widgets::{h_rule, pill, search_field, section_label, spacer, status_dot, toolbar_button};
 
-actions!(throne, [ToggleProxy, FocusSearch, Quit]);
+actions!(throne, [ToggleProxy, FocusSearch, ImportClipboard, SaveDb, Quit]);
 
 pub struct MainWindow {
     state: AppState,
     focus_handle: FocusHandle,
     /// Local draft for search; applied into state on each change.
     search_draft: String,
+    /// Optional path message for last DB save.
+    db_path_label: String,
 }
 
 impl MainWindow {
@@ -26,13 +28,85 @@ impl MainWindow {
             gpui::KeyBinding::new("ctrl-r", ToggleProxy, None),
             gpui::KeyBinding::new("cmd-f", FocusSearch, None),
             gpui::KeyBinding::new("ctrl-f", FocusSearch, None),
+            gpui::KeyBinding::new("cmd-v", ImportClipboard, None),
+            gpui::KeyBinding::new("ctrl-v", ImportClipboard, None),
+            gpui::KeyBinding::new("cmd-s", SaveDb, None),
+            gpui::KeyBinding::new("ctrl-s", SaveDb, None),
             gpui::KeyBinding::new("cmd-q", Quit, None),
         ]);
 
+        let (state, db_path_label) = load_initial_state();
+
         Self {
-            state: AppState::with_demo_data(),
+            state,
             focus_handle: cx.focus_handle(),
             search_draft: String::new(),
+            db_path_label,
+        }
+    }
+
+    fn import_clipboard(&mut self, cx: &mut Context<Self>) {
+        // GPUI clipboard API varies; use std env THRONE_IMPORT / demo paste buffer first.
+        let text = std::env::var("THRONE_IMPORT")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(read_os_clipboard)
+            .unwrap_or_default();
+
+        if text.trim().is_empty() {
+            self.state.set_status_message(
+                "Import: clipboard empty — set THRONE_IMPORT or copy share links",
+            );
+            cx.notify();
+            return;
+        }
+
+        let report = throne_import::import_text(&text);
+        let insecure_flag = self.state.settings().show_config_security;
+        let items = report.profiles.into_iter().map(|p| {
+            let insecure = insecure_flag
+                && (p.outbound.insecure == Some(true)
+                    || p.outbound.tls == Some(false)
+                    || p.source.contains("insecure=1"));
+            (p.name, p.profile_type, p.outbound, insecure)
+        });
+        let n = self.state.import_profiles(items);
+        let mut msg = format!("Imported {n} · skipped {}", report.skipped);
+        if let Some(url) = report.pending_sub_url {
+            msg.push_str(&format!(" · pending sub fetch: {url}"));
+        }
+        for note in report.notes.iter().take(2) {
+            msg.push_str(" · ");
+            msg.push_str(note);
+        }
+        if n == 0 && !report.errors.is_empty() {
+            msg = report.errors.first().cloned().unwrap_or(msg);
+        }
+        self.state.set_status_message(msg);
+        // Auto-persist after successful import
+        if n > 0 {
+            let _ = self.persist_db();
+        }
+        cx.notify();
+    }
+
+    fn persist_db(&mut self) -> Result<(), String> {
+        let path = throne_storage::default_db_path();
+        let db = throne_storage::Database::open(&path).map_err(|e| e.to_string())?;
+        db.save_state(&self.state).map_err(|e| e.to_string())?;
+        self.db_path_label = path.display().to_string();
+        self.state
+            .set_status_message(format!("Saved · {}", self.db_path_label));
+        Ok(())
+    }
+
+    fn save_db(&mut self, cx: &mut Context<Self>) {
+        match self.persist_db() {
+            Ok(()) => cx.notify(),
+            Err(e) => {
+                self.state.set_status_message(format!("Save failed: {e}"));
+                cx.notify();
+            }
         }
     }
 
@@ -126,6 +200,12 @@ impl MainWindow {
             })
             .child({
                 let entity = cx.entity().clone();
+                toolbar_button("import", "Import", false, move |_, _, cx| {
+                    entity.update(cx, |this, cx| this.import_clipboard(cx));
+                })
+            })
+            .child({
+                let entity = cx.entity().clone();
                 toolbar_button("toggle", start_label, true, move |_, _, cx| {
                     entity.update(cx, |this, cx| this.toggle_proxy(cx));
                 })
@@ -147,6 +227,12 @@ impl MainWindow {
                         };
                         this.set_mode(next, cx);
                     });
+                })
+            })
+            .child({
+                let entity = cx.entity().clone();
+                toolbar_button("save", "Save", false, move |_, _, cx| {
+                    entity.update(cx, |this, cx| this.save_db(cx));
                 })
             })
     }
@@ -396,18 +482,100 @@ impl MainWindow {
                     .text_color(Theme::text_muted())
                     .child("Protobuf: core/server/gen/libcore.proto"),
             )
+            .child(section_label("SETTINGS (upstream defaults)"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(Theme::text_muted())
+                    .child(format!(
+                        "DNS {}",
+                        self.state.settings().remote_dns
+                    )),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(Theme::text_muted())
+                    .child(format!(
+                        "SOCKS {}:{}",
+                        self.state.settings().inbound_address,
+                        self.state.settings().inbound_socks_port
+                    )),
+            )
             .child(section_label("SHORTCUTS"))
             .child(shortcut_row("⌘/Ctrl+R", "Start / Stop"))
-            .child(shortcut_row("⌘/Ctrl+F", "Focus filter"))
+            .child(shortcut_row("⌘/Ctrl+V", "Import clipboard"))
+            .child(shortcut_row("⌘/Ctrl+S", "Save DB"))
             .child(shortcut_row("Double-click", "Start profile"))
             .child(spacer())
             .child(
                 div()
                     .text_xs()
                     .text_color(Theme::text_muted())
-                    .child("Rewrite milestone 0 — UI shell"),
+                    .child(if self.db_path_label.is_empty() {
+                        "DB: memory/demo".into()
+                    } else {
+                        format!("DB: {}", self.db_path_label)
+                    }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(Theme::text_muted())
+                    .child("Wave A · upstream-synced import + SQLite"),
             )
     }
+}
+
+fn load_initial_state() -> (AppState, String) {
+    match throne_storage::open_default() {
+        Ok(db) => {
+            let path = db.path().display().to_string();
+            match throne_storage::load_or_seed_demo(&db) {
+                Ok(state) => (state, path),
+                Err(e) => {
+                    let mut s = AppState::with_demo_data();
+                    s.set_status_message(format!("DB load failed ({e}); using demo"));
+                    (s, path)
+                }
+            }
+        }
+        Err(e) => {
+            let mut s = AppState::with_demo_data();
+            s.set_status_message(format!("DB open failed ({e}); using demo"));
+            (s, String::new())
+        }
+    }
+}
+
+/// Best-effort clipboard read without pulling extra crates.
+fn read_os_clipboard() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        let out = Command::new("pbpaste").output().ok()?;
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).to_string();
+            if !s.trim().is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::process::Command;
+        for cmd in [["xclip", "-selection", "clipboard", "-o"], ["wl-paste"]] {
+            if let Ok(out) = Command::new(cmd[0]).args(&cmd[1..]).output() {
+                if out.status.success() {
+                    let s = String::from_utf8_lossy(&out.stdout).to_string();
+                    if !s.trim().is_empty() {
+                        return Some(s);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn shortcut_row(key: &str, desc: &str) -> impl IntoElement {
@@ -449,6 +617,10 @@ impl Render for MainWindow {
         div()
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &ToggleProxy, _, cx| this.toggle_proxy(cx)))
+            .on_action(cx.listener(|this, _: &ImportClipboard, _, cx| {
+                this.import_clipboard(cx)
+            }))
+            .on_action(cx.listener(|this, _: &SaveDb, _, cx| this.save_db(cx)))
             .on_action(cx.listener(|_this, _: &Quit, _, cx| cx.quit()))
             .on_action(cx.listener(|this, _: &FocusSearch, _, cx| {
                 this.state

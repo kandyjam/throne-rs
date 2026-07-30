@@ -28,11 +28,24 @@ Unchanged from upstream:
 - Today: stubs returning `CoreError::NotImplemented`.
 - Tomorrow: framing compatible with the Qt `API::Client` local-socket codec.
 
+### `throne-import`
+
+- Share-link parsers aligned with upstream `GroupUpdater` / `RawUpdater`.
+- `throne://add|route|remoteRoute|addsub/` deep links (`e7eb0438`).
+
+### `throne-storage`
+
+- SQLite tables matching upstream `profiles` / `groups` / `groups_order` / `settings`.
+- Default path under the OS data directory (`throne-rs/throne.db`).
+
 ### `throne` (binary)
 
 - GPUI `Application` + `MainWindow`.
 - Maps user actions → `AppState` mutations (and later async core commands).
 - Theme tokens in `theme.rs`.
+- Import (clipboard / `THRONE_IMPORT`) + Save DB shortcuts.
+
+See [UPSTREAM_TRACKING.md](./UPSTREAM_TRACKING.md) for the live parity matrix against `throneproj/Throne`.
 
 ## UI map (M0)
 

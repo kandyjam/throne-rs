@@ -4,6 +4,8 @@ members = [
     "crates/throne",
     "crates/throne-domain",
     "crates/throne-core-client",
+    "crates/throne-import",
+    "crates/throne-storage",
 ]
 default-members = ["crates/throne"]
 
@@ -17,6 +19,8 @@ authors = ["Throne-rs contributors"]
 [workspace.dependencies]
 throne-domain = { path = "crates/throne-domain" }
 throne-core-client = { path = "crates/throne-core-client" }
+throne-import = { path = "crates/throne-import" }
+throne-storage = { path = "crates/throne-storage" }
 gpui = "0.2.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -28,3 +32,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 anyhow = "1"
+base64 = "0.22"
+url = "2"
+urlencoding = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }

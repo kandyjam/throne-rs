@@ -55,12 +55,43 @@ impl ProfileType {
             Self::TrustTunnel => "trusttunnel",
             Self::ShadowTls => "shadowtls",
             Self::Ssh => "ssh",
-            Self::XrayVless => "xray_vless",
+            // Upstream OutboundFactory uses "xrayvless" (no underscore).
+            Self::XrayVless => "xrayvless",
             Self::Chain => "chain",
             Self::Custom => "custom",
             Self::Direct => "direct",
             Self::Tailscale => "tailscale",
-            Self::ExtraCore => "extra_core",
+            Self::ExtraCore => "extracore",
+        }
+    }
+
+    /// Parse upstream type strings (`hysteria2` → Hysteria bean type hysteria).
+    pub fn from_upstream(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "socks" | "socks5" => Some(Self::Socks),
+            "http" | "https" => Some(Self::Http),
+            "shadowsocks" | "ss" => Some(Self::Shadowsocks),
+            "vmess" => Some(Self::Vmess),
+            "vless" => Some(Self::Vless),
+            "trojan" => Some(Self::Trojan),
+            "hysteria" => Some(Self::Hysteria),
+            "hysteria2" | "hy2" => Some(Self::Hysteria2),
+            "tuic" => Some(Self::Tuic),
+            "wireguard" | "wg" => Some(Self::Wireguard),
+            "anytls" => Some(Self::AnyTls),
+            "mieru" => Some(Self::Mieru),
+            "naive" | "naiveproxy" => Some(Self::Naive),
+            "juicity" => Some(Self::Juicity),
+            "trusttunnel" => Some(Self::TrustTunnel),
+            "shadowtls" => Some(Self::ShadowTls),
+            "ssh" => Some(Self::Ssh),
+            "xrayvless" | "xray_vless" => Some(Self::XrayVless),
+            "chain" => Some(Self::Chain),
+            "custom" => Some(Self::Custom),
+            "direct" => Some(Self::Direct),
+            "tailscale" => Some(Self::Tailscale),
+            "extracore" | "extra_core" => Some(Self::ExtraCore),
+            _ => None,
         }
     }
 
@@ -93,6 +124,51 @@ impl ProfileType {
     }
 }
 
+/// Parsed outbound fields shared by importers (maps toward sing-box JSON later).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParsedOutbound {
+    pub tag: Option<String>,
+    pub server: Option<String>,
+    pub server_port: Option<u16>,
+    pub uuid: Option<String>,
+    pub password: Option<String>,
+    pub username: Option<String>,
+    pub method: Option<String>,
+    pub flow: Option<String>,
+    pub security: Option<String>,
+    pub alter_id: Option<i32>,
+    pub transport: Option<String>,
+    pub host: Option<String>,
+    pub path: Option<String>,
+    pub service_name: Option<String>,
+    pub tls: Option<bool>,
+    pub sni: Option<String>,
+    pub alpn: Option<String>,
+    pub fp: Option<String>,
+    pub pbk: Option<String>,
+    pub sid: Option<String>,
+    pub spx: Option<String>,
+    pub insecure: Option<bool>,
+    pub plugin: Option<String>,
+    pub plugin_opts: Option<String>,
+    pub obfs: Option<String>,
+    pub up_mbps: Option<u32>,
+    pub down_mbps: Option<u32>,
+    pub congestion_control: Option<String>,
+    pub udp_relay_mode: Option<String>,
+    pub packet_encoding: Option<String>,
+    /// Full serialized snapshot for DB `outbound_json`.
+    pub raw_json: Option<String>,
+}
+
+impl ParsedOutbound {
+    pub fn to_db_json(&self) -> String {
+        self.raw_json
+            .clone()
+            .unwrap_or_else(|| serde_json::to_string(self).unwrap_or_else(|_| "{}".into()))
+    }
+}
+
 /// A proxy profile (node) belonging to a group.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
@@ -110,6 +186,12 @@ pub struct Profile {
     pub ip_out: String,
     /// Opaque outbound JSON / sing-box fragment (filled by importers later).
     pub outbound_json: String,
+    /// Structured outbound when available (import path).
+    #[serde(default)]
+    pub outbound: ParsedOutbound,
+    /// Upstream "config security" flag (`cd7cb259`) — true if link looks insecure.
+    #[serde(default)]
+    pub insecure: bool,
 }
 
 impl Profile {
@@ -127,6 +209,8 @@ impl Profile {
             traffic_uplink: 0,
             ip_out: String::new(),
             outbound_json: String::new(),
+            outbound: ParsedOutbound::default(),
+            insecure: false,
         }
     }
 
@@ -220,8 +304,83 @@ impl CoreStatus {
 pub struct TrafficSnapshot {
     pub proxy_up: i64,
     pub proxy_down: i64,
-    pub direct_up: i64,
     pub direct_down: i64,
+    pub direct_up: i64,
+}
+
+/// Subset of upstream `SettingsRepo` defaults used by the Rust client.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppSettings {
+    pub inbound_socks_port: i32,
+    pub inbound_address: String,
+    pub test_latency_url: String,
+    pub remote_dns: String,
+    pub direct_dns: String,
+    pub vpn_strict_route: bool,
+    pub vpn_mtu: i32,
+    pub disable_private_range_bypass: bool,
+    pub sub_show_change_popup: bool,
+    pub allow_stopping_active_profile: bool,
+    pub show_config_security: bool,
+    pub current_route_id: i64,
+    pub remember_id: i64,
+    pub system_proxy_enabled: bool,
+    pub tun_mode_enabled: bool,
+    pub theme: String,
+    pub log_level: String,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            inbound_socks_port: 2080,
+            inbound_address: "127.0.0.1".into(),
+            test_latency_url: "https://www.gstatic.com/generate_204".into(),
+            // upstream 56d0d9fd — Google DoH as default remote DNS
+            remote_dns: "https://dns.google/dns-query".into(),
+            direct_dns: "localhost".into(),
+            vpn_strict_route: false,
+            vpn_mtu: 9000,
+            disable_private_range_bypass: false,
+            sub_show_change_popup: true,
+            allow_stopping_active_profile: true,
+            show_config_security: true,
+            current_route_id: -1,
+            remember_id: -1,
+            system_proxy_enabled: false,
+            tun_mode_enabled: false,
+            theme: "dark".into(),
+            log_level: "info".into(),
+        }
+    }
+}
+
+/// Route profile skeleton (full rule graph lands with storage wave B).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteProfile {
+    pub id: i64,
+    pub name: String,
+    pub default_outbound_id: i64,
+    pub is_raw: bool,
+    pub raw_route: String,
+    pub is_remote: bool,
+    pub remote_url: String,
+    pub auto_update: bool,
+}
+
+impl RouteProfile {
+    pub fn new(id: i64, name: impl Into<String>) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            default_outbound_id: -1,
+            is_raw: false,
+            raw_route: String::new(),
+            is_remote: false,
+            remote_url: String::new(),
+            auto_update: false,
+        }
+    }
 }
 
 fn human_bytes(n: i64) -> String {

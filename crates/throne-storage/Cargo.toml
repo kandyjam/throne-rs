@@ -1,0 +1,18 @@
+[package]
+name = "throne-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SQLite persistence compatible with upstream Throne schema"
+
+[dependencies]
+throne-domain = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+dirs = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
