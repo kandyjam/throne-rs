@@ -646,7 +646,7 @@ fn merge_settings_tx(
     tx: &rusqlite::Transaction<'_>,
     s: &AppSettings,
 ) -> Result<(), StorageError> {
-    let pairs: [(&str, String); 17] = [
+    let pairs: [(&str, String); 18] = [
         ("inbound_socks_port", s.inbound_socks_port.to_string()),
         ("inbound_address", s.inbound_address.clone()),
         ("test_url", s.test_latency_url.clone()),
@@ -668,6 +668,7 @@ fn merge_settings_tx(
         ("remember_id", s.remember_id.to_string()),
         ("system_proxy_enabled", bool_str(s.system_proxy_enabled)),
         ("tun_mode_enabled", bool_str(s.tun_mode_enabled)),
+        ("system_dns_set", bool_str(s.system_dns_set)),
         ("theme", s.theme.clone()),
         ("log_level", s.log_level.clone()),
     ];
@@ -722,6 +723,7 @@ fn apply_setting(s: &mut AppSettings, key: &str, value: &str) {
         }
         "system_proxy_enabled" => s.system_proxy_enabled = parse_bool(value),
         "tun_mode_enabled" => s.tun_mode_enabled = parse_bool(value),
+        "system_dns_set" => s.system_dns_set = parse_bool(value),
         "theme" => s.theme = value.to_string(),
         "log_level" => s.log_level = value.to_string(),
         _ => {}

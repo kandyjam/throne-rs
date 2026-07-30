@@ -215,18 +215,74 @@ impl Profile {
 
     pub fn display_latency(&self) -> String {
         match self.latency_ms {
-            0 => "—".into(),
+            0 => String::new(),
             n if n < 0 => "fail".into(),
             n => format!("{n} ms"),
         }
     }
 
+    /// Upstream table "Test Result" cell (latency + optional speed/country).
+    pub fn display_test_result(&self) -> String {
+        let mut parts = Vec::new();
+        let lat = self.display_latency();
+        if !lat.is_empty() {
+            parts.push(lat);
+        }
+        if !self.test_country.is_empty() {
+            parts.push(self.test_country.clone());
+        }
+        if !self.download_speed.is_empty() {
+            parts.push(format!("↓{}", self.download_speed));
+        }
+        if !self.upload_speed.is_empty() {
+            parts.push(format!("↑{}", self.upload_speed));
+        }
+        parts.join(" ")
+    }
+
     pub fn display_traffic(&self) -> String {
+        if self.traffic_downlink == 0 && self.traffic_uplink == 0 {
+            return String::new();
+        }
         format!(
-            "↓ {}  ↑ {}",
+            "↓{} ↑{}",
             human_bytes(self.traffic_downlink),
             human_bytes(self.traffic_uplink)
         )
+    }
+
+    /// Upstream ColAddress: `host:port` from outbound.
+    pub fn display_address(&self) -> String {
+        let server = self
+            .outbound
+            .server
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                serde_json::from_str::<serde_json::Value>(&self.outbound_json)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("server")
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_string())
+                    })
+            })
+            .unwrap_or_default();
+        let port = self.outbound.server_port.or_else(|| {
+            serde_json::from_str::<serde_json::Value>(&self.outbound_json)
+                .ok()
+                .and_then(|v| v.get("server_port").and_then(|x| x.as_u64().map(|n| n as u16)))
+        });
+        match (server.is_empty(), port) {
+            (true, _) => String::new(),
+            (false, Some(p)) if p > 0 => format!("{server}:{p}"),
+            (false, _) => server,
+        }
+    }
+
+    /// Upstream ColType via outbound DisplayType.
+    pub fn display_type(&self) -> String {
+        self.profile_type.display_name().to_string()
     }
 }
 
@@ -344,6 +400,8 @@ pub struct AppSettings {
     pub remember_id: i64,
     pub system_proxy_enabled: bool,
     pub tun_mode_enabled: bool,
+    /// Upstream `system_dns_set` checkbox on the main toolbar.
+    pub system_dns_set: bool,
     pub theme: String,
     pub log_level: String,
 }
@@ -367,6 +425,7 @@ impl Default for AppSettings {
             remember_id: -1,
             system_proxy_enabled: false,
             tun_mode_enabled: false,
+            system_dns_set: false,
             theme: "dark".into(),
             log_level: "info".into(),
         }
@@ -607,7 +666,7 @@ mod tests {
     #[test]
     fn latency_display() {
         let mut p = Profile::new(1, 1, "a", ProfileType::Vless);
-        assert_eq!(p.display_latency(), "—");
+        assert_eq!(p.display_latency(), "");
         p.latency_ms = 42;
         assert_eq!(p.display_latency(), "42 ms");
         p.latency_ms = -1;

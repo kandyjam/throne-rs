@@ -1,4 +1,4 @@
-//! Dark theme tokens inspired by modern proxy clients / Zed.
+//! Colors closer to default Qt Fusion / Throne desktop chrome.
 
 use gpui::{Hsla, rgb};
 
@@ -6,82 +6,92 @@ pub struct Theme;
 
 impl Theme {
     pub fn bg_app() -> Hsla {
-        rgb(0x1a1b1e).into()
+        rgb(0xf0f0f0).into()
     }
 
     pub fn bg_panel() -> Hsla {
-        rgb(0x222327).into()
+        rgb(0xe8e8e8).into()
     }
 
     pub fn bg_elevated() -> Hsla {
-        rgb(0x2a2b30).into()
+        rgb(0xffffff).into()
     }
 
     pub fn bg_hover() -> Hsla {
-        rgb(0x32333a).into()
+        rgb(0xdce8f8).into()
     }
 
     pub fn bg_selected() -> Hsla {
-        rgb(0x2d3a4f).into()
+        rgb(0x3d7eff).into()
+    }
+
+    pub fn bg_selected_text() -> Hsla {
+        rgb(0xffffff).into()
+    }
+
+    pub fn bg_toolbar_btn() -> Hsla {
+        rgb(0xf7f7f7).into()
     }
 
     pub fn border() -> Hsla {
-        rgb(0x3a3b42).into()
+        rgb(0x777777).into()
+    }
+
+    pub fn border_light() -> Hsla {
+        rgb(0xb0b0b0).into()
     }
 
     pub fn text() -> Hsla {
-        rgb(0xe8e8ed).into()
+        rgb(0x202020).into()
     }
 
     pub fn text_muted() -> Hsla {
-        rgb(0x9a9aa3).into()
+        rgb(0x606060).into()
+    }
+
+    pub fn text_on_selected() -> Hsla {
+        rgb(0xffffff).into()
     }
 
     pub fn accent() -> Hsla {
-        rgb(0x5b8def).into()
+        rgb(0x2a6af0).into()
     }
 
     pub fn accent_soft() -> Hsla {
-        rgb(0x3d5a8a).into()
+        rgb(0xc8daf8).into()
     }
 
     pub fn success() -> Hsla {
-        rgb(0x3dd68c).into()
+        rgb(0x2e8b57).into()
     }
 
-    #[allow(dead_code)]
     pub fn danger() -> Hsla {
-        rgb(0xf07178).into()
+        rgb(0xc0392b).into()
     }
 
-    #[allow(dead_code)]
     pub fn warning() -> Hsla {
-        rgb(0xe6b450).into()
+        rgb(0xd48806).into()
     }
 
-    pub fn latency_good() -> Hsla {
-        rgb(0x3dd68c).into()
+    pub fn start_green() -> Hsla {
+        rgb(0x27ae60).into()
     }
 
-    pub fn latency_ok() -> Hsla {
-        rgb(0xe6b450).into()
+    pub fn stop_red() -> Hsla {
+        rgb(0xe74c3c).into()
     }
 
-    pub fn latency_bad() -> Hsla {
-        rgb(0xf07178).into()
-    }
-
-    pub fn latency_none() -> Hsla {
-        Self::text_muted()
+    pub fn tab_selected_border() -> Hsla {
+        rgb(0x3d7eff).into()
     }
 }
 
 pub fn latency_color(ms: i32) -> Hsla {
     match ms {
-        0 => Theme::latency_none(),
-        n if n < 0 => Theme::latency_bad(),
-        n if n < 80 => Theme::latency_good(),
-        n if n < 150 => Theme::latency_ok(),
-        _ => Theme::latency_bad(),
+        0 => Theme::text_muted(),
+        n if n < 0 => Theme::danger(),
+        n if n < 80 => Theme::success(),
+        n if n < 150 => Theme::warning(),
+        _ => Theme::danger(),
     }
 }

@@ -19,7 +19,8 @@ fn main() {
     Application::new().run(|cx: &mut App| {
         cx.activate(true);
 
-        let bounds = Bounds::centered(None, size(px(1100.), px(720.)), cx);
+        // Upstream mainwindow.ui minimum 800×600
+        let bounds = Bounds::centered(None, size(px(960.), px(640.)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),

@@ -281,11 +281,98 @@ impl AppState {
 
     pub fn set_system_mode(&mut self, mode: SystemMode) {
         self.system_mode = mode;
+        self.settings.system_proxy_enabled = matches!(mode, SystemMode::SystemProxy);
+        self.settings.tun_mode_enabled = matches!(mode, SystemMode::VpnTun);
+        // TUN and system proxy can both be on in upstream; we track primary mode
+        // but keep independent checkboxes via set_spmode_*.
         self.status_message = match mode {
             SystemMode::Off => "System mode: off".into(),
-            SystemMode::SystemProxy => "System mode: system proxy".into(),
-            SystemMode::VpnTun => "System mode: TUN / VPN".into(),
+            SystemMode::SystemProxy => "System Proxy enabled".into(),
+            SystemMode::VpnTun => "Tun Mode enabled".into(),
         };
+    }
+
+    /// Upstream `checkBox_SystemProxy`.
+    pub fn set_spmode_system_proxy(&mut self, enable: bool) {
+        self.settings.system_proxy_enabled = enable;
+        self.sync_system_mode_from_flags();
+        self.status_message = if enable {
+            "System Proxy enabled".into()
+        } else {
+            "System Proxy disabled".into()
+        };
+    }
+
+    /// Upstream `checkBox_VPN` (Tun Mode).
+    pub fn set_spmode_vpn(&mut self, enable: bool) {
+        self.settings.tun_mode_enabled = enable;
+        self.sync_system_mode_from_flags();
+        self.status_message = if enable {
+            "Tun Mode enabled".into()
+        } else {
+            "Tun Mode disabled".into()
+        };
+    }
+
+    /// Upstream `system_dns` checkbox.
+    pub fn set_system_dns(&mut self, enable: bool) {
+        self.settings.system_dns_set = enable;
+        self.status_message = if enable {
+            "System DNS enabled".into()
+        } else {
+            "System DNS disabled".into()
+        };
+    }
+
+    fn sync_system_mode_from_flags(&mut self) {
+        self.system_mode = if self.settings.tun_mode_enabled {
+            SystemMode::VpnTun
+        } else if self.settings.system_proxy_enabled {
+            SystemMode::SystemProxy
+        } else {
+            SystemMode::Off
+        };
+    }
+
+    /// Running profile display for `label_running` (upstream refresh_status).
+    pub fn running_label(&self) -> String {
+        match &self.core_status {
+            CoreStatus::Running { profile_name, .. } => profile_name.clone(),
+            CoreStatus::Starting => "Starting…".into(),
+            CoreStatus::Stopping => "Stopping…".into(),
+            CoreStatus::Error(e) => format!("Error: {e}"),
+            CoreStatus::Stopped => {
+                if let Some(id) = self.selected_profile_id {
+                    if let Some(p) = self.profiles.get(&id) {
+                        return format!("{}  (stopped)", p.name);
+                    }
+                }
+                "Not running".into()
+            }
+        }
+    }
+
+    /// Inbound summary for `label_inbound`.
+    pub fn inbound_label(&self) -> String {
+        let s = &self.settings;
+        format!(
+            "Mixed: {}:{}",
+            s.inbound_address, s.inbound_socks_port
+        )
+    }
+
+    /// Speed lines for `label_speed`.
+    pub fn speed_label(&self) -> String {
+        if !self.core_status.is_running() {
+            return String::new();
+        }
+        format!(
+            "Proxy: ↓{}/s ↑{}/s\nDirect: ↓{}/s ↑{}/s",
+            human_rate(self.traffic.proxy_down),
+            human_rate(self.traffic.proxy_up),
+            human_rate(self.traffic.direct_down),
+            human_rate(self.traffic.direct_up),
+        )
     }
 
     pub fn tick_traffic_demo(&mut self) {
@@ -487,6 +574,21 @@ impl AppState {
                 self.selected_profile_id = None;
             }
         }
+    }
+}
+
+fn human_rate(bytes: i64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut v = bytes.max(0) as f64;
+    let mut i = 0usize;
+    while v >= 1024.0 && i + 1 < UNITS.len() {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{bytes}{}", UNITS[i])
+    } else {
+        format!("{v:.1}{}", UNITS[i])
     }
 }
 

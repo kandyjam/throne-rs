@@ -46,6 +46,7 @@ Status legend: ✅ done · 🧩 partial · ⏳ planned · ❌ out of scope (Go c
 | Linux CLI installer | `89f3ec1d` | ⏳ | `script/` / xtask |
 | Core: sing-box / xray / TUN / DNS | Go `core/server` | ❌ keep Go | `core/server` |
 | GPUI shell | — | ✅ M0 | `throne` |
+| Main window layout / ops | `mainwindow.ui` | 🧩 toolbar menus, Start/Stop, Tun/DNS/Proxy, group tabs, 5-col table, logs/conn panel, status bar | `throne` |
 
 ## Defaults synced from upstream
 

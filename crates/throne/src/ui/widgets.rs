@@ -1,116 +1,167 @@
-use gpui::{App, SharedString, div, prelude::*, px, relative};
+use gpui::{
+    App, ClickEvent, Div, SharedString, Window, div, prelude::*, px,
+};
 
 use crate::theme::Theme;
 
-pub fn toolbar_button(
+/// Top toolbar menu button: icon glyph + label under (text-under-icon style).
+pub fn toolbar_menu_btn(
     id: impl Into<SharedString>,
-    label: impl Into<SharedString>,
-    primary: bool,
-    on_click: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut App) + 'static,
+    glyph: &'static str,
+    label: &'static str,
+    open: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    let label = label.into();
-    let id = id.into();
     div()
-        .id(id)
-        .px_3()
-        .py_1p5()
-        .rounded_md()
-        .text_sm()
+        .id(id.into())
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap_0p5()
+        .px_2()
+        .py_1()
+        .min_w(px(64.))
+        .rounded_sm()
+        .border_1()
+        .border_color(if open {
+            Theme::accent()
+        } else {
+            Theme::border_light()
+        })
+        .bg(if open {
+            Theme::accent_soft()
+        } else {
+            Theme::bg_toolbar_btn()
+        })
+        .hover(|e| e.bg(Theme::bg_hover()))
         .cursor_pointer()
-        .when(primary, |el| {
-            el.bg(Theme::accent())
-                .text_color(gpui::white())
-                .hover(|e| e.bg(Theme::accent_soft()))
-        })
-        .when(!primary, |el| {
-            el.bg(Theme::bg_elevated())
+        .child(
+            div()
+                .text_lg()
+                .line_height(px(22.))
                 .text_color(Theme::text())
-                .border_1()
-                .border_color(Theme::border())
-                .hover(|e| e.bg(Theme::bg_hover()))
-        })
-        .child(label)
+                .child(glyph),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(Theme::text())
+                .child(label),
+        )
         .on_click(on_click)
 }
 
-pub fn pill(label: impl Into<SharedString>, color: gpui::Hsla) -> impl IntoElement {
-    div()
-        .px_2()
-        .py_0p5()
-        .rounded_full()
-        .bg(Theme::bg_elevated())
-        .border_1()
-        .border_color(Theme::border())
-        .text_xs()
-        .text_color(color)
-        .child(label.into())
-}
-
-pub fn section_label(text: impl Into<SharedString>) -> impl IntoElement {
-    div()
-        .text_xs()
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(Theme::text_muted())
-        .child(text.into())
-}
-
-pub fn spacer() -> impl IntoElement {
-    div().flex_1()
-}
-
-pub fn h_rule() -> impl IntoElement {
-    div()
-        .w_full()
-        .h(px(1.))
-        .bg(Theme::border())
-        .my_1()
-}
-
-pub fn status_dot(active: bool) -> impl IntoElement {
-    div()
-        .size(px(8.))
-        .rounded_full()
-        .bg(if active {
-            Theme::success()
-        } else {
-            Theme::text_muted()
-        })
-}
-
-/// Simple text field styling for the search box (click-to-focus later).
-pub fn search_field(
-    id: impl Into<SharedString>,
-    value: &str,
-    placeholder: &str,
-    on_input: impl Fn(&str, &mut gpui::Window, &mut App) + 'static,
+/// Large Start / Stop control (upstream StartStopButton).
+pub fn start_stop_btn(
+    running: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    let shown = if value.is_empty() {
-        placeholder.to_string()
+    let (label, color, glyph) = if running {
+        ("Stop", Theme::stop_red(), "■")
     } else {
-        value.to_string()
+        ("Start", Theme::start_green(), "▶")
     };
-    let muted = value.is_empty();
-    // Character-cycle demo filter keys: type letters via click chips for MVP;
-    // full IME input lands with a proper Input element later.
-    let _ = on_input;
+    div()
+        .id("startstop")
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .w(px(72.))
+        .h(px(56.))
+        .rounded_md()
+        .border_1()
+        .border_color(color)
+        .bg(Theme::bg_elevated())
+        .hover(|e| e.bg(Theme::bg_hover()))
+        .cursor_pointer()
+        .child(
+            div()
+                .text_xl()
+                .text_color(color)
+                .child(glyph),
+        )
+        .child(
+            div()
+                .text_xs()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(color)
+                .child(label),
+        )
+        .on_click(on_click)
+}
+
+/// Checkbox row matching Tun / System DNS / System Proxy.
+pub fn mode_checkbox(
+    id: impl Into<SharedString>,
+    label: &'static str,
+    checked: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
     div()
         .id(id.into())
         .flex()
         .items_center()
+        .gap_1p5()
+        .cursor_pointer()
+        .on_click(on_click)
+        .child(
+            div()
+                .size(px(14.))
+                .rounded_sm()
+                .border_1()
+                .border_color(Theme::border())
+                .bg(if checked {
+                    Theme::accent()
+                } else {
+                    Theme::bg_elevated()
+                })
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_xs()
+                .text_color(Theme::text_on_selected())
+                .child(if checked { "✓" } else { "" }),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(Theme::text())
+                .child(label),
+        )
+}
+
+pub fn menu_item(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id.into())
         .px_3()
-        .h(px(32.))
-        .min_w(px(180.))
-        .max_w(relative(0.35))
-        .flex_1()
-        .rounded_md()
-        .bg(Theme::bg_elevated())
-        .border_1()
-        .border_color(Theme::border())
+        .py_1p5()
         .text_sm()
-        .text_color(if muted {
-            Theme::text_muted()
-        } else {
-            Theme::text()
-        })
-        .child(shown)
+        .text_color(Theme::text())
+        .cursor_pointer()
+        .hover(|e| e.bg(Theme::accent()).text_color(Theme::text_on_selected()))
+        .child(label.into())
+        .on_click(on_click)
+}
+
+pub fn menu_separator() -> impl IntoElement {
+    div()
+        .h(px(1.))
+        .w_full()
+        .my_1()
+        .bg(Theme::border_light())
+}
+
+pub fn menu_label(text: impl Into<SharedString>) -> impl IntoElement {
+    div()
+        .px_3()
+        .py_1()
+        .text_xs()
+        .text_color(Theme::text_muted())
+        .child(text.into())
 }
