@@ -187,6 +187,12 @@ pub struct LoadConfigRequest {
     pub disable_stats: bool,
 }
 
+/// A live IPC process is reusable after a successful Stop. Only an active
+/// profile needs an in-band Stop before a new Start.
+fn should_stop_before_start(running_profile: Option<ProfileId>) -> bool {
+    running_profile.is_some()
+}
+
 /// Long-lived core session: IPC server + child process + RPC stream.
 pub struct CoreSession {
     config: CoreConfig,
@@ -386,9 +392,9 @@ impl CoreSession {
         let built = build_load_config(profile, settings, route_profile)?;
         self.ensure_connected()?;
 
-        // Keep-alive path: a previous Stop may have left boxInstance up, or a
-        // half-failed Start. Always Stop first so Start is clean.
-        if self.running_profile.is_some() || self.connected {
+        // A caller that did not complete Stop may have left boxInstance up.
+        // After a completed Stop, retain the live IPC process for the next Start.
+        if should_stop_before_start(self.running_profile) {
             let _ = self.call(
                 "Stop",
                 &proto_wire::encode_empty_req(),
@@ -951,5 +957,11 @@ mod tests {
         let short = format_core_error(raw);
         assert!(short.contains("legacy inbound"), "got: {short}");
         assert!(!short.contains("\"sniff\""), "should drop JSON blob: {short}");
+    }
+
+    #[test]
+    fn starting_after_a_completed_stop_does_not_stop_the_live_ipc_session_again() {
+        assert!(!should_stop_before_start(None));
+        assert!(should_stop_before_start(Some(42)));
     }
 }
