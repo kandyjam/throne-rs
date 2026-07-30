@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# macOS packaging — mirrors zed-industries/zed `script/bundle-mac`.
+#
+# 1. cargo-bundle → Throne.app
+# 2. Copy ThroneCore beside Throne (parentcheck)
+# 3. Optional codesign
+# 4. hdiutil → DMG in dist/
+#
+# Usage:
+#   ./script/bundle-mac
+#   TARGET_TRIPLE=aarch64-apple-darwin ./script/bundle-mac
+#   SIGN_IDENTITY="Developer ID Application: …" ./script/bundle-mac
+set -euo pipefail
+
+# shellcheck source=lib.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
+
+[[ "$HOST" == "macos" ]] || die "bundle-mac must run on macOS (host=$HOST)"
+
+need_cmd hdiutil "macOS disk image tool"
+need_cmd cargo "Rust toolchain"
+
+ensure_cargo_bundle() {
+  if cargo bundle --help >/dev/null 2>&1; then
+    return 0
+  fi
+  log "Installing cargo-bundle"
+  # Zed pins a fork; upstream cargo-bundle is enough for .app generation.
+  cargo install cargo-bundle --locked 2>/dev/null \
+    || cargo install cargo-bundle
+  cargo bundle --help >/dev/null 2>&1 \
+    || die "cargo-bundle install failed"
+}
+
+prepare_binaries
+ensure_cargo_bundle
+
+log "cargo bundle --release (Throne.app)"
+# cargo-bundle reads [package.metadata.bundle] from crates/throne.
+# Note: macOS /bin/bash is 3.2 — empty "${arr[@]}" under `set -u` is an error,
+# so avoid empty arrays and branch on TARGET_TRIPLE instead.
+(
+  cd "$ROOT"
+  if [[ -n "${TARGET_TRIPLE:-}" ]]; then
+    cargo bundle --release -p throne --target "$TARGET_TRIPLE" 2>/dev/null \
+      || cargo bundle --release --target "$TARGET_TRIPLE"
+  else
+    cargo bundle --release -p throne 2>/dev/null \
+      || cargo bundle --release
+  fi
+)
+
+# Locate .app produced by cargo-bundle
+APP=""
+for candidate in \
+  "$RELEASE_DIR/bundle/osx/Throne.app" \
+  "$TARGET_DIR/${TARGET_TRIPLE:-}/$PROFILE/bundle/osx/Throne.app" \
+  "$TARGET_DIR/$PROFILE/bundle/osx/Throne.app" \
+  "$ROOT/target/release/bundle/osx/Throne.app"
+do
+  if [[ -d "$candidate" ]]; then
+    APP="$candidate"
+    break
+  fi
+done
+# Fallback: find newest Throne.app under target/
+if [[ -z "$APP" ]]; then
+  APP="$(find "$TARGET_DIR" -type d -name 'Throne.app' 2>/dev/null | head -1 || true)"
+fi
+[[ -n "$APP" && -d "$APP" ]] || die "Throne.app not found after cargo bundle"
+
+MACOS_DIR="$APP/Contents/MacOS"
+mkdir -p "$MACOS_DIR"
+
+# cargo-bundle may name the binary after package/bin — ensure `Throne`
+if [[ -f "$MACOS_DIR/throne" && ! -f "$MACOS_DIR/Throne" ]]; then
+  mv "$MACOS_DIR/throne" "$MACOS_DIR/Throne"
+fi
+if [[ ! -f "$MACOS_DIR/Throne" ]]; then
+  cp "$GUI_BIN" "$MACOS_DIR/Throne"
+  chmod +x "$MACOS_DIR/Throne"
+fi
+
+# parentcheck: ThroneCore next to Throne
+cp "$CORE_BIN" "$MACOS_DIR/ThroneCore"
+chmod +x "$MACOS_DIR/ThroneCore"
+
+# Embed icon if cargo-bundle skipped icns
+RESOURCES_DIR="$APP/Contents/Resources"
+mkdir -p "$RESOURCES_DIR"
+if [[ ! -f "$RESOURCES_DIR/app-icon.icns" && -f "$ROOT/crates/throne/resources/app-icon.icns" ]]; then
+  cp "$ROOT/crates/throne/resources/app-icon.icns" "$RESOURCES_DIR/AppIcon.icns"
+fi
+
+# Optional entitlements codesign (unsigned local builds are fine)
+ENTITLEMENTS="$ROOT/crates/throne/resources/throne.entitlements"
+if [[ -n "${SIGN_IDENTITY:-}" ]]; then
+  need_cmd codesign "Xcode CLT"
+  log "codesign with identity: $SIGN_IDENTITY"
+  codesign --force --deep --options runtime \
+    --entitlements "$ENTITLEMENTS" \
+    --sign "$SIGN_IDENTITY" \
+    "$MACOS_DIR/ThroneCore" || warn "codesign ThroneCore failed"
+  codesign --force --deep --options runtime \
+    --entitlements "$ENTITLEMENTS" \
+    --sign "$SIGN_IDENTITY" \
+    "$APP" || warn "codesign app failed"
+else
+  # Ad-hoc sign so Gatekeeper local runs are less noisy
+  if command -v codesign >/dev/null 2>&1; then
+    codesign --force --deep --sign - "$APP" 2>/dev/null || true
+  fi
+fi
+
+# Stage app into dist for DMG
+STAGE="$TARGET_DIR/dmg-stage-$$"
+rm -rf "$STAGE"
+mkdir -p "$STAGE"
+cp -R "$APP" "$STAGE/Throne.app"
+
+DMG_NAME="Throne-${VERSION}-${ARCH}"
+DMG_PATH="$DIST/${DMG_NAME}.dmg"
+rm -f "$DMG_PATH"
+
+log "Creating DMG → $DMG_PATH"
+# Temporary RW image, then convert to compressed UDZO (Zed uses hdiutil similarly)
+TMP_DMG="$TARGET_DIR/${DMG_NAME}.tmp.dmg"
+rm -f "$TMP_DMG"
+hdiutil create \
+  -volname "Throne" \
+  -srcfolder "$STAGE" \
+  -ov -format UDRW \
+  "$TMP_DMG"
+
+# Add Applications symlink for drag-install UX
+MOUNT_DIR="$(mktemp -d)"
+hdiutil attach "$TMP_DMG" -mountpoint "$MOUNT_DIR" -nobrowse -quiet
+ln -sf /Applications "$MOUNT_DIR/Applications"
+hdiutil detach "$MOUNT_DIR" -quiet || hdiutil detach "$MOUNT_DIR" -force -quiet
+rmdir "$MOUNT_DIR" 2>/dev/null || true
+
+hdiutil convert "$TMP_DMG" -format UDZO -imagekey zlib-level=9 -o "$DMG_PATH"
+rm -f "$TMP_DMG"
+rm -rf "$STAGE"
+
+# Also keep a copy of the .app next to the DMG for CI / local install
+rm -rf "$DIST/Throne.app"
+cp -R "$APP" "$DIST/Throne.app"
+
+log "macOS bundle complete:"
+ls -lh "$DMG_PATH" "$DIST/Throne.app"
+echo "$DMG_PATH"

@@ -2,6 +2,15 @@
 /target/
 **/*.rs.bk
 
+# Packaging output
+/dist/
+*.dmg
+*.deb
+*.rpm
+*.AppImage
+*.msi
+# (*.exe already ignored below)
+
 # Go core build artifacts
 /deployment/
 **/Core

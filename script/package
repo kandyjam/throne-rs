@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Host dispatcher — like running Zed's platform bundle script for this machine.
+#
+# Usage:
+#   ./script/package              # default artifacts for this OS
+#   ./script/package mac          # → bundle-mac
+#   ./script/package linux        # → bundle-linux
+#   ./script/package linux --deb --rpm
+#   ./script/package windows      # prints PowerShell hint on non-Windows
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib.sh
+source "$SCRIPT_DIR/lib.sh"
+
+usage() {
+  cat <<EOF
+Usage: ./script/package [mac|linux|windows|all] [bundle-linux flags...]
+
+Zed-style packaging entrypoint. Artifacts → ./dist/
+
+  mac       Throne.app + DMG          (script/bundle-mac)
+  linux     tar.gz [--deb] [--rpm]    (script/bundle-linux)
+  windows   Inno Setup .exe           (script/bundle-windows.ps1)
+  all       host defaults
+
+See docs/PACKAGING.md
+EOF
+}
+
+TARGET="${1:-all}"
+if [[ $# -gt 0 ]]; then shift; fi
+
+case "$TARGET" in
+  -h|--help) usage; exit 0 ;;
+  mac|macos|dmg|app)
+    exec bash "$SCRIPT_DIR/bundle-mac" "$@"
+    ;;
+  linux|tar|deb|rpm)
+    case "$TARGET" in
+      deb) exec bash "$SCRIPT_DIR/bundle-linux" --deb "$@" ;;
+      rpm) exec bash "$SCRIPT_DIR/bundle-linux" --rpm "$@" ;;
+      *)   exec bash "$SCRIPT_DIR/bundle-linux" "$@" ;;
+    esac
+    ;;
+  windows|win|exe|innosetup)
+    if command -v pwsh >/dev/null 2>&1; then
+      exec pwsh -File "$SCRIPT_DIR/bundle-windows.ps1" "$@"
+    elif command -v powershell >/dev/null 2>&1; then
+      exec powershell -File "$SCRIPT_DIR/bundle-windows.ps1" "$@"
+    else
+      die "Windows packaging requires PowerShell. On Windows run: .\\script\\bundle-windows.ps1"
+    fi
+    ;;
+  all|default|"")
+    case "$HOST" in
+      macos)   exec bash "$SCRIPT_DIR/bundle-mac" "$@" ;;
+      linux)   exec bash "$SCRIPT_DIR/bundle-linux" --deb "$@" ;;
+      windows)
+        if command -v pwsh >/dev/null 2>&1; then
+          exec pwsh -File "$SCRIPT_DIR/bundle-windows.ps1" "$@"
+        else
+          exec powershell -File "$SCRIPT_DIR/bundle-windows.ps1" "$@"
+        fi
+        ;;
+      *) die "unsupported host: $HOST ($OS_UNAME)" ;;
+    esac
+    ;;
+  *)
+    usage
+    die "unknown target: $TARGET"
+    ;;
+esac

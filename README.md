@@ -64,6 +64,27 @@ cargo run -p throne
 cargo test --workspace
 ```
 
+## Packaging (Zed-style)
+
+Same approach as [Zed](https://github.com/zed-industries/zed): `cargo-bundle` + `script/bundle-*`.
+
+| Platform | Command | Artifact |
+|----------|---------|----------|
+| macOS | `./script/bundle-mac` | `dist/Throne-*.dmg` |
+| Linux | `./script/bundle-linux` `[--deb] [--rpm]` | `dist/throne-linux-*.tar.gz` (+ deb/rpm) |
+| Windows | `.\script\bundle-windows.ps1` | Inno Setup `dist/Throne-*.exe` |
+
+```bash
+# one-time (macOS)
+cargo install cargo-bundle --locked
+
+./script/package                 # auto-detect host
+./script/bundle-mac
+./script/bundle-linux --deb
+```
+
+Details: [`docs/PACKAGING.md`](./docs/PACKAGING.md) · CI: [`.github/workflows/package.yml`](./.github/workflows/package.yml).
+
 On **Start**:
 1. Builds a minimal sing-box config (mixed inbound + selected outbound)
 2. Spawns `ThroneCore` with `THRONE_CORE_SOCKET`

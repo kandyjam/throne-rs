@@ -1,0 +1,179 @@
+# Zed-style platform bundles (script/bundle-*).
+# macOS DMG · Linux tar.gz(+deb) · Windows Inno Setup
+name: Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: "Upload artifacts to a GitHub Release for this ref"
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bundle_mac:
+    name: bundle-mac (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            arch: aarch64
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            arch: x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache-dependency-path: core/server/go.sum
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            target
+          key: bundle-mac-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+      - name: Install cargo-bundle
+        run: cargo install cargo-bundle --locked || cargo install cargo-bundle
+      - name: Bundle
+        env:
+          TARGET_TRIPLE: ${{ matrix.target }}
+        run: ./script/bundle-mac
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: Throne-macOS-${{ matrix.arch }}
+          path: |
+            dist/*.dmg
+            dist/Throne.app
+          if-no-files-found: error
+          retention-days: 14
+
+  bundle_linux:
+    name: bundle-linux (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache-dependency-path: core/server/go.sum
+      - name: System deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libssl-dev \
+            desktop-file-utils dpkg-dev
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: bundle-linux-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
+      - name: Bundle tar.gz + deb
+        run: ./script/bundle-linux --deb
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: Throne-linux-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.deb
+          if-no-files-found: error
+          retention-days: 14
+
+  bundle_windows:
+    name: bundle-windows (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            arch: x86_64
+          - runner: windows-11-arm
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache-dependency-path: core/server/go.sum
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: bundle-win-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
+      - name: Install Inno Setup
+        run: choco install innosetup -y
+      - name: Bundle
+        shell: pwsh
+        run: .\script\bundle-windows.ps1 -Architecture ${{ matrix.arch }}
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: Throne-windows-${{ matrix.arch }}
+          path: |
+            dist/Throne-*.exe
+            dist/throne-windows-*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: GitHub Release
+    needs: [bundle_mac, bundle_linux, bundle_windows]
+    if: >-
+      github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+      || (github.event_name == 'workflow_dispatch' && inputs.create_release)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+      - name: Flatten
+        run: |
+          mkdir -p upload
+          find release-assets -type f \( -name '*.dmg' -o -name '*.tar.gz' -o -name '*.deb' -o -name '*.exe' -o -name '*.zip' -o -name '*.rpm' \) \
+            -exec cp -v {} upload/ \;
+          ls -lah upload
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Throne ${{ github.ref_name }}
+          generate_release_notes: true
+          files: upload/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

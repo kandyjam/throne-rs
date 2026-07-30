@@ -44,6 +44,7 @@ Unchanged from upstream:
 - Maps user actions → `AppState` mutations (and later async core commands).
 - Theme tokens in `theme.rs`.
 - Import (clipboard / `THRONE_IMPORT`) + Save DB shortcuts.
+- Packaging (Zed-style): [`script/bundle-*`](../script/) + `crates/throne` `[package.metadata.bundle]` → DMG / tar.gz / deb / Inno Setup (see [PACKAGING.md](./PACKAGING.md)).
 
 See [UPSTREAM_TRACKING.md](./UPSTREAM_TRACKING.md) for the live parity matrix against `throneproj/Throne`.
 

@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# Linux packaging — mirrors zed-industries/zed `script/bundle-linux`.
+#
+# Primary artifact: portable tar.gz with Throne + ThroneCore side-by-side
+# (upstream parentcheck). Optional: --deb / --rpm for distro packages.
+#
+# Layout (Zed-inspired portable app dir):
+#   throne-linux-<arch>/
+#     Throne
+#     ThroneCore
+#     Throne.desktop
+#     icons/...
+#     bin/throne          → wrapper launching ./Throne
+#
+# Usage:
+#   ./script/bundle-linux
+#   ./script/bundle-linux --deb
+#   ./script/bundle-linux --rpm
+#   ./script/bundle-linux --deb --rpm
+set -euo pipefail
+
+# shellcheck source=lib.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
+
+[[ "$HOST" == "linux" ]] || die "bundle-linux must run on Linux (host=$HOST)"
+
+MAKE_DEB=0
+MAKE_RPM=0
+for arg in "$@"; do
+  case "$arg" in
+    --deb) MAKE_DEB=1 ;;
+    --rpm) MAKE_RPM=1 ;;
+    -h|--help)
+      sed -n '2,20p' "$0"
+      exit 0
+      ;;
+    *) die "unknown arg: $arg" ;;
+  esac
+done
+
+prepare_binaries
+maybe_strip "$GUI_BIN"
+maybe_strip "$CORE_BIN"
+
+BUNDLE_NAME="throne-linux-${ARCH}"
+BUNDLE_ROOT="$TARGET_DIR/${BUNDLE_NAME}"
+rm -rf "$BUNDLE_ROOT"
+mkdir -p \
+  "$BUNDLE_ROOT" \
+  "$BUNDLE_ROOT/bin" \
+  "$BUNDLE_ROOT/icons/hicolor/256x256/apps" \
+  "$BUNDLE_ROOT/icons/hicolor/128x128/apps" \
+  "$BUNDLE_ROOT/icons/hicolor/512x512/apps"
+
+log "Assembling $BUNDLE_NAME"
+
+cp "$GUI_BIN"  "$BUNDLE_ROOT/Throne"
+cp "$CORE_BIN" "$BUNDLE_ROOT/ThroneCore"
+chmod 755 "$BUNDLE_ROOT/Throne" "$BUNDLE_ROOT/ThroneCore"
+
+# PATH-friendly launcher (Zed puts a cli in bin/)
+cat >"$BUNDLE_ROOT/bin/throne" <<'EOF'
+#!/bin/sh
+# Launch Throne from the portable bundle root (core sits beside the GUI).
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+exec "$ROOT/Throne" "$@"
+EOF
+chmod 755 "$BUNDLE_ROOT/bin/throne"
+
+# Icons
+cp "$ROOT/crates/throne/resources/app-icon-256.png" \
+  "$BUNDLE_ROOT/icons/hicolor/256x256/apps/Throne.png"
+cp "$ROOT/crates/throne/resources/app-icon-128.png" \
+  "$BUNDLE_ROOT/icons/hicolor/128x128/apps/Throne.png"
+cp "$ROOT/crates/throne/resources/app-icon.png" \
+  "$BUNDLE_ROOT/icons/hicolor/512x512/apps/Throne.png"
+cp "$ROOT/crates/throne/resources/app-icon-256.png" "$BUNDLE_ROOT/Throne.png"
+
+# Desktop entry (portable: Exec uses env-expanded path via wrapper instructions)
+# For the tarball, point Exec at the bundle-relative binary via sh -c.
+DESKTOP_IN="$ROOT/crates/throne/resources/throne.desktop.in"
+DESKTOP_OUT="$BUNDLE_ROOT/Throne.desktop"
+# Portable desktop: users copy desktop file and adjust — default uses absolute after install.
+sed \
+  -e "s|\${EXEC_PATH}|$BUNDLE_ROOT/Throne|g" \
+  -e "s|\${ICON_PATH}|$BUNDLE_ROOT/Throne.png|g" \
+  "$DESKTOP_IN" >"$DESKTOP_OUT"
+
+# LICENSE
+cp "$ROOT/LICENSE" "$BUNDLE_ROOT/LICENSE"
+
+# tar.gz (primary Zed-style artifact)
+TARBALL="$DIST/${BUNDLE_NAME}.tar.gz"
+log "Creating $TARBALL"
+mkdir -p "$DIST"
+tar -C "$TARGET_DIR" -czf "$TARBALL" "$BUNDLE_NAME"
+
+# ── optional DEB (from the same tree → /opt/Throne) ────────────────────
+if [[ "$MAKE_DEB" -eq 1 ]]; then
+  log "Building DEB"
+  DEB_ROOT="$TARGET_DIR/deb-root"
+  rm -rf "$DEB_ROOT"
+  mkdir -p \
+    "$DEB_ROOT/DEBIAN" \
+    "$DEB_ROOT/opt/Throne" \
+    "$DEB_ROOT/usr/bin" \
+    "$DEB_ROOT/usr/share/applications" \
+    "$DEB_ROOT/usr/share/icons/hicolor/256x256/apps" \
+    "$DEB_ROOT/usr/share/doc/throne"
+
+  cp "$BUNDLE_ROOT/Throne" "$BUNDLE_ROOT/ThroneCore" "$DEB_ROOT/opt/Throne/"
+  chmod 755 "$DEB_ROOT/opt/Throne/Throne" "$DEB_ROOT/opt/Throne/ThroneCore"
+  cat >"$DEB_ROOT/usr/bin/Throne" <<'EOF'
+#!/bin/sh
+exec /opt/Throne/Throne "$@"
+EOF
+  chmod 755 "$DEB_ROOT/usr/bin/Throne"
+
+  sed \
+    -e 's|${EXEC_PATH}|/opt/Throne/Throne|g' \
+    -e 's|${ICON_PATH}|Throne|g' \
+    "$DESKTOP_IN" >"$DEB_ROOT/usr/share/applications/Throne.desktop"
+  cp "$BUNDLE_ROOT/icons/hicolor/256x256/apps/Throne.png" \
+    "$DEB_ROOT/usr/share/icons/hicolor/256x256/apps/Throne.png"
+  cp "$ROOT/LICENSE" "$DEB_ROOT/usr/share/doc/throne/copyright"
+
+  # Architecture field for dpkg
+  case "$ARCH" in
+    x86_64) DEB_ARCH=amd64 ;;
+    aarch64) DEB_ARCH=arm64 ;;
+    *) DEB_ARCH="$ARCH" ;;
+  esac
+
+  cat >"$DEB_ROOT/DEBIAN/control" <<EOF
+Package: throne
+Version: ${VERSION}
+Section: net
+Priority: optional
+Architecture: ${DEB_ARCH}
+Maintainer: Throne-rs contributors <noreply@throne.app>
+Depends: libc6, libx11-6, libxcb1, libxkbcommon0, libwayland-client0, desktop-file-utils
+Homepage: https://github.com/kandyjam/throne-rs
+Description: Cross-platform GUI proxy client (sing-box / Xray)
+ Rust + GPUI rewrite of throneproj/Throne. Bundles Throne GUI and ThroneCore.
+EOF
+
+  cat >"$DEB_ROOT/DEBIAN/postinst" <<'EOF'
+#!/bin/sh
+set -e
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database -q /usr/share/applications || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+  gtk-update-icon-cache -q /usr/share/icons/hicolor 2>/dev/null || true
+fi
+# Register throne:// handler best-effort
+if command -v xdg-mime >/dev/null 2>&1; then
+  xdg-mime default Throne.desktop x-scheme-handler/throne 2>/dev/null || true
+fi
+exit 0
+EOF
+  chmod 755 "$DEB_ROOT/DEBIAN/postinst"
+
+  need_cmd dpkg-deb "apt install dpkg"
+  DEB_OUT="$DIST/throne_${VERSION}_${DEB_ARCH}.deb"
+  dpkg-deb --build --root-owner-group "$DEB_ROOT" "$DEB_OUT"
+  log "DEB → $DEB_OUT"
+fi
+
+# ── optional RPM ───────────────────────────────────────────────────────
+if [[ "$MAKE_RPM" -eq 1 ]]; then
+  log "Building RPM"
+  if command -v fpm >/dev/null 2>&1; then
+    RPM_OUT="$DIST/throne-${VERSION}-1.${ARCH}.rpm"
+    fpm -s dir -t rpm -n throne -v "$VERSION" \
+      --license "GPL-3.0-or-later" \
+      --url "https://github.com/kandyjam/throne-rs" \
+      --description "Cross-platform GUI proxy client (sing-box / Xray backend)" \
+      --depends libc.so.6 \
+      --prefix / \
+      -C "$TARGET_DIR/deb-root" \
+      --package "$RPM_OUT" \
+      opt usr 2>/dev/null \
+    || {
+      # If deb-root missing (rpm without deb), stage fresh
+      STAGE="$TARGET_DIR/rpm-stage"
+      rm -rf "$STAGE"
+      mkdir -p "$STAGE/opt/Throne" "$STAGE/usr/bin" \
+        "$STAGE/usr/share/applications" \
+        "$STAGE/usr/share/icons/hicolor/256x256/apps"
+      cp "$BUNDLE_ROOT/Throne" "$BUNDLE_ROOT/ThroneCore" "$STAGE/opt/Throne/"
+      cat >"$STAGE/usr/bin/Throne" <<'EOF'
+#!/bin/sh
+exec /opt/Throne/Throne "$@"
+EOF
+      chmod 755 "$STAGE/opt/Throne/"* "$STAGE/usr/bin/Throne"
+      sed \
+        -e 's|${EXEC_PATH}|/opt/Throne/Throne|g' \
+        -e 's|${ICON_PATH}|Throne|g' \
+        "$DESKTOP_IN" >"$STAGE/usr/share/applications/Throne.desktop"
+      cp "$BUNDLE_ROOT/icons/hicolor/256x256/apps/Throne.png" \
+        "$STAGE/usr/share/icons/hicolor/256x256/apps/Throne.png"
+      fpm -s dir -t rpm -n throne -v "$VERSION" \
+        --license "GPL-3.0-or-later" \
+        --url "https://github.com/kandyjam/throne-rs" \
+        --description "Cross-platform GUI proxy client (sing-box / Xray backend)" \
+        -C "$STAGE" --package "$RPM_OUT" opt usr
+    }
+    log "RPM → $RPM_OUT"
+  elif command -v rpmbuild >/dev/null 2>&1; then
+    warn "fpm not found; basic rpmbuild path not implemented — install fpm: gem install fpm"
+  else
+    die "RPM requested but neither fpm nor rpmbuild is available"
+  fi
+fi
+
+log "Linux bundle complete:"
+ls -lh "$TARBALL" "$DIST"/*.{deb,rpm} 2>/dev/null || ls -lh "$TARBALL"
+echo "$TARBALL"

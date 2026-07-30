@@ -3,7 +3,10 @@ name = "throne"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
 description = "Throne desktop client — Rust + GPUI rewrite"
+homepage = "https://github.com/kandyjam/throne-rs"
 # Binary must be named `Throne` — Go ThroneCore parentcheck requires
 # parent basename == "Throne" and ThroneCore living in the same directory.
 default-run = "Throne"
@@ -25,3 +28,44 @@ anyhow = { workspace = true }
 serde_json = { workspace = true }
 smol = "2"
 tray-icon = "0.24.1"
+
+# ── Desktop packaging (Zed-style) ───────────────────────────────────────
+# macOS .app via cargo-bundle; DMG/tar.gz/deb/rpm/Inno via script/bundle-*.
+# Mirror of zed-industries/zed `crates/zed` + `script/bundle-{mac,linux,windows}`.
+#
+#   ./script/bundle-mac
+#   ./script/bundle-linux
+#   ./script/bundle-windows.ps1
+#   ./script/package            # host dispatcher
+#
+# Docs: docs/PACKAGING.md
+[package.metadata.bundle]
+name = "Throne"
+identifier = "app.throne.desktop"
+icon = [
+    "resources/app-icon-32.png",
+    "resources/app-icon-128.png",
+    "resources/app-icon-256.png",
+    "resources/app-icon.png",
+    "resources/app-icon@2x.png",
+    "resources/app-icon.icns",
+]
+resources = []
+copyright = "Copyright © Throne-rs contributors"
+category = "Utility"
+short_description = "Cross-platform GUI proxy client (sing-box / Xray)"
+long_description = """
+Throne is a cross-platform GUI proxy configuration manager powered by
+Sing-box / Xray. This is the Rust + GPUI rewrite of throneproj/Throne.
+"""
+osx_minimum_system_version = "11.0"
+osx_url_schemes = ["throne"]
+osx_info_plist_exts = []
+deb_depends = [
+    "libc6",
+    "libx11-6",
+    "libxcb1",
+    "libxkbcommon0",
+    "libwayland-client0",
+    "libasound2 | libasound2t64",
+]
