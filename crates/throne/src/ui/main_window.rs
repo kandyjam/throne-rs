@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use gpui::{
     AnyElement, ClipboardItem, Context, FocusHandle, KeyDownEvent, ScrollHandle, SharedString,
-    Window, actions, div, prelude::*, px, uniform_list,
+    Subscription, Window, actions, div, prelude::*, px, uniform_list,
 };
 
 use throne_core_client::{
@@ -28,7 +28,7 @@ use throne_core_client::{
 use throne_domain::{AppState, CoreStatus, GroupId, Profile, ProfileId, TrafficSnapshot};
 use throne_import::import_from_url;
 
-use crate::theme::{Theme, latency_color};
+use crate::theme::{self, Theme, latency_color};
 use crate::ui::dialogs::{
     Dialog, add_input_body, basic_settings_body, confirm_delete_unavailable_body,
     edit_profile_body, hotkey_settings_body, manage_groups_body, tun_settings_body,
@@ -157,6 +157,8 @@ pub struct MainWindow {
     core: Arc<Mutex<CoreSession>>,
     /// True while a start/stop background job is in flight (ignore re-clicks).
     core_op_busy: bool,
+    /// When Tun/Proxy mode changes during a busy start/stop, restart once idle.
+    restart_when_idle: bool,
     /// Target profile to start once the current core has fully stopped.
     pending_profile_switch: PendingProfileSwitch,
     /// Frame index for the Start/Stop transition indicator.
@@ -171,6 +173,8 @@ pub struct MainWindow {
     prev_traffic_at: Option<std::time::Instant>,
     /// Prevent an overdue core request from queuing another poll.
     runtime_poll_busy: bool,
+    /// Keeps the OS appearance observer alive for the current window.
+    _appearance_sub: Option<Subscription>,
 }
 
 impl MainWindow {
@@ -226,6 +230,7 @@ impl MainWindow {
             mg_focus: MgFocus::NewName,
             core: Arc::new(Mutex::new(CoreSession::new(core_cfg))),
             core_op_busy: false,
+            restart_when_idle: false,
             pending_profile_switch: PendingProfileSwitch::default(),
             loading_frame: 0,
             background_busy: false,
@@ -234,10 +239,27 @@ impl MainWindow {
             connections: Vec::new(),
             prev_traffic_at: None,
             runtime_poll_busy: false,
+            _appearance_sub: None,
         };
         window.spawn_runtime_poller(cx);
         window.spawn_loading_indicator(cx);
         window
+    }
+
+    /// Attach (or re-attach) the system appearance observer when a window is opened.
+    ///
+    /// Call from `open_window` so theme tokens follow OS light/dark changes live.
+    pub fn attach_window_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_theme_from_window(window);
+        self._appearance_sub = Some(cx.observe_window_appearance(window, |this, window, cx| {
+            this.sync_theme_from_window(window);
+            cx.notify();
+        }));
+    }
+
+    fn sync_theme_from_window(&self, window: &Window) {
+        let system_dark = theme::system_is_dark(window.appearance());
+        theme::apply_preference(&self.state.settings().theme, system_dark);
     }
 
     fn spawn_runtime_poller(&self, cx: &mut Context<Self>) {
@@ -1010,6 +1032,8 @@ impl MainWindow {
 
     fn start_proxy(&mut self, cx: &mut Context<Self>) {
         if self.core_op_busy {
+            // Tun/Proxy toggles must not be lost while Start/Stop is in flight.
+            self.restart_when_idle = true;
             return;
         }
         let Some(id) = self.state.selected_profile_id() else {
@@ -1063,14 +1087,18 @@ impl MainWindow {
                             profile_id,
                             profile_name: profile_name.clone(),
                         });
+                        let tun = this.state.settings().tun_mode_enabled;
                         let mut msg = format!(
                             "Running · {profile_name} · route {route_label} · mixed {addr}:{port}"
                         );
+                        if tun {
+                            msg.push_str(" · Tun ON");
+                        }
                         if apply_proxy {
                             msg.push_str(" · system proxy ON");
-                        } else {
+                        } else if !tun {
                             msg.push_str(
-                                " · tip: enable System Proxy or point apps to this port",
+                                " · tip: enable Tun or System Proxy, or point apps to this port",
                             );
                         }
                         this.state.set_status_message(msg);
@@ -1080,6 +1108,10 @@ impl MainWindow {
                         this.state.set_core_status(CoreStatus::Error(e.clone()));
                         this.state.set_status_message(format!("Start failed: {e}"));
                     }
+                }
+                if this.restart_when_idle {
+                    this.restart_when_idle = false;
+                    this.start_proxy(cx);
                 }
                 cx.notify();
             })
@@ -1120,6 +1152,12 @@ impl MainWindow {
                     Err(e) => this
                         .state
                         .set_status_message(format!("Stopped (with errors): {e}")),
+                }
+                if this.restart_when_idle {
+                    this.restart_when_idle = false;
+                    this.start_proxy(cx);
+                    cx.notify();
+                    return;
                 }
                 if let Some(profile_id) = switch_target {
                     if this.state.select_profile(profile_id).is_ok() {
@@ -1645,10 +1683,19 @@ impl MainWindow {
                         Ok(true) => {
                             this.state.set_spmode_vpn(true);
                             let _ = this.persist_db();
-                            this.state.set_status_message("Tun Mode enabled");
-                            // Upstream: if started_id >= 0 → profile_start
-                            if this.state.core_status().is_running() {
+                            // Upstream: if started_id >= 0 → profile_start (rebuild with tun-in).
+                            // Tun checkbox alone does nothing until Start applies the inbound.
+                            if this.state.core_status().is_running()
+                                || matches!(this.state.core_status(), CoreStatus::Starting)
+                            {
+                                this.state.set_status_message(
+                                    "Tun Mode enabled — restarting profile with TUN…",
+                                );
                                 this.start_proxy(cx);
+                            } else {
+                                this.state.set_status_message(
+                                    "Tun Mode enabled — press Start to apply system-wide TUN",
+                                );
                             }
                         }
                         Ok(false) => {
@@ -3465,6 +3512,9 @@ fn read_os_clipboard() -> Option<String> {
 
 impl Render for MainWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Keep paint tokens aligned with settings + current OS appearance.
+        self.sync_theme_from_window(window);
+
         if self.state.core_status().is_running() {
             self.poll_core_runtime(cx);
         }

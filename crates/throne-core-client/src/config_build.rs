@@ -118,15 +118,11 @@ pub fn build_load_config(
         }));
     }
 
+    let (dns, default_resolver_tag) = build_dns_section(settings, settings.tun_mode_enabled);
+
     let config = json!({
         "log": { "level": log_level, "timestamp": true },
-        "dns": {
-            "servers": [
-                { "type": "local", "tag": "local" }
-            ],
-            "final": "local",
-            "strategy": "prefer_ipv4"
-        },
+        "dns": dns,
         "inbounds": inbounds,
         "outbounds": [
             outbound,
@@ -138,7 +134,7 @@ pub fn build_load_config(
             "final": route_final,
             "auto_detect_interface": true,
             "default_domain_resolver": {
-                "server": "local",
+                "server": default_resolver_tag,
                 "strategy": "prefer_ipv4"
             }
         },
@@ -1021,7 +1017,92 @@ fn apply_tls(v: &mut Value, o: &ParsedOutbound, default_on: bool) {
     obj.insert("tls".into(), tls);
 }
 
-#[cfg(test)]
+/// Build DNS object + tag used by `route.default_domain_resolver`.
+///
+/// Upstream: on Darwin + Tun, `type: local` is forbidden (DNS loops into the
+/// tunnel). Use remote DoH via proxy + a concrete UDP "underlying" IP for
+/// bootstrap / direct (see `core_box_underlying_dns`).
+fn build_dns_section(settings: &AppSettings, tun_enabled: bool) -> (Value, &'static str) {
+    if !tun_enabled {
+        return (
+            json!({
+                "servers": [ { "type": "local", "tag": "local" } ],
+                "final": "local",
+                "strategy": "prefer_ipv4"
+            }),
+            "local",
+        );
+    }
+
+    // Tun path — never use OS `local` resolver as final on macOS.
+    let underlying = resolve_underlying_dns(settings);
+    // Upstream generate.cpp: only dns-remote gets detour=proxy.
+    // dns-direct must NOT set detour=direct — sing-box rejects
+    // "detour to an empty direct outbound makes no sense".
+    let mut remote = build_dns_server_obj(&settings.remote_dns);
+    if let Some(obj) = remote.as_object_mut() {
+        obj.insert("tag".into(), json!("dns-remote"));
+        obj.insert("detour".into(), json!("proxy"));
+        obj.insert("domain_resolver".into(), json!("dns-local"));
+    }
+
+    let mut direct = build_dns_server_obj(&underlying);
+    // Force UDP IP for direct/underlying — never `local` under Tun.
+    if direct.get("type").and_then(|t| t.as_str()) == Some("local") {
+        direct = json!({ "type": "udp", "server": underlying });
+    }
+    if let Some(obj) = direct.as_object_mut() {
+        obj.insert("tag".into(), json!("dns-direct"));
+        obj.insert("domain_resolver".into(), json!("dns-local"));
+    }
+
+    // Bootstrap resolver — no detour (plain dial), same as upstream dns-local.
+    let local = json!({
+        "type": "udp",
+        "tag": "dns-local",
+        "server": underlying
+    });
+
+    let final_tag = match settings.dns_final_out.trim().to_ascii_lowercase().as_str() {
+        "direct" => "dns-direct",
+        _ => "dns-remote",
+    };
+
+    (
+        json!({
+            "servers": [remote, direct, local],
+            "final": final_tag,
+            "strategy": "prefer_ipv4"
+        }),
+        "dns-local",
+    )
+}
+
+/// Upstream `core_box_underlying_dns`, with a safe public fallback when empty
+/// (Darwin Tun requires a real IP — empty is a hard error in Qt Throne).
+fn resolve_underlying_dns(settings: &AppSettings) -> String {
+    let t = settings.core_box_underlying_dns.trim();
+    if !t.is_empty()
+        && !t.eq_ignore_ascii_case("local")
+        && !t.eq_ignore_ascii_case("localhost")
+    {
+        return t.to_string();
+    }
+    let d = settings.direct_dns.trim();
+    if !d.is_empty()
+        && !d.eq_ignore_ascii_case("local")
+        && !d.eq_ignore_ascii_case("localhost")
+        && !d.contains("://")
+    {
+        // bare IP / host OK
+        if d.parse::<std::net::Ipv4Addr>().is_ok() {
+            return d.to_string();
+        }
+    }
+    // Public resolver used only as bootstrap for domain_resolver / direct DNS.
+    "1.1.1.1".into()
+}
+
 fn build_dns_server_obj(address: &str) -> Value {
     let address = address.trim();
     if address.is_empty() || address.eq_ignore_ascii_case("local") || address == "localhost" {
@@ -1030,12 +1111,18 @@ fn build_dns_server_obj(address: &str) -> Value {
 
     let (ty, rest) = if let Some(rest) = address.strip_prefix("https://") {
         ("https", rest)
+    } else if let Some(rest) = address.strip_prefix("http://") {
+        ("http", rest)
     } else if let Some(rest) = address.strip_prefix("udp://") {
         ("udp", rest)
+    } else if let Some(rest) = address.strip_prefix("tls://") {
+        ("tls", rest)
+    } else if let Some(rest) = address.strip_prefix("quic://") {
+        ("quic", rest)
     } else {
         ("udp", address)
     };
-    let (host_port, path) = if ty == "https" {
+    let (host_port, path) = if ty == "https" || ty == "http" {
         match rest.split_once('/') {
             Some((host, path)) => (host, format!("/{path}")),
             None => (rest, "/dns-query".into()),
@@ -1090,6 +1177,29 @@ mod tests {
         assert_eq!(tun["tag"], "tun-in");
         assert_eq!(tun["address"][0], "172.19.0.1/24");
         assert_eq!(built.tun_ipv4_cidr, "172.19.0.1/24");
+        // Tun must not use OS `local` DNS as final (Darwin loops into the tunnel).
+        assert_ne!(v["dns"]["final"], "local");
+        assert_eq!(v["route"]["default_domain_resolver"]["server"], "dns-local");
+        let servers = v["dns"]["servers"].as_array().unwrap();
+        assert!(
+            servers.iter().any(|s| s["tag"] == "dns-remote"),
+            "expected dns-remote: {servers:?}"
+        );
+        assert!(
+            servers
+                .iter()
+                .any(|s| s["tag"] == "dns-local" && s["type"] != "local"),
+            "dns-local must be concrete under Tun: {servers:?}"
+        );
+        // sing-box rejects detour=direct on DNS servers.
+        for s in servers {
+            if s["tag"] == "dns-direct" || s["tag"] == "dns-local" {
+                assert!(
+                    s.get("detour").is_none(),
+                    "dns server must not detour=direct: {s}"
+                );
+            }
+        }
         #[cfg(target_os = "macos")]
         {
             // Empty/omitted name — kernel assigns utunN. "throne-tun" is invalid on Darwin.

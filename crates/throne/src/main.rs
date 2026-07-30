@@ -86,7 +86,13 @@ fn open_main_window(cx: &mut App, root: Entity<MainWindow>) -> WindowHandle<Main
             show: true,
             ..Default::default()
         },
-        |_window, _cx| root,
+        |window, cx| {
+            // Follow OS light/dark and re-paint when the system appearance changes.
+            root.update(cx, |view, cx| {
+                view.attach_window_appearance(window, cx);
+            });
+            root
+        },
     )
     .expect("open main window")
 }

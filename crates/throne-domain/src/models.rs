@@ -614,7 +614,8 @@ impl Default for AppSettings {
             system_proxy_enabled: false,
             tun_mode_enabled: false,
             system_dns_set: false,
-            theme: "dark".into(),
+            // Upstream default after migration: follow OS light/dark.
+            theme: "System".into(),
             log_level: "info".into(),
             // upstream default: Mirrors::CLOUDFLARE
             ruleset_mirror: RulesetMirror::Cloudflare,

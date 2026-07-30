@@ -17,8 +17,9 @@ pub use config_build::{
     BuiltConfig, apply_ruleset_mirror, build_load_config, build_url_test_config,
 };
 pub use privilege::{
-    PrivilegeOutcome, core_has_setuid, core_is_root_setuid, core_path_beside_gui,
-    request_core_privileges,
+    ElevatedPermissions, PrivilegeOutcome, core_has_setuid, core_is_root_setuid,
+    core_path_beside_gui, find_core_real_path, is_setuid_set, path_on_nosuid_volume,
+    reexec_off_nosuid_volume, request_core_privileges,
 };
 pub use proto_wire::{ConnectionRow, IpTestResult, SpeedTestResult, UrlTestResult};
 pub use sys_proxy::{force_clear_system_proxy, set_system_proxy};
@@ -402,6 +403,10 @@ impl CoreSession {
         // Tun needs a privileged core (setuid root). Check/request before Start.
         if settings.tun_mode_enabled {
             self.ensure_tun_privileges()?;
+            info!(
+                tun_cidr = %built.tun_ipv4_cidr,
+                "Start with Tun inbound enabled"
+            );
         }
 
         self.ensure_connected()?;
@@ -467,6 +472,7 @@ impl CoreSession {
         info!(
             profile = profile.id,
             port = settings.inbound_socks_port,
+            tun = settings.tun_mode_enabled,
             "core Start OK"
         );
         Ok(())
@@ -488,70 +494,107 @@ impl CoreSession {
         resolve_core_binary()
     }
 
-    /// Whether the live core reports euid 0, or the on-disk binary is root setuid.
-    pub fn is_core_privileged(&mut self) -> bool {
-        // Real TUN capability: root-owned setuid binary (or live euid 0).
-        if privilege::core_is_root_setuid(&self.resolved_core_path()) {
-            return true;
+    /// Upstream `Configs::IsAdmin` — live core `IsPrivileged` (euid == 0).
+    ///
+    /// When the core is not connected, returns `false` (same as a failed RPC).
+    pub fn is_admin(&mut self) -> bool {
+        if !self.connected {
+            return false;
         }
-        // Prefer live RPC when connected (matches upstream IsAdmin / geteuid==0).
-        if self.connected {
-            if let Ok(resp) = self.call(
-                "IsPrivileged",
-                &proto_wire::encode_empty_req(),
-                Duration::from_millis(800),
-            ) {
-                if let Ok(true) = proto_wire::decode_is_privileged_resp(&resp) {
-                    return true;
+        match self.call(
+            "IsPrivileged",
+            &proto_wire::encode_empty_req(),
+            Duration::from_millis(800),
+        ) {
+            Ok(resp) => proto_wire::decode_is_privileged_resp(&resp).unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
+    /// Upstream name used by older call sites.
+    pub fn is_core_privileged(&mut self) -> bool {
+        self.is_admin()
+    }
+
+    /// Upstream `MainWindow::get_elevated_permissions` + Tun enable gate.
+    ///
+    /// Returns:
+    /// - `Ok(true)` — Tun may be turned on (`IsAdmin` or root-setuid core).
+    /// - `Err(TunPrivilegeRequired)` — Terminal opened / denied / re-exec; **do not** enable Tun yet.
+    pub fn get_elevated_permissions(&mut self) -> Result<bool, CoreError> {
+        // Upstream: if (IsAdmin()) return true;
+        if self.is_admin() {
+            return Ok(true);
+        }
+
+        // nosuid volume (e.g. /Volumes/data): move off before any Terminal spam.
+        if let Ok(exe) = std::env::current_exe() {
+            if privilege::path_on_nosuid_volume(&exe) {
+                // Stop core first so we don't leave orphans across exec.
+                if self.connected || self.child.is_some() {
+                    self.force_kill_core();
+                }
+                let core_src = prepare_core_beside_gui(&self.config).ok();
+                match privilege::reexec_off_nosuid_volume(core_src.as_deref()) {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        // exec replaced us — unreachable
+                        return Err(CoreError::TunPrivilegeRequired(
+                            "Restarting on a volume that supports Tun…".into(),
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(CoreError::TunPrivilegeRequired(e));
+                    }
                 }
             }
         }
-        false
-    }
 
-    fn apply_privilege_outcome(outcome: PrivilegeOutcome) -> Result<bool, CoreError> {
-        match outcome {
-            PrivilegeOutcome::AlreadyPrivileged | PrivilegeOutcome::Granted => Ok(true),
-            PrivilegeOutcome::ElevationLaunched { hint } => {
+        // Ensure FindCoreRealPath exists (copy beside GUI if needed).
+        let path = prepare_core_beside_gui(&self.config)?;
+
+        match privilege::get_elevated_permissions_for_core(&path) {
+            ElevatedPermissions::Ready => {
+                // Upstream: StopVPNProcess so next Start picks up setuid euid.
+                if self.connected || self.child.is_some() {
+                    info!("StopVPNProcess equivalent — restart core after setuid grant");
+                    self.force_kill_core();
+                }
+                Ok(true)
+            }
+            ElevatedPermissions::Reexecing => Err(CoreError::TunPrivilegeRequired(
+                "Restarting on a volume that supports Tun…".into(),
+            )),
+            ElevatedPermissions::RetryAfterPassword { hint } => {
                 Err(CoreError::TunPrivilegeRequired(hint))
             }
-            PrivilegeOutcome::Failed(e) => Err(CoreError::TunPrivilegeRequired(e)),
-            PrivilegeOutcome::Unsupported(msg) => {
-                Err(CoreError::TunPrivilegeRequired(msg.to_string()))
+            ElevatedPermissions::Denied { reason } => {
+                Err(CoreError::TunPrivilegeRequired(reason))
             }
         }
     }
 
-    /// Ensure Tun can run: root-setuid core or launch a one-shot admin dialog.
-    pub fn ensure_tun_privileges(&mut self) -> Result<(), CoreError> {
-        if self.is_core_privileged() {
-            return Ok(());
-        }
-
-        // Materialize beside GUI so setuid lands on the binary we actually spawn.
-        let path = prepare_core_beside_gui(&self.config)?;
-
-        // Kill unprivileged core so the next spawn picks up setuid.
-        if self.connected || self.child.is_some() {
-            warn!("stopping unprivileged core before Tun elevation");
-            self.force_kill_core();
-        }
-
-        Self::apply_privilege_outcome(privilege::request_core_privileges(&path)).map(|_| ())
-    }
-
-    /// Request Tun privileges without starting a profile (toolbar Tun toggle).
-    ///
-    /// Returns `Ok(true)` when the core is (now) privileged.
+    /// Upstream `set_spmode_vpn(true)` permission check before enabling Tun.
     pub fn request_tun_privileges_for_toggle(&mut self) -> Result<bool, CoreError> {
-        if self.is_core_privileged() {
+        if self.is_admin() {
             return Ok(true);
         }
-        let path = prepare_core_beside_gui(&self.config)?;
-        if self.connected || self.child.is_some() {
-            self.force_kill_core();
+        self.get_elevated_permissions()
+    }
+
+    /// Before Start with Tun: same gate as enabling Tun.
+    pub fn ensure_tun_privileges(&mut self) -> Result<(), CoreError> {
+        if self.is_admin() {
+            return Ok(());
         }
-        Self::apply_privilege_outcome(privilege::request_core_privileges(&path))
+        let path = prepare_core_beside_gui(&self.config)?;
+        if privilege::core_is_root_setuid(&path) && !privilege::path_on_nosuid_volume(&path) {
+            if (self.connected || self.child.is_some()) && !self.is_admin() {
+                self.force_kill_core();
+            }
+            return Ok(());
+        }
+        self.get_elevated_permissions().map(|_| ())
     }
 
     /// Stop the running profile.
@@ -908,12 +951,11 @@ fn prepare_core_beside_gui(config: &CoreConfig) -> Result<PathBuf, CoreError> {
     let dest = gui_dir.join("ThroneCore");
     let source = find_core_source(config)?;
 
-    // Never overwrite a root-setuid core — that undoes Tun elevation (especially
-    // painful under `cargo run` where prepare runs on every Start/Tun toggle).
-    let dest_is_root_setuid = privilege::core_is_root_setuid(&dest);
+    // Never overwrite a setuid core (upstream leaves applicationDirPath/ThroneCore
+    // alone after `chmod u+s`). Copying would strip setuid under `cargo run`.
+    let dest_has_setuid = privilege::is_setuid_set(&dest);
 
-    // Copy when missing or source is newer / different size — unless elevated.
-    let need_copy = if dest_is_root_setuid {
+    let need_copy = if dest_has_setuid {
         false
     } else {
         match (dest.metadata(), source.metadata()) {
@@ -942,15 +984,9 @@ fn prepare_core_beside_gui(config: &CoreConfig) -> Result<PathBuf, CoreError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        // Preserve setuid (u+s) if the user already granted Tun privileges.
-        // Stripping it here would undo elevation every time we prepare the core.
-        if !dest_is_root_setuid {
-            let meta = std::fs::metadata(&dest).map_err(|e| CoreError::Spawn(e.to_string()))?;
-            let mode = meta.permissions().mode();
-            let keep_setuid = (mode & 0o4000) != 0;
-            // Only touch mode when not root-setuid; chmod on root-owned files fails
-            // for normal users and is unnecessary.
-            if !keep_setuid {
+        // Do not chmod a setuid binary (would drop u+s or fail on root-owned).
+        if !dest_has_setuid {
+            if let Ok(meta) = std::fs::metadata(&dest) {
                 let mut perms = meta.permissions();
                 perms.set_mode(0o755);
                 let _ = std::fs::set_permissions(&dest, perms);
