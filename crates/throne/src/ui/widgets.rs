@@ -1,4 +1,4 @@
-use gpui::{App, ClickEvent, SharedString, Window, div, prelude::*, px};
+use gpui::{App, ClickEvent, SharedString, Window, div, prelude::*, px, svg};
 
 use crate::theme::Theme;
 
@@ -7,9 +7,28 @@ pub const TOOLBAR_BTN_W: f32 = 68.;
 /// Gap between toolbar menu buttons.
 pub const TOOLBAR_BTN_GAP: f32 = 4.;
 /// Top padding of the top bar + button height — menu overlay top edge.
-pub const TOOLBAR_MENU_TOP: f32 = 66.;
+pub const TOOLBAR_MENU_TOP: f32 = 68.;
 /// Left padding of the top bar.
-pub const TOOLBAR_PAD_X: f32 = 8.;
+pub const TOOLBAR_PAD_X: f32 = 12.;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolbarIcon {
+    Program,
+    Settings,
+    Groups,
+    Routing,
+    Tools,
+}
+
+pub fn toolbar_icon_path(icon: ToolbarIcon) -> &'static str {
+    match icon {
+        ToolbarIcon::Program => "icons/box.svg",
+        ToolbarIcon::Settings => "icons/settings.svg",
+        ToolbarIcon::Groups => "icons/layers.svg",
+        ToolbarIcon::Routing => "icons/route.svg",
+        ToolbarIcon::Tools => "icons/wrench.svg",
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StartStopState {
@@ -30,7 +49,19 @@ pub fn start_stop_presentation(state: StartStopState) -> (&'static str, bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{StartStopState, start_stop_presentation};
+    use super::{StartStopState, ToolbarIcon, start_stop_presentation, toolbar_icon_path};
+
+    #[test]
+    fn toolbar_actions_use_distinct_embedded_icon_assets() {
+        assert_eq!(toolbar_icon_path(ToolbarIcon::Program), "icons/box.svg");
+        assert_eq!(
+            toolbar_icon_path(ToolbarIcon::Settings),
+            "icons/settings.svg"
+        );
+        assert_eq!(toolbar_icon_path(ToolbarIcon::Groups), "icons/layers.svg");
+        assert_eq!(toolbar_icon_path(ToolbarIcon::Routing), "icons/route.svg");
+        assert_eq!(toolbar_icon_path(ToolbarIcon::Tools), "icons/wrench.svg");
+    }
 
     #[test]
     fn transitional_start_stop_states_show_loading_feedback() {
@@ -62,7 +93,7 @@ mod tests {
 /// painted under the profile table / group tabs.
 pub fn toolbar_btn(
     id: impl Into<SharedString>,
-    glyph: &'static str,
+    icon: ToolbarIcon,
     label: &'static str,
     open: bool,
     on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
@@ -76,7 +107,7 @@ pub fn toolbar_btn(
         .justify_center()
         .gap_0p5()
         .w(px(TOOLBAR_BTN_W))
-        .h(px(56.))
+        .h(px(52.))
         .rounded_sm()
         .border_1()
         .border_color(if open {
@@ -92,11 +123,10 @@ pub fn toolbar_btn(
         .hover(|e| e.bg(Theme::bg_hover()))
         .cursor_pointer()
         .child(
-            div()
-                .text_lg()
-                .line_height(px(22.))
-                .text_color(Theme::text())
-                .child(glyph),
+            svg()
+                .path(toolbar_icon_path(icon))
+                .size(px(18.))
+                .text_color(if open { Theme::accent() } else { Theme::text() }),
         )
         .child(div().text_xs().text_color(Theme::text()).child(label))
         .on_click(on_toggle)
@@ -151,15 +181,27 @@ pub fn start_stop_btn(
         .flex_col()
         .items_center()
         .justify_center()
-        .w(px(64.))
-        .h(px(56.))
+        .w(px(72.))
+        .h(px(52.))
         .rounded_md()
         .border_1()
         .border_color(color)
         .bg(Theme::bg_elevated())
         .hover(|e| e.bg(Theme::bg_hover()))
         .cursor_pointer()
-        .child(div().text_xl().text_color(color).child(glyph))
+        .child(if loading {
+            div().text_xl().text_color(color).child(glyph).into_any_element()
+        } else {
+            svg()
+                .path(if matches!(state, StartStopState::Stop) {
+                    "icons/square.svg"
+                } else {
+                    "icons/play.svg"
+                })
+                .size(px(18.))
+                .text_color(color)
+                .into_any_element()
+        })
         .child(
             div()
                 .text_xs()

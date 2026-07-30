@@ -37,7 +37,7 @@ use crate::ui::dialogs::{
 use crate::ui::widgets::{
     TOOLBAR_BTN_GAP, TOOLBAR_BTN_W, TOOLBAR_MENU_TOP, TOOLBAR_PAD_X, menu_item, menu_label,
     menu_separator, modal_shell, mode_checkbox, secondary_btn, start_stop_btn, toolbar_btn,
-    toolbar_menu_panel, StartStopState,
+    toolbar_menu_panel, StartStopState, ToolbarIcon,
 };
 
 actions!(
@@ -894,16 +894,15 @@ impl MainWindow {
 
             this.update(cx, |this, cx| {
                 this.core_op_busy = false;
+                let switch_target = this.pending_profile_switch.take();
                 // Always mark stopped locally — stop_profile force-kills core.
                 this.state.set_core_status(CoreStatus::Stopped);
-                let switch_target = this.pending_profile_switch.take();
                 match result {
                     Ok(()) => this.state.set_status_message("Core stopped"),
                     Err(e) => this
                         .state
                         .set_status_message(format!("Stopped (with errors): {e}")),
                 }
-                let _ = this.persist_db();
                 if let Some(profile_id) = switch_target {
                     if this.state.select_profile(profile_id).is_ok() {
                         this.start_proxy(cx);
@@ -915,6 +914,7 @@ impl MainWindow {
                     this.state
                         .set_status_message("Switch failed: selected profile was removed");
                 }
+                let _ = this.persist_db();
                 cx.notify();
             })
             .ok();
@@ -1777,9 +1777,9 @@ impl MainWindow {
         div()
             .relative()
             .flex()
-            .items_start()
-            .gap_2()
-            .px_2()
+            .items_center()
+            .gap_3()
+            .px_3()
             .py_2()
             .bg(Theme::bg_panel())
             .border_b_1()
@@ -1798,7 +1798,7 @@ impl MainWindow {
                     .justify_center()
                     .gap_1()
                     .px_2()
-                    .h(px(56.))
+                    .h(px(52.))
                     .child({
                         let e = entity.clone();
                         let on = self.state.settings().tun_mode_enabled;
@@ -2034,18 +2034,26 @@ impl MainWindow {
 
         // Buttons only — dropdown panels are root overlays so they paint above the table.
         let menus = [
-            (OpenMenu::Program, "tb-program", "⚙", "Program"),
-            (OpenMenu::Settings, "tb-settings", "☰", "Settings"),
-            (OpenMenu::Groups, "tb-groups", "▦", "Groups"),
-            (OpenMenu::Routing, "tb-routing", "⇄", "Routing"),
-            (OpenMenu::Tools, "tb-tools", "⚒", "Tools"),
+            (OpenMenu::Program, "tb-program", ToolbarIcon::Program, "Program"),
+            (OpenMenu::Settings, "tb-settings", ToolbarIcon::Settings, "Settings"),
+            (OpenMenu::Groups, "tb-groups", ToolbarIcon::Groups, "Groups"),
+            (OpenMenu::Routing, "tb-routing", ToolbarIcon::Routing, "Routing"),
+            (OpenMenu::Tools, "tb-tools", ToolbarIcon::Tools, "Tools"),
         ];
 
-        let mut row = div().flex().items_center().gap_1();
-        for (menu, id, glyph, label) in menus {
+        let mut row = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .p_1()
+            .rounded_sm()
+            .border_1()
+            .border_color(Theme::border_light())
+            .bg(Theme::bg_elevated());
+        for (menu, id, icon, label) in menus {
             let e = entity.clone();
             let open = self.open_menu == menu;
-            row = row.child(toolbar_btn(id, glyph, label, open, move |_, _, cx| {
+            row = row.child(toolbar_btn(id, icon, label, open, move |_, _, cx| {
                 e.update(cx, |this, cx| this.toggle_menu(menu, cx));
             }));
         }
@@ -2070,7 +2078,7 @@ impl MainWindow {
         let Some(idx) = Self::toolbar_menu_index(menu) else {
             return div().into_any_element();
         };
-        let left = TOOLBAR_PAD_X + idx as f32 * (TOOLBAR_BTN_W + TOOLBAR_BTN_GAP);
+        let left = TOOLBAR_PAD_X + 4. + idx as f32 * (TOOLBAR_BTN_W + TOOLBAR_BTN_GAP);
         let items = self.menu_items_for(menu, cx);
         // Dim strip is optional; panel alone is enough. Click-away closes via Esc.
         toolbar_menu_panel(
@@ -3068,9 +3076,9 @@ impl MainWindow {
         div()
             .flex()
             .items_center()
-            .gap_4()
+            .gap_3()
             .px_3()
-            .py_1p5()
+            .py_1()
             .bg(Theme::bg_panel())
             .border_t_1()
             .border_color(Theme::border_light())
@@ -3087,16 +3095,14 @@ impl MainWindow {
                     })
                     .child(self.state.running_label()),
             )
-            .child(div().flex_1().child(self.state.inbound_label()))
+            .child(div().flex_1().text_color(Theme::text_muted()).child(self.state.inbound_label()))
             .child(
                 div()
-                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .gap_3()
                     .text_color(Theme::text_muted())
-                    .child(self.state.speed_label()),
-            )
-            .child(
-                div()
-                    .text_color(Theme::text_muted())
+                    .child(self.state.speed_label())
                     .child(if self.db_path_label.is_empty() {
                         String::new()
                     } else {
@@ -3105,11 +3111,7 @@ impl MainWindow {
                             .and_then(|s| s.to_str())
                             .unwrap_or("throne.db")
                             .to_string()
-                    }),
-            )
-            .child(
-                div()
-                    .text_color(Theme::text_muted())
+                    })
                     .child(throne_domain::NKR_VERSION),
             )
     }
@@ -3368,7 +3370,8 @@ impl Render for MainWindow {
 #[cfg(test)]
 mod tests {
     use super::{
-        CoreAction, next_core_action, should_scroll_logs_to_bottom, should_update_rendered_log_text,
+        CoreAction, PendingProfileSwitch, next_core_action, should_scroll_logs_to_bottom,
+        should_update_rendered_log_text,
     };
     use throne_domain::CoreStatus;
 
@@ -3428,7 +3431,7 @@ mod tests {
 
     #[test]
     fn pending_switch_keeps_its_target_while_stop_is_in_progress() {
-        let mut pending = super::PendingProfileSwitch::default();
+        let mut pending = PendingProfileSwitch::default();
 
         assert!(pending.schedule(2));
         assert!(!pending.schedule(3));

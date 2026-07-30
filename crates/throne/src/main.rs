@@ -1,3 +1,4 @@
+mod assets;
 mod theme;
 mod tray;
 mod ui;
@@ -20,7 +21,7 @@ fn main() {
 
     tracing::info!(version = NKR_VERSION, "Throne starting");
 
-    Application::new().run(|cx: &mut App| {
+    Application::new().with_assets(assets::Assets).run(|cx: &mut App| {
         cx.activate(true);
 
         // Upstream mainwindow.ui minimum 800×600

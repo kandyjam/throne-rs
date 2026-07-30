@@ -57,15 +57,43 @@ pub fn next_command() -> Option<TrayCommand> {
 
 fn throne_icon_rgba() -> Vec<u8> {
     let mut rgba = vec![0; 16 * 16 * 4];
-    for y in 2..14 {
-        for x in 2..14 {
-            let is_border = x == 2 || x == 13 || y == 2 || y == 13;
-            let is_cross = x == 7 || x == 8 || y == 7 || y == 8;
-            if is_border || is_cross {
+    for (y, ranges) in [
+        (2, &[7..9][..]),
+        (3, &[6..10][..]),
+        (4, &[3..5, 6..10, 11..13][..]),
+        (5, &[3..5, 5..11, 11..13][..]),
+        (6, &[3..13][..]),
+        (7, &[4..12][..]),
+        (8, &[4..12][..]),
+        (9, &[4..12][..]),
+        (10, &[5..11][..]),
+        (11, &[5..11][..]),
+        (12, &[4..12][..]),
+        (13, &[4..12][..]),
+    ] {
+        for range in ranges {
+            for x in range.clone() {
                 let offset = (y * 16 + x) * 4;
                 rgba[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
             }
         }
     }
     rgba
+}
+
+#[cfg(test)]
+mod tests {
+    use super::throne_icon_rgba;
+
+    #[test]
+    fn tray_icon_uses_a_transparent_canvas_with_crown_peaks() {
+        let rgba = throne_icon_rgba();
+        let alpha = |x: usize, y: usize| rgba[(y * 16 + x) * 4 + 3];
+
+        assert_eq!(rgba.len(), 16 * 16 * 4);
+        assert_eq!(alpha(2, 2), 0);
+        assert_eq!(alpha(3, 5), 255);
+        assert_eq!(alpha(7, 2), 255);
+        assert_eq!(alpha(12, 5), 255);
+    }
 }
