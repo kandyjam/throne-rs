@@ -1122,15 +1122,14 @@ fn human_rate(bytes: i64) -> String {
 }
 
 fn format_log_line(msg: &str) -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() % 86_400)
-        .unwrap_or(0);
-    let h = secs / 3600;
-    let m = (secs % 3600) / 60;
-    let s = secs % 60;
-    format!("[{h:02}:{m:02}:{s:02}] {msg}")
+    format_log_line_at(chrono::Local::now(), msg)
+}
+
+fn format_log_line_at<Tz: chrono::TimeZone>(timestamp: chrono::DateTime<Tz>, msg: &str) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    format!("[{}] {msg}", timestamp.format("%H:%M:%S"))
 }
 
 fn profile_is_structurally_invalid(profile: &Profile) -> bool {
@@ -1148,6 +1147,21 @@ fn profile_is_structurally_invalid(profile: &Profile) -> bool {
 mod tests {
 
     use super::*;
+    use chrono::{FixedOffset, TimeZone};
+
+    #[test]
+    fn formats_log_timestamps_in_the_supplied_local_timezone() {
+        let offset = FixedOffset::east_opt(8 * 60 * 60).expect("valid UTC+8 offset");
+        let timestamp = offset
+            .with_ymd_and_hms(2026, 7, 30, 11, 23, 43)
+            .single()
+            .expect("valid timestamp");
+
+        assert_eq!(
+            format_log_line_at(timestamp, "Logs copied"),
+            "[11:23:43] Logs copied"
+        );
+    }
 
     #[test]
     fn demo_has_groups_and_profiles() {
