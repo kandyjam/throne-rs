@@ -536,11 +536,41 @@ impl AppState {
     }
 
     pub fn set_core_status(&mut self, status: CoreStatus) {
+        if !status.is_running() {
+            self.traffic = TrafficSnapshot::default();
+        }
         self.core_status = status;
     }
 
     pub fn set_traffic(&mut self, traffic: TrafficSnapshot) {
         self.traffic = traffic;
+    }
+
+    pub fn update_live_traffic(&mut self, sample: TrafficSnapshot) -> bool {
+        if !self.core_status.is_running() {
+            return false;
+        }
+
+        let retain_rate = |next_rate: i64, current_rate: i64| {
+            let next_rate = next_rate.max(0);
+            if next_rate == 0 && current_rate > 0 {
+                current_rate
+            } else {
+                next_rate
+            }
+        };
+        let updated = TrafficSnapshot {
+            proxy_up: retain_rate(sample.proxy_up, self.traffic.proxy_up),
+            proxy_down: retain_rate(sample.proxy_down, self.traffic.proxy_down),
+            direct_up: retain_rate(sample.direct_up, self.traffic.direct_up),
+            direct_down: retain_rate(sample.direct_down, self.traffic.direct_down),
+        };
+        if updated == self.traffic {
+            return false;
+        }
+
+        self.traffic = updated;
+        true
     }
 
     /// Add core traffic deltas to the profile currently carrying proxy traffic.
@@ -1197,6 +1227,33 @@ mod tests {
             state.speed_label(),
             "Proxy: 1.0KB↑ 17.1KB↓\nDirect: 0B↑ 0B↓"
         );
+    }
+
+    #[test]
+    fn zero_traffic_sample_preserves_live_rates_while_running() {
+        let mut state = AppState::with_demo_data();
+        state.toggle_selected().unwrap();
+        state.set_traffic(TrafficSnapshot {
+            proxy_up: 1_024,
+            ..TrafficSnapshot::default()
+        });
+
+        assert!(!state.update_live_traffic(TrafficSnapshot::default()));
+        assert_eq!(state.traffic().proxy_up, 1_024);
+    }
+
+    #[test]
+    fn stopping_core_clears_retained_live_rates() {
+        let mut state = AppState::with_demo_data();
+        state.toggle_selected().unwrap();
+        state.set_traffic(TrafficSnapshot {
+            proxy_down: 1_024,
+            ..TrafficSnapshot::default()
+        });
+
+        state.set_core_status(CoreStatus::Stopped);
+
+        assert_eq!(state.traffic(), &TrafficSnapshot::default());
     }
 
     #[test]

@@ -1231,7 +1231,6 @@ impl MainWindow {
                 .await;
             this.update(cx, |this, cx| {
                 this.runtime_poll_busy = false;
-                let mut should_notify = false;
                 if let Some((stats, conns)) = snap {
                     if let Some(cum) = stats {
                         let now = std::time::Instant::now();
@@ -1248,20 +1247,18 @@ impl MainWindow {
                             TrafficSnapshot::default()
                         };
                         this.prev_traffic_at = Some(now);
-                        this.state.set_traffic(rates);
+                        traffic_changed = this.state.update_live_traffic(rates);
                         if let CoreStatus::Running { profile_id, .. } = this.state.core_status() {
                             this.state
                                 .set_profile_traffic(*profile_id, cum.proxy_down, cum.proxy_up);
                         }
-                        should_notify = true;
                     }
                     if want_conn {
                         this.connections = conns;
-                        should_notify = true;
                     }
-                }
-                if should_notify {
-                    cx.notify();
+                    if traffic_changed || want_conn {
+                        cx.notify();
+                    }
                 }
             })
             .ok();
@@ -1308,6 +1305,7 @@ impl MainWindow {
 
         cx.spawn(async move |this, cx| {
             let result = cx
+                    let mut traffic_changed = false;
                 .background_spawn(async move { set_system_proxy(on, &host, port) })
                 .await;
             this.update(cx, |this, cx| {
@@ -1327,6 +1325,7 @@ impl MainWindow {
         .detach();
     }
 
+                            traffic_changed |= cum.proxy_down > 0 || cum.proxy_up > 0;
     fn set_sys_dns(&mut self, on: bool, cx: &mut Context<Self>) {
         self.state.set_system_dns(on);
         let _ = self.persist_db();
