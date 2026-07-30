@@ -1,6 +1,4 @@
-use gpui::{
-    App, ClickEvent, Div, SharedString, Window, div, prelude::*, px,
-};
+use gpui::{App, ClickEvent, SharedString, Window, div, prelude::*, px};
 
 use crate::theme::Theme;
 
