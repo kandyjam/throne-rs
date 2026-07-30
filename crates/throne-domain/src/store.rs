@@ -776,15 +776,23 @@ impl AppState {
         vpn_mtu: i32,
         vpn_strict_route: bool,
         disable_private_range_bypass: bool,
+        vpn_tun_ipv4_cidr: Option<String>,
     ) {
         self.settings.vpn_mtu = vpn_mtu.clamp(1280, 65535);
         self.settings.vpn_strict_route = vpn_strict_route;
         self.settings.disable_private_range_bypass = disable_private_range_bypass;
+        if let Some(cidr) = vpn_tun_ipv4_cidr {
+            let t = cidr.trim();
+            if !t.is_empty() {
+                self.settings.vpn_tun_ipv4_cidr = t.to_string();
+            }
+        }
         self.push_log(format!(
-            "Tun settings · mtu={} strict={} bypass_private={}",
+            "Tun settings · mtu={} strict={} bypass_private={} addr={}",
             self.settings.vpn_mtu,
             vpn_strict_route,
-            !disable_private_range_bypass
+            !disable_private_range_bypass,
+            self.settings.vpn_tun_ipv4_cidr
         ));
     }
 

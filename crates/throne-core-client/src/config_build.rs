@@ -17,6 +17,9 @@ pub struct BuiltConfig {
     pub core_config_json: String,
     pub need_xray: bool,
     pub xray_config: String,
+    /// Upstream `LoadConfigReq.tun_ipv4_cidr` — set when Tun inbound is present.
+    /// Empty when Tun is off. Core uses this on Darwin to set system DNS to tunIP+1.
+    pub tun_ipv4_cidr: String,
 }
 
 /// Build sing-box JSON for starting `profile` with the given settings.
@@ -48,17 +51,34 @@ pub fn build_load_config(
         "listen_port": port
     })];
     // TUN inbound when toolbar Tun is on (needs privileges on macOS/Linux).
+    let mut tun_ipv4_cidr = String::new();
     if settings.tun_mode_enabled {
+        tun_ipv4_cidr = normalize_tun_ipv4_cidr(&settings.vpn_tun_ipv4_cidr);
+        // Platform stack defaults match upstream SettingsRepo (macOS → gvisor).
+        let stack = default_tun_stack();
         let mut tun = json!({
             "type": "tun",
             "tag": "tun-in",
-            "interface_name": "throne-tun",
             "auto_route": true,
             "strict_route": settings.vpn_strict_route,
             "mtu": settings.vpn_mtu.clamp(1280, 65535),
-            "stack": "mixed",
-            "address": ["172.19.0.1/30"]
+            "stack": stack,
+            "address": [tun_ipv4_cidr.clone()]
         });
+        // Darwin only accepts utunN (or empty = OS assigns). Linux/Windows accept
+        // arbitrary names; "throne-tun" is rejected on macOS as "bad tun name".
+        if let Some(name) = default_tun_interface_name() {
+            tun.as_object_mut()
+                .unwrap()
+                .insert("interface_name".into(), json!(name));
+        }
+        // Linux: newer kernels need auto_redirect for system/mixed stacks (upstream default on).
+        #[cfg(target_os = "linux")]
+        {
+            tun.as_object_mut()
+                .unwrap()
+                .insert("auto_redirect".into(), json!(true));
+        }
         if !settings.disable_private_range_bypass {
             tun.as_object_mut().unwrap().insert(
                 "route_exclude_address".into(),
@@ -141,6 +161,7 @@ pub fn build_load_config(
         core_config_json,
         need_xray: false,
         xray_config: String::new(),
+        tun_ipv4_cidr,
     })
 }
 
@@ -574,6 +595,64 @@ pub fn build_url_test_config(
 }
 
 /// Inbound listen address. Defaults remain loopback, while an explicit IP enables LAN sharing.
+/// Platform-valid TUN `interface_name`, or `None` to let the OS/core assign one.
+///
+/// macOS/Darwin rejects arbitrary names (`bad tun name: throne-tun`); only
+/// `utunN` is valid, and omitting the field lets the kernel pick a free utun.
+fn default_tun_interface_name() -> Option<&'static str> {
+    #[cfg(target_os = "macos")]
+    {
+        None
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Some("throne-tun")
+    }
+}
+
+/// Upstream `vpn_implementation` platform defaults.
+fn default_tun_stack() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "gvisor"
+    }
+    #[cfg(target_os = "windows")]
+    {
+        "system"
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        "system"
+    }
+}
+
+/// Validate / fall back Tun IPv4 CIDR (upstream default `172.19.0.1/24`).
+fn normalize_tun_ipv4_cidr(raw: &str) -> String {
+    let t = raw.trim();
+    if is_plausible_ipv4_cidr(t) {
+        t.to_string()
+    } else {
+        "172.19.0.1/24".into()
+    }
+}
+
+fn is_plausible_ipv4_cidr(s: &str) -> bool {
+    let Some((addr, pref)) = s.split_once('/') else {
+        return false;
+    };
+    let Ok(prefix) = pref.parse::<u8>() else {
+        return false;
+    };
+    if prefix > 32 {
+        return false;
+    }
+    let parts: Vec<_> = addr.split('.').collect();
+    if parts.len() != 4 {
+        return false;
+    }
+    parts.iter().all(|p| p.parse::<u8>().is_ok())
+}
+
 fn normalize_listen_address(addr: &str) -> String {
     match addr.trim() {
         "" | "*" | "::" | "[::]" | "::0" | "localhost" => "127.0.0.1".into(),
@@ -988,6 +1067,45 @@ fn build_dns_server_obj(address: &str) -> Value {
 mod tests {
     use super::*;
     use throne_domain::{ParsedOutbound, Profile, ProfileType, RulesetMirror};
+
+    #[test]
+    fn tun_inbound_uses_platform_safe_interface_name() {
+        let mut p = Profile::new(1, 1, "n1", ProfileType::Vless);
+        p.outbound = ParsedOutbound {
+            server: Some("1.2.3.4".into()),
+            server_port: Some(443),
+            uuid: Some("11111111-1111-1111-1111-111111111111".into()),
+            ..Default::default()
+        };
+        let mut settings = AppSettings::default();
+        settings.tun_mode_enabled = true;
+        let built = build_load_config(&p, &settings, None).unwrap();
+        let v: Value = serde_json::from_str(&built.core_config_json).unwrap();
+        let tun = v["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|ib| ib["type"] == "tun")
+            .expect("tun inbound");
+        assert_eq!(tun["tag"], "tun-in");
+        assert_eq!(tun["address"][0], "172.19.0.1/24");
+        assert_eq!(built.tun_ipv4_cidr, "172.19.0.1/24");
+        #[cfg(target_os = "macos")]
+        {
+            // Empty/omitted name — kernel assigns utunN. "throne-tun" is invalid on Darwin.
+            assert!(
+                tun.get("interface_name").is_none()
+                    || tun["interface_name"].as_str().is_some_and(|n| n.is_empty() || n.starts_with("utun")),
+                "macOS tun name must be utun* or omitted, got {:?}",
+                tun.get("interface_name")
+            );
+            assert_eq!(tun["stack"], "gvisor");
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(tun["interface_name"], "throne-tun");
+        }
+    }
 
     #[test]
     fn builds_vless_config() {

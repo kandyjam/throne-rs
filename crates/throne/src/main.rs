@@ -3,9 +3,12 @@ mod theme;
 mod tray;
 mod ui;
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use gpui::{
-    App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, prelude::*, px,
-    size,
+    App, Application, Bounds, Entity, TitlebarOptions, WindowBounds, WindowHandle, WindowOptions,
+    point, prelude::*, px, size,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -24,28 +27,16 @@ fn main() {
     Application::new().with_assets(assets::Assets).run(|cx: &mut App| {
         cx.activate(true);
 
-        // Upstream mainwindow.ui minimum 800×600
-        let bounds = Bounds::centered(None, size(px(960.), px(640.)), cx);
-        let window_handle = cx
-            .open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    // Upstream tray/title includes NKR_VERSION
-                    title: Some(display_name().into()),
-                    appears_transparent: false,
-                    traffic_light_position: Some(point(px(9.), px(9.))),
-                }),
-                focus: true,
-                show: true,
-                ..Default::default()
-            },
-            |_window, cx| cx.new(MainWindow::new),
-            )
-            .expect("open main window");
+        // Keep the root view alive across window close so tray "Show" / "Toggle"
+        // can reopen the same session instead of losing CoreSession state.
+        let root = cx.new(MainWindow::new);
+        let window_slot: Rc<RefCell<Option<WindowHandle<MainWindow>>>> =
+            Rc::new(RefCell::new(Some(open_main_window(cx, root.clone()))));
 
         match tray::install() {
             Ok(()) => {
+                let window_slot = window_slot.clone();
+                let root = root.clone();
                 cx.spawn(move |cx: &mut gpui::AsyncApp| {
                     let async_cx = cx.clone();
                     async move {
@@ -55,13 +46,10 @@ fn main() {
                                 if async_cx
                                     .update(|cx| match command {
                                         tray::TrayCommand::ShowWindow => {
-                                            cx.activate(true);
-                                            let _ = window_handle.update(cx, |_, window, _| {
-                                                window.activate_window();
-                                            });
+                                            show_main_window(cx, &window_slot, &root);
                                         }
                                         tray::TrayCommand::ToggleProxy => {
-                                            let _ = window_handle.update(cx, |view, _, cx| {
+                                            root.update(cx, |view, cx| {
                                                 view.toggle_proxy(cx);
                                             });
                                         }
@@ -80,6 +68,57 @@ fn main() {
             Err(error) => tracing::warn!(%error, "desktop tray unavailable"),
         }
     });
+}
+
+fn open_main_window(cx: &mut App, root: Entity<MainWindow>) -> WindowHandle<MainWindow> {
+    // Upstream mainwindow.ui minimum 800×600
+    let bounds = Bounds::centered(None, size(px(960.), px(640.)), cx);
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(TitlebarOptions {
+                // Upstream tray/title includes NKR_VERSION
+                title: Some(display_name().into()),
+                appears_transparent: false,
+                traffic_light_position: Some(point(px(9.), px(9.))),
+            }),
+            focus: true,
+            show: true,
+            ..Default::default()
+        },
+        |_window, _cx| root,
+    )
+    .expect("open main window")
+}
+
+/// `WindowHandle::is_active` is `None` when the window has been closed.
+fn window_needs_reopen(is_active: Option<bool>) -> bool {
+    is_active.is_none()
+}
+
+/// Bring the main window forward, recreating it if the user closed it to the tray.
+fn show_main_window(
+    cx: &mut App,
+    window_slot: &Rc<RefCell<Option<WindowHandle<MainWindow>>>>,
+    root: &Entity<MainWindow>,
+) {
+    cx.activate(true);
+
+    let is_active = window_slot
+        .borrow()
+        .as_ref()
+        .and_then(|handle| handle.is_active(cx));
+
+    if window_needs_reopen(is_active) {
+        *window_slot.borrow_mut() = Some(open_main_window(cx, root.clone()));
+        return;
+    }
+
+    if let Some(handle) = window_slot.borrow().as_ref() {
+        let _ = handle.update(cx, |_, window, _| {
+            window.activate_window();
+        });
+    }
 }
 
 #[cfg(test)]
@@ -116,5 +155,16 @@ mod tests {
         assert_eq!(command_from_menu_id("throne.toggle"), Some(TrayCommand::ToggleProxy));
         assert_eq!(command_from_menu_id("throne.quit"), Some(TrayCommand::Quit));
         assert_eq!(command_from_menu_id("unrelated"), None);
+    }
+
+    #[test]
+    fn closed_window_handle_is_treated_as_needing_reopen() {
+        use super::window_needs_reopen;
+
+        // `WindowHandle::is_active` returns None when the platform window is gone.
+        assert!(window_needs_reopen(None));
+        // Still open (focused or not) → just activate, do not recreate.
+        assert!(!window_needs_reopen(Some(true)));
+        assert!(!window_needs_reopen(Some(false)));
     }
 }

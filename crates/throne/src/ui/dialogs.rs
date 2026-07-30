@@ -762,7 +762,7 @@ pub fn tun_settings_body(
                 .mb_3()
                 .child(
                     "Tun Mode settings — applied on next Start when Tun is checked. \
-                     macOS Tun usually needs elevated privileges (next wave).",
+                     macOS/Linux require elevated ThroneCore (setuid); enabling Tun will prompt.",
                 ),
         )
         .child(

@@ -455,6 +455,10 @@ impl RulesetMirror {
     }
 }
 
+fn default_vpn_tun_ipv4_cidr() -> String {
+    "172.19.0.1/24".into()
+}
+
 /// Subset of upstream `SettingsRepo` defaults used by the Rust client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
@@ -465,6 +469,10 @@ pub struct AppSettings {
     pub direct_dns: String,
     pub vpn_strict_route: bool,
     pub vpn_mtu: i32,
+    /// Tun IPv4 address/prefix (upstream `vpn_tun_ipv4_cidr`, default `172.19.0.1/24`).
+    /// Passed to sing-box `inbounds[].address` and Start RPC `tun_ipv4_cidr` (macOS system DNS).
+    #[serde(default = "default_vpn_tun_ipv4_cidr")]
+    pub vpn_tun_ipv4_cidr: String,
     pub disable_private_range_bypass: bool,
     pub sub_show_change_popup: bool,
     pub allow_stopping_active_profile: bool,
@@ -506,7 +514,9 @@ impl Default for AppSettings {
             remote_dns: "https://dns.google/dns-query".into(),
             direct_dns: "localhost".into(),
             vpn_strict_route: false,
-            vpn_mtu: 9000,
+            // upstream SettingsRepo default is 1500; keep 9000 only if user already persisted it
+            vpn_mtu: 1500,
+            vpn_tun_ipv4_cidr: default_vpn_tun_ipv4_cidr(),
             disable_private_range_bypass: false,
             sub_show_change_popup: true,
             allow_stopping_active_profile: true,

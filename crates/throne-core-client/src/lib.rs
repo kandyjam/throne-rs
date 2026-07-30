@@ -8,12 +8,17 @@
 //! - Payload = protobuf (`LoadConfigReq` / `EmptyReq` / `ErrorResp`)
 
 mod config_build;
+mod privilege;
 mod proto_wire;
 mod rule_set_list;
 mod sys_proxy;
 
 pub use config_build::{
     BuiltConfig, apply_ruleset_mirror, build_load_config, build_url_test_config,
+};
+pub use privilege::{
+    PrivilegeOutcome, core_has_setuid, core_is_root_setuid, core_path_beside_gui,
+    request_core_privileges,
 };
 pub use proto_wire::{ConnectionRow, IpTestResult, SpeedTestResult, UrlTestResult};
 pub use sys_proxy::{force_clear_system_proxy, set_system_proxy};
@@ -51,6 +56,9 @@ pub enum CoreError {
     Config(String),
     #[error("timeout waiting for core IPC connection")]
     ConnectTimeout,
+    /// Tun Mode needs root on the core binary; elevation UI was opened or must be.
+    #[error("tun privilege required: {0}")]
+    TunPrivilegeRequired(String),
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),
 }
@@ -390,6 +398,12 @@ impl CoreSession {
         apply_system_proxy: bool,
     ) -> Result<(), CoreError> {
         let built = build_load_config(profile, settings, route_profile)?;
+
+        // Tun needs a privileged core (setuid root). Check/request before Start.
+        if settings.tun_mode_enabled {
+            self.ensure_tun_privileges()?;
+        }
+
         self.ensure_connected()?;
 
         // A caller that did not complete Stop may have left boxInstance up.
@@ -408,6 +422,7 @@ impl CoreSession {
             false,
             built.need_xray,
             &built.xray_config,
+            &built.tun_ipv4_cidr,
         );
         let resp = match self.call("Start", &payload, Duration::from_secs(30)) {
             Ok(r) => r,
@@ -455,6 +470,88 @@ impl CoreSession {
             "core Start OK"
         );
         Ok(())
+    }
+
+    /// Path of the ThroneCore binary used for IPC (beside GUI after prepare).
+    pub fn resolved_core_path(&self) -> PathBuf {
+        if let Ok(gui) = std::env::current_exe() {
+            if let Some(dir) = gui.parent() {
+                let dest = dir.join("ThroneCore");
+                if dest.exists() {
+                    return dest;
+                }
+            }
+        }
+        if self.config.binary_path.exists() {
+            return self.config.binary_path.clone();
+        }
+        resolve_core_binary()
+    }
+
+    /// Whether the live core reports euid 0, or the on-disk binary is root setuid.
+    pub fn is_core_privileged(&mut self) -> bool {
+        // Real TUN capability: root-owned setuid binary (or live euid 0).
+        if privilege::core_is_root_setuid(&self.resolved_core_path()) {
+            return true;
+        }
+        // Prefer live RPC when connected (matches upstream IsAdmin / geteuid==0).
+        if self.connected {
+            if let Ok(resp) = self.call(
+                "IsPrivileged",
+                &proto_wire::encode_empty_req(),
+                Duration::from_millis(800),
+            ) {
+                if let Ok(true) = proto_wire::decode_is_privileged_resp(&resp) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn apply_privilege_outcome(outcome: PrivilegeOutcome) -> Result<bool, CoreError> {
+        match outcome {
+            PrivilegeOutcome::AlreadyPrivileged | PrivilegeOutcome::Granted => Ok(true),
+            PrivilegeOutcome::ElevationLaunched { hint } => {
+                Err(CoreError::TunPrivilegeRequired(hint))
+            }
+            PrivilegeOutcome::Failed(e) => Err(CoreError::TunPrivilegeRequired(e)),
+            PrivilegeOutcome::Unsupported(msg) => {
+                Err(CoreError::TunPrivilegeRequired(msg.to_string()))
+            }
+        }
+    }
+
+    /// Ensure Tun can run: root-setuid core or launch a one-shot admin dialog.
+    pub fn ensure_tun_privileges(&mut self) -> Result<(), CoreError> {
+        if self.is_core_privileged() {
+            return Ok(());
+        }
+
+        // Materialize beside GUI so setuid lands on the binary we actually spawn.
+        let path = prepare_core_beside_gui(&self.config)?;
+
+        // Kill unprivileged core so the next spawn picks up setuid.
+        if self.connected || self.child.is_some() {
+            warn!("stopping unprivileged core before Tun elevation");
+            self.force_kill_core();
+        }
+
+        Self::apply_privilege_outcome(privilege::request_core_privileges(&path)).map(|_| ())
+    }
+
+    /// Request Tun privileges without starting a profile (toolbar Tun toggle).
+    ///
+    /// Returns `Ok(true)` when the core is (now) privileged.
+    pub fn request_tun_privileges_for_toggle(&mut self) -> Result<bool, CoreError> {
+        if self.is_core_privileged() {
+            return Ok(true);
+        }
+        let path = prepare_core_beside_gui(&self.config)?;
+        if self.connected || self.child.is_some() {
+            self.force_kill_core();
+        }
+        Self::apply_privilege_outcome(privilege::request_core_privileges(&path))
     }
 
     /// Stop the running profile.
@@ -811,11 +908,19 @@ fn prepare_core_beside_gui(config: &CoreConfig) -> Result<PathBuf, CoreError> {
     let dest = gui_dir.join("ThroneCore");
     let source = find_core_source(config)?;
 
-    // Copy when missing or source is newer / different size.
-    let need_copy = match (dest.metadata(), source.metadata()) {
-        (Ok(d), Ok(s)) => d.len() != s.len(),
-        (Err(_), _) => true,
-        _ => true,
+    // Never overwrite a root-setuid core — that undoes Tun elevation (especially
+    // painful under `cargo run` where prepare runs on every Start/Tun toggle).
+    let dest_is_root_setuid = privilege::core_is_root_setuid(&dest);
+
+    // Copy when missing or source is newer / different size — unless elevated.
+    let need_copy = if dest_is_root_setuid {
+        false
+    } else {
+        match (dest.metadata(), source.metadata()) {
+            (Ok(d), Ok(s)) => d.len() != s.len(),
+            (Err(_), _) => true,
+            _ => true,
+        }
     };
     if need_copy {
         if source != dest {
@@ -837,11 +942,20 @@ fn prepare_core_beside_gui(config: &CoreConfig) -> Result<PathBuf, CoreError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&dest)
-            .map_err(|e| CoreError::Spawn(e.to_string()))?
-            .permissions();
-        perms.set_mode(0o755);
-        let _ = std::fs::set_permissions(&dest, perms);
+        // Preserve setuid (u+s) if the user already granted Tun privileges.
+        // Stripping it here would undo elevation every time we prepare the core.
+        if !dest_is_root_setuid {
+            let meta = std::fs::metadata(&dest).map_err(|e| CoreError::Spawn(e.to_string()))?;
+            let mode = meta.permissions().mode();
+            let keep_setuid = (mode & 0o4000) != 0;
+            // Only touch mode when not root-setuid; chmod on root-owned files fails
+            // for normal users and is unnecessary.
+            if !keep_setuid {
+                let mut perms = meta.permissions();
+                perms.set_mode(0o755);
+                let _ = std::fs::set_permissions(&dest, perms);
+            }
+        }
     }
 
     // Drop macOS quarantine so Gatekeeper does not block exec (EACCES / killed).
@@ -927,7 +1041,13 @@ mod tests {
             ..Default::default()
         };
         let built = build_load_config(&p, &AppSettings::default(), None).unwrap();
-        let bytes = proto_wire::encode_load_config_req(&built.core_config_json, false, false, "");
+        let bytes = proto_wire::encode_load_config_req(
+            &built.core_config_json,
+            false,
+            false,
+            "",
+            &built.tun_ipv4_cidr,
+        );
         assert!(bytes.len() > 10);
     }
 

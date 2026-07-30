@@ -646,7 +646,7 @@ fn merge_settings_tx(
     tx: &rusqlite::Transaction<'_>,
     s: &AppSettings,
 ) -> Result<(), StorageError> {
-    let pairs: [(&str, String); 25] = [
+    let pairs: [(&str, String); 26] = [
         ("inbound_socks_port", s.inbound_socks_port.to_string()),
         ("inbound_address", s.inbound_address.clone()),
         ("test_url", s.test_latency_url.clone()),
@@ -654,6 +654,7 @@ fn merge_settings_tx(
         ("direct_dns", s.direct_dns.clone()),
         ("vpn_strict_route", bool_str(s.vpn_strict_route)),
         ("vpn_mtu", s.vpn_mtu.to_string()),
+        ("vpn_tun_ipv4_cidr", s.vpn_tun_ipv4_cidr.clone()),
         (
             "disable_private_range_bypass",
             bool_str(s.disable_private_range_bypass),
@@ -712,6 +713,12 @@ fn apply_setting(s: &mut AppSettings, key: &str, value: &str) {
         "vpn_mtu" => {
             if let Ok(n) = value.parse() {
                 s.vpn_mtu = n;
+            }
+        }
+        "vpn_tun_ipv4_cidr" => {
+            let t = value.trim();
+            if !t.is_empty() {
+                s.vpn_tun_ipv4_cidr = t.to_string();
             }
         }
         "disable_private_range_bypass" => s.disable_private_range_bypass = parse_bool(value),

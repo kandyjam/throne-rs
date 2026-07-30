@@ -16,8 +16,9 @@ pub fn encode_load_config_req(
     disable_stats: bool,
     need_xray: bool,
     xray_config: &str,
+    tun_ipv4_cidr: &str,
 ) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(core_config.len() + xray_config.len() + 64);
+    let mut buf = Vec::with_capacity(core_config.len() + xray_config.len() + tun_ipv4_cidr.len() + 80);
     write_string(&mut buf, 1, core_config);
     write_varint_field(&mut buf, 2, u64::from(disable_stats));
     write_varint_field(&mut buf, 3, 0); // need_extra_process
@@ -26,7 +27,32 @@ pub fn encode_load_config_req(
     if !xray_config.is_empty() {
         write_string(&mut buf, 10, xray_config);
     }
+    // field 11 — Darwin core sets system DNS to tunIP+1 when non-empty
+    if !tun_ipv4_cidr.is_empty() {
+        write_string(&mut buf, 11, tun_ipv4_cidr);
+    }
     buf
+}
+
+/// Decode `IsPrivilegedResponse.has_privilege` (field 1, bool).
+pub fn decode_is_privileged_resp(data: &[u8]) -> Result<bool, CoreError> {
+    let mut i = 0;
+    let mut has = false;
+    while i < data.len() {
+        let (key, ni) = read_varint(data, i)?;
+        i = ni;
+        let field = (key >> 3) as u32;
+        let wire = (key & 0x7) as u8;
+        match (field, wire) {
+            (1, 0) => {
+                let (v, ni) = read_varint(data, i)?;
+                has = v != 0;
+                i = ni;
+            }
+            _ => i = skip_field(data, i, wire)?,
+        }
+    }
+    Ok(has)
 }
 
 pub fn encode_empty_req() -> Vec<u8> {
@@ -620,19 +646,31 @@ mod tests {
 
     #[test]
     fn encode_load_has_core_config() {
-        let b = encode_load_config_req(r#"{"log":{}}"#, false, false, "");
+        let b = encode_load_config_req(r#"{"log":{}}"#, false, false, "", "");
         assert!(!b.is_empty());
         assert_eq!(b[0], 0x0a);
     }
 
     #[test]
     fn encode_load_always_includes_bool_fields() {
-        let b = encode_load_config_req("{}", false, false, "");
+        let b = encode_load_config_req("{}", false, false, "", "");
         assert!(
             b.contains(&0x18),
             "need_extra_process must be encoded: {b:02x?}"
         );
         assert!(b.contains(&0x48), "need_xray must be encoded: {b:02x?}");
+    }
+
+    #[test]
+    fn encode_load_includes_tun_ipv4_cidr() {
+        let b = encode_load_config_req("{}", false, false, "", "172.19.0.1/24");
+        // field 11 string tag = (11 << 3) | 2 = 0x5a
+        assert!(
+            b.contains(&0x5a),
+            "tun_ipv4_cidr field tag missing: {b:02x?}"
+        );
+        let s = String::from_utf8_lossy(&b);
+        assert!(s.contains("172.19.0.1/24"), "{s}");
     }
 
     #[test]

@@ -568,11 +568,12 @@ impl MainWindow {
             ..
         } = &self.dialog
         {
-            let mtu = vpn_mtu.parse::<i32>().unwrap_or(9000);
+            let mtu = vpn_mtu.parse::<i32>().unwrap_or(1500);
             self.state.apply_tun_settings(
                 mtu,
                 *vpn_strict_route,
                 *disable_private_range_bypass,
+                None,
             );
             self.close_dialog();
             let _ = self.persist_db();
@@ -1392,8 +1393,69 @@ impl MainWindow {
     }
 
     fn set_vpn(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.state.set_spmode_vpn(on);
+        // Upstream set_spmode_vpn: request elevation before enabling Tun.
+        if on {
+            let core = Arc::clone(&self.core);
+            self.state
+                .set_status_message("Checking Tun privileges…");
+            cx.notify();
+            cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_spawn(async move {
+                        let mut guard = core
+                            .lock()
+                            .map_err(|e| format!("core lock poisoned: {e}"))?;
+                        guard
+                            .request_tun_privileges_for_toggle()
+                            .map_err(|e| e.to_string())
+                    })
+                    .await;
+                this.update(cx, |this, cx| {
+                    match result {
+                        Ok(true) => {
+                            this.state.set_spmode_vpn(true);
+                            let _ = this.persist_db();
+                            this.state
+                                .set_status_message("Tun Mode enabled (core privileged)");
+                            // Upstream restarts running profile when Tun toggles.
+                            if this.state.core_status().is_running() {
+                                this.start_proxy(cx);
+                            }
+                        }
+                        Ok(false) => {
+                            // Reserved — elevation paths return Ok(true) or Err.
+                            this.state.set_spmode_vpn(false);
+                            let _ = this.persist_db();
+                            this.state.set_status_message(
+                                "Tun elevation pending — complete the admin prompt, then enable again",
+                            );
+                        }
+                        Err(e) => {
+                            this.state.set_spmode_vpn(false);
+                            let _ = this.persist_db();
+                            // Strip noisy "tun privilege required: " prefix for status bar.
+                            let msg = e
+                                .strip_prefix("tun privilege required: ")
+                                .unwrap_or(&e);
+                            this.state
+                                .set_status_message(format!("Tun privileges: {msg}"));
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
+
+        self.state.set_spmode_vpn(false);
         let _ = self.persist_db();
+        self.state.set_status_message("Tun Mode disabled");
+        if self.state.core_status().is_running() {
+            // Rebuild config without Tun inbound.
+            self.start_proxy(cx);
+        }
         cx.notify();
     }
 
