@@ -18,8 +18,9 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use gpui::{
-    AnyElement, ClipboardItem, Context, FocusHandle, KeyDownEvent, ScrollHandle, SharedString,
-    Subscription, Window, actions, div, prelude::*, px, uniform_list,
+    AnyElement, App, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler,
+    FocusHandle, Focusable, KeyDownEvent, Pixels, ScrollHandle, SharedString, Subscription,
+    UTF16Selection, Window, actions, canvas, div, prelude::*, px, uniform_list,
 };
 
 use throne_core_client::{
@@ -256,27 +257,36 @@ pub struct MainWindow {
     _appearance_sub: Option<Subscription>,
 }
 
+impl Focusable for MainWindow {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
 impl MainWindow {
     pub fn new(cx: &mut Context<Self>) -> Self {
+        // Bind destructive / list shortcuts only in the "Main" key context so they
+        // never steal Backspace/Delete/typing while a modal dialog is open.
+        // (GPUI dispatches matching KeyBindings BEFORE on_key_down listeners.)
         cx.bind_keys([
-            gpui::KeyBinding::new("cmd-r", ToggleProxy, None),
-            gpui::KeyBinding::new("ctrl-r", ToggleProxy, None),
-            gpui::KeyBinding::new("cmd-v", ImportClipboard, None),
-            gpui::KeyBinding::new("ctrl-v", ImportClipboard, None),
-            gpui::KeyBinding::new("cmd-s", SaveDb, None),
-            gpui::KeyBinding::new("ctrl-s", SaveDb, None),
-            gpui::KeyBinding::new("cmd-a", SelectAll, None),
-            gpui::KeyBinding::new("ctrl-a", SelectAll, None),
-            gpui::KeyBinding::new("backspace", DeleteSelected, None),
-            gpui::KeyBinding::new("delete", DeleteSelected, None),
-            gpui::KeyBinding::new("cmd-shift-c", CopyLogs, None),
-            gpui::KeyBinding::new("ctrl-shift-c", CopyLogs, None),
-            gpui::KeyBinding::new("cmd-t", UrlTestSelected, None),
-            gpui::KeyBinding::new("ctrl-t", UrlTestSelected, None),
-            gpui::KeyBinding::new("cmd-shift-g", UrlTestGroup, None),
-            gpui::KeyBinding::new("ctrl-shift-g", UrlTestGroup, None),
-            gpui::KeyBinding::new("cmd-shift-r", DeleteUnavailable, None),
-            gpui::KeyBinding::new("ctrl-shift-r", DeleteUnavailable, None),
+            gpui::KeyBinding::new("cmd-r", ToggleProxy, Some("Main")),
+            gpui::KeyBinding::new("ctrl-r", ToggleProxy, Some("Main")),
+            gpui::KeyBinding::new("cmd-v", ImportClipboard, Some("Main")),
+            gpui::KeyBinding::new("ctrl-v", ImportClipboard, Some("Main")),
+            gpui::KeyBinding::new("cmd-s", SaveDb, Some("Main")),
+            gpui::KeyBinding::new("ctrl-s", SaveDb, Some("Main")),
+            gpui::KeyBinding::new("cmd-a", SelectAll, Some("Main")),
+            gpui::KeyBinding::new("ctrl-a", SelectAll, Some("Main")),
+            gpui::KeyBinding::new("backspace", DeleteSelected, Some("Main")),
+            gpui::KeyBinding::new("delete", DeleteSelected, Some("Main")),
+            gpui::KeyBinding::new("cmd-shift-c", CopyLogs, Some("Main")),
+            gpui::KeyBinding::new("ctrl-shift-c", CopyLogs, Some("Main")),
+            gpui::KeyBinding::new("cmd-t", UrlTestSelected, Some("Main")),
+            gpui::KeyBinding::new("ctrl-t", UrlTestSelected, Some("Main")),
+            gpui::KeyBinding::new("cmd-shift-g", UrlTestGroup, Some("Main")),
+            gpui::KeyBinding::new("ctrl-shift-g", UrlTestGroup, Some("Main")),
+            gpui::KeyBinding::new("cmd-shift-r", DeleteUnavailable, Some("Main")),
+            gpui::KeyBinding::new("ctrl-shift-r", DeleteUnavailable, Some("Main")),
             gpui::KeyBinding::new("cmd-q", Quit, None),
         ]);
 
@@ -516,11 +526,18 @@ impl MainWindow {
         cx.notify();
     }
 
-    fn handle_routing_event(&mut self, ev: RoutingEvent, cx: &mut Context<Self>) {
+    fn handle_routing_event(
+        &mut self,
+        ev: RoutingEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Dialog::RoutingSettings(draft) = &mut self.dialog else {
             return;
         };
         let effect = draft.apply_event(ev);
+        // Keep window keyboard focus so IME + on_key_down keep delivering.
+        self.focus_handle.focus(window);
         self.dispatch_routing_effect(effect, cx);
     }
 
@@ -2112,45 +2129,13 @@ impl MainWindow {
         }
     }
 
-    fn handle_dialog_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
-        if matches!(self.dialog, Dialog::None) {
-            return false;
-        }
-        let key = event.keystroke.key.as_str();
-        if key == "escape" {
-            self.close_dialog();
-            cx.notify();
-            return true;
-        }
+    fn dialog_is_open(&self) -> bool {
+        !matches!(self.dialog, Dialog::None)
+    }
 
-        // character / backspace into focused field
-        let is_back = key == "backspace" || key == "delete";
-        let ch = if key.len() == 1
-            && !event.keystroke.modifiers.platform
-            && !event.keystroke.modifiers.control
-        {
-            key.chars().next().filter(|c| !c.is_control())
-        } else if key == "space" {
-            Some(' ')
-        } else if key == "enter"
-            && matches!(
-                self.dialog,
-                Dialog::AddFromInput { .. } | Dialog::RoutingSettings(_)
-            )
-        {
-            // allow newlines in multi-line dialogs
-            Some('\n')
-        } else if key == "enter" && matches!(self.dialog, Dialog::EditProfile { .. }) {
-            self.save_edit_profile(cx);
-            return true;
-        } else {
-            None
-        };
-
-        if !is_back && ch.is_none() {
-            return true; // swallow other keys while dialog open
-        }
-
+    /// Mutable access to the string field currently focused inside a dialog.
+    /// Used by keyboard + EntityInputHandler (IME) paths.
+    fn focused_dialog_field_mut(&mut self) -> Option<(&mut String, bool /*allow_nl*/)> {
         match &mut self.dialog {
             Dialog::BasicSettings {
                 inbound_address,
@@ -2170,20 +2155,7 @@ impl MainWindow {
                     4 => direct_dns,
                     _ => log_level,
                 };
-                if is_back {
-                    field.pop();
-                } else if let Some(c) = ch {
-                    if *focus == 1 {
-                        // port: digits only
-                        if c.is_ascii_digit() {
-                            field.push(c);
-                        }
-                    } else {
-                        field.push(c);
-                    }
-                }
-                cx.notify();
-                true
+                Some((field, false))
             }
             Dialog::ManageGroups {
                 new_name,
@@ -2196,47 +2168,64 @@ impl MainWindow {
                     MgFocus::EditName => edit_name,
                     MgFocus::EditUrl => edit_url,
                 };
-                if is_back {
-                    field.pop();
-                } else if let Some(c) = ch {
-                    if c != '\n' {
-                        field.push(c);
-                    }
-                }
-                cx.notify();
-                true
+                Some((field, false))
             }
-            Dialog::AddFromInput { text } => {
-                if is_back {
-                    text.pop();
-                } else if let Some(c) = ch {
-                    text.push(c);
-                }
-                cx.notify();
-                true
-            }
+            Dialog::AddFromInput { text } => Some((text, true)),
             Dialog::RoutingSettings(draft) => {
-                draft.handle_key(ch, is_back);
-                cx.notify();
-                true
+                // Ensure a field is focused so IME/typing always has a target.
+                if draft.focus == crate::ui::routing::RtFocus::None {
+                    draft.focus = match draft.tab {
+                        crate::ui::routing::RoutingTab::Dns => {
+                            crate::ui::routing::RtFocus::RemoteDns
+                        }
+                        crate::ui::routing::RoutingTab::Warp => {
+                            crate::ui::routing::RtFocus::WarpEp
+                        }
+                        crate::ui::routing::RoutingTab::Hijack => {
+                            crate::ui::routing::RtFocus::DnsPort
+                        }
+                        _ => crate::ui::routing::RtFocus::None,
+                    };
+                }
+                let s = &mut draft.settings;
+                let field: Option<(&mut String, bool)> = match draft.focus {
+                    crate::ui::routing::RtFocus::RemoteDns => Some((&mut s.remote_dns, false)),
+                    crate::ui::routing::RtFocus::DirectDns => Some((&mut s.direct_dns, false)),
+                    crate::ui::routing::RtFocus::LocalOverride => {
+                        Some((&mut s.core_box_underlying_dns, false))
+                    }
+                    crate::ui::routing::RtFocus::CacheCap => {
+                        // digits stored as string temporarily — handled specially
+                        None
+                    }
+                    crate::ui::routing::RtFocus::DnsObject => Some((&mut s.dns_object, true)),
+                    crate::ui::routing::RtFocus::DnsV4 => Some((&mut s.dns_v4_resp, false)),
+                    crate::ui::routing::RtFocus::DnsV6 => Some((&mut s.dns_v6_resp, false)),
+                    crate::ui::routing::RtFocus::DnsPort => None,
+                    crate::ui::routing::RtFocus::RedirectAddr => {
+                        Some((&mut s.redirect_listen_address, false))
+                    }
+                    crate::ui::routing::RtFocus::RedirectPort => None,
+                    crate::ui::routing::RtFocus::WarpEp => Some((&mut s.warp_ep, false)),
+                    crate::ui::routing::RtFocus::WarpPriv => Some((&mut s.warp_private_key, false)),
+                    crate::ui::routing::RtFocus::WarpPub => Some((&mut s.warp_public_key, false)),
+                    crate::ui::routing::RtFocus::WarpAddrs
+                    | crate::ui::routing::RtFocus::WarpReserved
+                    | crate::ui::routing::RtFocus::DnsRules
+                    | crate::ui::routing::RtFocus::None => None,
+                };
+                field
             }
             Dialog::TunSettings {
                 vpn_mtu,
                 focus_mtu,
                 ..
             } => {
-                if !*focus_mtu {
-                    return true;
+                if *focus_mtu {
+                    Some((vpn_mtu, false))
+                } else {
+                    None
                 }
-                if is_back {
-                    vpn_mtu.pop();
-                } else if let Some(c) = ch {
-                    if c.is_ascii_digit() {
-                        vpn_mtu.push(c);
-                    }
-                }
-                cx.notify();
-                true
             }
             Dialog::HotkeySettings {
                 start_stop,
@@ -2253,30 +2242,109 @@ impl MainWindow {
                     3 => url_test,
                     _ => copy_logs,
                 };
-                if is_back {
-                    field.pop();
-                } else if let Some(c) = ch {
-                    if c != '\n' {
-                        field.push(c);
-                    }
-                }
-                cx.notify();
-                true
+                Some((field, false))
             }
-            Dialog::EditProfile { name, .. } => {
-                if is_back {
-                    name.pop();
-                } else if let Some(c) = ch {
-                    if c != '\n' {
-                        name.push(c);
-                    }
-                }
-                cx.notify();
-                true
-            }
-            Dialog::ConfirmDeleteUnavailable { .. } => true,
-            Dialog::None => false,
+            Dialog::EditProfile { name, .. } => Some((name, false)),
+            Dialog::ConfirmDeleteUnavailable { .. } | Dialog::None => None,
         }
+    }
+
+    /// Insert/delete text into the focused dialog field (end-cursor model).
+    fn apply_dialog_text_edit(&mut self, text: &str, is_backspace: bool, cx: &mut Context<Self>) {
+        // Prefer RoutingDraft::handle_key for complex routing fields (lists, i32).
+        if let Dialog::RoutingSettings(draft) = &mut self.dialog {
+            draft.handle_key(if is_backspace { None } else { Some(text) }, is_backspace);
+            cx.notify();
+            return;
+        }
+
+        let digits_only = matches!(
+            &self.dialog,
+            Dialog::BasicSettings { focus: 1, .. }
+                | Dialog::TunSettings {
+                    focus_mtu: true,
+                    ..
+                }
+        );
+
+        let Some((field, allow_nl)) = self.focused_dialog_field_mut() else {
+            return;
+        };
+
+        if is_backspace {
+            field.pop();
+        } else {
+            for c in text.chars() {
+                if c == '\n' || c == '\r' {
+                    if allow_nl {
+                        field.push('\n');
+                    }
+                    continue;
+                }
+                if c.is_control() {
+                    continue;
+                }
+                if digits_only && !c.is_ascii_digit() {
+                    continue;
+                }
+                field.push(c);
+            }
+        }
+        cx.notify();
+    }
+
+    fn handle_dialog_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if matches!(self.dialog, Dialog::None) {
+            return false;
+        }
+        let key = event.keystroke.key.as_str();
+        if key == "escape" {
+            self.close_dialog();
+            cx.notify();
+            return true;
+        }
+
+        if key == "enter" && matches!(self.dialog, Dialog::EditProfile { .. }) {
+            self.save_edit_profile(cx);
+            return true;
+        }
+
+        // Prefer GPUI key_char (IME / layout-correct typed text).
+        let is_back = key == "backspace" || key == "delete";
+        let typed: Option<String> = if is_back {
+            None
+        } else if event.keystroke.modifiers.platform || event.keystroke.modifiers.control {
+            None
+        } else if let Some(kc) = event.keystroke.key_char.as_ref() {
+            if kc.chars().all(|c| c.is_control()) {
+                None
+            } else {
+                Some(kc.clone())
+            }
+        } else if key == "space" {
+            Some(" ".into())
+        } else if key == "enter"
+            && matches!(
+                self.dialog,
+                Dialog::AddFromInput { .. } | Dialog::RoutingSettings(_)
+            )
+        {
+            Some("\n".into())
+        } else if key.len() == 1 {
+            key.chars()
+                .next()
+                .filter(|c| !c.is_control())
+                .map(|c| c.to_string())
+        } else {
+            None
+        };
+
+        if !is_back && typed.is_none() {
+            return true; // swallow other keys while dialog open
+        }
+
+        self.apply_dialog_text_edit(typed.as_deref().unwrap_or(""), is_back, cx);
+        true
     }
 
     // ─── layout regions ─────────────────────────────────────────────────
@@ -2861,8 +2929,8 @@ impl MainWindow {
             }
             Dialog::RoutingSettings(draft) => {
                 let e = entity.clone();
-                routing_settings_view(draft, move |ev, _, cx| {
-                    e.update(cx, |t, cx| t.handle_routing_event(ev, cx));
+                routing_settings_view(draft, move |ev, window, cx| {
+                    e.update(cx, |t, cx| t.handle_routing_event(ev, window, cx));
                 })
                 .into_any_element()
             }
@@ -3689,6 +3757,96 @@ fn read_os_clipboard() -> Option<String> {
     None
 }
 
+/// macOS IME / system text input path for dialog fields.
+/// Without this, printable keys often never reach `on_key_down` as usable text.
+impl EntityInputHandler for MainWindow {
+    fn text_for_range(
+        &mut self,
+        range: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let (field, _) = self.focused_dialog_field_mut()?;
+        let len = field.len();
+        let start = range.start.min(len);
+        let end = range.end.min(len);
+        *adjusted_range = Some(start..end);
+        Some(field.get(start..end)?.to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let (field, _) = self.focused_dialog_field_mut()?;
+        // End-cursor model: caret always at end.
+        let n = field.encode_utf16().count();
+        Some(UTF16Selection {
+            range: n..n,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(&self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<Range<usize>> {
+        None
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+
+    fn replace_text_in_range(
+        &mut self,
+        _range: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.dialog_is_open() {
+            return;
+        }
+        if text.is_empty() {
+            // IME delete / clear
+            self.apply_dialog_text_edit("", true, cx);
+        } else {
+            self.apply_dialog_text_edit(text, false, cx);
+        }
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        new_text: &str,
+        _new_selected_range: Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Composition: treat as plain replace for our end-cursor fields.
+        self.replace_text_in_range(range, new_text, window, cx);
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        Some(element_bounds)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: gpui::Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let (field, _) = self.focused_dialog_field_mut()?;
+        Some(field.encode_utf16().count())
+    }
+}
+
 impl Render for MainWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Keep paint tokens aligned with settings + current OS appearance.
@@ -3707,8 +3865,16 @@ impl Render for MainWindow {
         let ctx_open = self.open_menu == OpenMenu::ProfileCtx;
         let toolbar_menu_open = Self::toolbar_menu_index(self.open_menu).is_some();
 
+        // Key context: destructive Main shortcuts only when no modal is open.
+        let key_ctx = if dialog_open { "Dialog" } else { "Main" };
+
+        // Entity for IME input handler registration during paint.
+        let entity = cx.entity().clone();
+        let focus_for_input = self.focus_handle.clone();
+
         div()
             .track_focus(&self.focus_handle)
+            .key_context(key_ctx)
             .on_action(cx.listener(|this, _: &ToggleProxy, _, cx| this.toggle_proxy(cx)))
             .on_action(cx.listener(|this, _: &ImportClipboard, _, cx| {
                 this.import_clipboard(cx)
@@ -3716,6 +3882,12 @@ impl Render for MainWindow {
             .on_action(cx.listener(|this, _: &SaveDb, _, cx| this.save_db(cx)))
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.select_all(cx)))
             .on_action(cx.listener(|this, _: &DeleteSelected, _, cx| {
+                // Safety: even if a binding leaks into Dialog context, never
+                // delete profiles while a modal is capturing the keyboard.
+                if this.dialog_is_open() {
+                    this.apply_dialog_text_edit("", true, cx);
+                    return;
+                }
                 this.delete_selected(cx)
             }))
             .on_action(cx.listener(|this, _: &UrlTestSelected, _, cx| {
@@ -3728,8 +3900,11 @@ impl Render for MainWindow {
             .on_action(cx.listener(|this, _: &CycleRoute, _, cx| this.cycle_route(cx)))
             .on_action(cx.listener(|this, _: &CopyLogs, _, cx| this.copy_logs(cx)))
             .on_action(cx.listener(|_this, _: &Quit, _, cx| cx.quit()))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.handle_dialog_key(event, cx) {
+                    // Mark handled so macOS doesn't drop the keystroke on the floor.
+                    cx.stop_propagation();
+                    window.prevent_default();
                     return;
                 }
                 if event.keystroke.key == "escape" {
@@ -3798,7 +3973,25 @@ impl Render for MainWindow {
                 .child(self.render_toolbar_menu_overlay(cx))
             })
             .when(ctx_open, |el| el.child(self.render_ctx_menu(cx)))
-            .when(dialog_open, |el| el.child(self.render_dialog_overlay(cx)))
+            .when(dialog_open, |el| {
+                el.child(self.render_dialog_overlay(cx))
+                    // Register IME/text input handler while a modal is open so
+                    // macOS delivers typed characters into dialog fields.
+                    .child(
+                        canvas(
+                            move |_, _, _| (),
+                            move |bounds, (), window, cx| {
+                                window.handle_input(
+                                    &focus_for_input,
+                                    ElementInputHandler::new(bounds, entity.clone()),
+                                    cx,
+                                );
+                            },
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+            })
     }
 }
 

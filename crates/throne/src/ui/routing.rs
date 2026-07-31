@@ -54,7 +54,6 @@ pub enum RtFocus {
     RemoteDns,
     DirectDns,
     LocalOverride,
-    DnsFinalOut,
     CacheCap,
     DnsObject,
     DnsRules,
@@ -266,12 +265,13 @@ impl RoutingDraft {
             .collect();
     }
 
-    /// Apply keystroke into the focused field. Returns true if handled.
-    pub fn handle_key(&mut self, ch: Option<char>, is_back: bool) -> bool {
+    /// Apply keystroke into the focused field. `text` is the typed string
+    /// (from GPUI `key_char` or a single-key fallback). Returns true if handled.
+    pub fn handle_key(&mut self, text: Option<&str>, is_back: bool) -> bool {
         // Nested editors first
         match &mut self.nested {
-            RoutingNested::ImportPaste { text } => {
-                edit_str(text, ch, is_back, true);
+            RoutingNested::ImportPaste { text: buf } => {
+                edit_str(buf, text, is_back, true);
                 return true;
             }
             RoutingNested::RouteEditor(ed) => {
@@ -285,7 +285,7 @@ impl RoutingDraft {
                     ReFocus::RuleName => {
                         if let Some(i) = ed.selected_rule {
                             if let Some(r) = ed.profile.rules.get_mut(i) {
-                                edit_str(&mut r.name, ch, is_back, false);
+                                edit_str(&mut r.name, text, is_back, false);
                             }
                         }
                         return true;
@@ -293,19 +293,19 @@ impl RoutingDraft {
                     ReFocus::RuleProtocol => {
                         if let Some(i) = ed.selected_rule {
                             if let Some(r) = ed.profile.rules.get_mut(i) {
-                                edit_str(&mut r.protocol, ch, is_back, false);
+                                edit_str(&mut r.protocol, text, is_back, false);
                             }
                         }
                         return true;
                     }
                     ReFocus::RuleDomain => {
-                        return edit_rule_list_field(ed, |r| &mut r.domain, ch, is_back);
+                        return edit_rule_list_field(ed, |r| &mut r.domain, text, is_back);
                     }
                     ReFocus::RuleSuffix => {
-                        return edit_rule_list_field(ed, |r| &mut r.domain_suffix, ch, is_back);
+                        return edit_rule_list_field(ed, |r| &mut r.domain_suffix, text, is_back);
                     }
                     ReFocus::RuleIp => {
-                        return edit_rule_list_field(ed, |r| &mut r.ip_cidr, ch, is_back);
+                        return edit_rule_list_field(ed, |r| &mut r.ip_cidr, text, is_back);
                     }
                     ReFocus::RawJson => return true,
                 };
@@ -316,7 +316,7 @@ impl RoutingDraft {
                         | ReFocus::SimpleBlock
                         | ReFocus::SimpleWarp
                 );
-                edit_str(field, ch, is_back, allow_nl);
+                edit_str(field, text, is_back, allow_nl);
                 return true;
             }
             RoutingNested::RawEditor(ed) => {
@@ -325,7 +325,7 @@ impl RoutingDraft {
                     _ => &mut ed.raw_route,
                 };
                 let allow_nl = !matches!(ed.focus, ReFocus::Name);
-                edit_str(field, ch, is_back, allow_nl);
+                edit_str(field, text, is_back, allow_nl);
                 return true;
             }
             RoutingNested::NewMenu
@@ -334,50 +334,63 @@ impl RoutingDraft {
             | RoutingNested::None => {}
         }
 
+        // No field focused: auto-focus the primary editable of the active tab
+        // (matches Qt: typing into a dialog with a default focus widget).
+        if self.focus == RtFocus::None && (is_back || text.is_some()) {
+            self.focus = match self.tab {
+                RoutingTab::Dns => RtFocus::RemoteDns,
+                RoutingTab::Warp => RtFocus::WarpEp,
+                RoutingTab::Hijack => RtFocus::DnsPort,
+                RoutingTab::Common | RoutingTab::Route => RtFocus::None,
+            };
+            if self.focus == RtFocus::None {
+                return true;
+            }
+        }
+
         let s = &mut self.settings;
         let field: Option<(&mut String, bool)> = match self.focus {
             RtFocus::RemoteDns => Some((&mut s.remote_dns, false)),
             RtFocus::DirectDns => Some((&mut s.direct_dns, false)),
             RtFocus::LocalOverride => Some((&mut s.core_box_underlying_dns, false)),
-            RtFocus::DnsFinalOut => Some((&mut s.dns_final_out, false)),
             RtFocus::CacheCap => {
-                return edit_i32_field(&mut s.dns_cache_capacity, ch, is_back);
+                return edit_i32_field(&mut s.dns_cache_capacity, text, is_back);
             }
             RtFocus::DnsObject => Some((&mut s.dns_object, true)),
             RtFocus::DnsV4 => Some((&mut s.dns_v4_resp, false)),
             RtFocus::DnsV6 => Some((&mut s.dns_v6_resp, false)),
             RtFocus::DnsPort => {
-                return edit_i32_field(&mut s.dns_server_listen_port, ch, is_back);
+                return edit_i32_field(&mut s.dns_server_listen_port, text, is_back);
             }
             RtFocus::RedirectAddr => Some((&mut s.redirect_listen_address, false)),
             RtFocus::RedirectPort => {
-                return edit_i32_field(&mut s.redirect_listen_port, ch, is_back);
+                return edit_i32_field(&mut s.redirect_listen_port, text, is_back);
             }
             RtFocus::WarpEp => Some((&mut s.warp_ep, false)),
             RtFocus::WarpPriv => Some((&mut s.warp_private_key, false)),
             RtFocus::WarpPub => Some((&mut s.warp_public_key, false)),
             RtFocus::WarpAddrs => {
                 let mut joined = s.warp_ifc_addrs.join(",");
-                edit_str(&mut joined, ch, is_back, false);
+                edit_str(&mut joined, text, is_back, false);
                 s.warp_ifc_addrs = split_csv(&joined);
                 return true;
             }
             RtFocus::WarpReserved => {
                 let mut joined = s.warp_reserved.join(",");
-                edit_str(&mut joined, ch, is_back, false);
+                edit_str(&mut joined, text, is_back, false);
                 s.warp_reserved = split_csv(&joined);
                 return true;
             }
             RtFocus::DnsRules => {
                 let mut t = self.dns_rules_text();
-                edit_str(&mut t, ch, is_back, true);
+                edit_str(&mut t, text, is_back, true);
                 self.set_dns_rules_from_text(&t);
                 return true;
             }
             RtFocus::None => None,
         };
         if let Some((f, nl)) = field {
-            edit_str(f, ch, is_back, nl);
+            edit_str(f, text, is_back, nl);
             return true;
         }
         // swallow keys while dialog open
@@ -385,24 +398,36 @@ impl RoutingDraft {
     }
 }
 
-fn edit_str(s: &mut String, ch: Option<char>, is_back: bool, allow_nl: bool) {
+fn edit_str(s: &mut String, text: Option<&str>, is_back: bool, allow_nl: bool) {
     if is_back {
         s.pop();
-    } else if let Some(c) = ch {
-        if c == '\n' && !allow_nl {
-            return;
+        return;
+    }
+    let Some(t) = text else {
+        return;
+    };
+    for c in t.chars() {
+        if c == '\n' || c == '\r' {
+            if allow_nl {
+                s.push('\n');
+            }
+            continue;
         }
-        s.push(c);
+        if !c.is_control() {
+            s.push(c);
+        }
     }
 }
 
-fn edit_i32_field(n: &mut i32, ch: Option<char>, is_back: bool) -> bool {
+fn edit_i32_field(n: &mut i32, text: Option<&str>, is_back: bool) -> bool {
     let mut s = n.to_string();
     if is_back {
         s.pop();
-    } else if let Some(c) = ch {
-        if c.is_ascii_digit() {
-            s.push(c);
+    } else if let Some(t) = text {
+        for c in t.chars() {
+            if c.is_ascii_digit() {
+                s.push(c);
+            }
         }
     }
     *n = s.parse().unwrap_or(0);
@@ -419,7 +444,7 @@ fn split_csv(s: &str) -> Vec<String> {
 fn edit_rule_list_field(
     ed: &mut RouteEditorDraft,
     get: impl FnOnce(&mut RouteRule) -> &mut Vec<String>,
-    ch: Option<char>,
+    text: Option<&str>,
     is_back: bool,
 ) -> bool {
     let Some(i) = ed.selected_rule else {
@@ -430,7 +455,7 @@ fn edit_rule_list_field(
     };
     let list = get(rule);
     let mut t = list.join("\n");
-    edit_str(&mut t, ch, is_back, true);
+    edit_str(&mut t, text, is_back, true);
     *list = t
         .lines()
         .map(|l| l.trim().to_string())
@@ -443,9 +468,40 @@ fn edit_rule_list_field(
 
 const STRATEGIES: &[&str] = &["", "prefer_ipv4", "prefer_ipv6", "ipv4_only", "ipv6_only"];
 
+/// Upstream remote_dns editable combo presets (dialog_manage_routes.ui).
+const REMOTE_DNS_PRESETS: &[&str] = &[
+    "tls://8.8.8.8",
+    "tls://1.1.1.1",
+    "8.8.8.8",
+    "1.1.1.1",
+    "https://dns.google/dns-query",
+];
+
+/// Upstream direct_dns editable combo presets.
+const DIRECT_DNS_PRESETS: &[&str] = &[
+    "localhost",
+    "223.5.5.5",
+    "119.29.29.29",
+    "178.22.122.100",
+    "77.88.8.8",
+];
+
 pub fn cycle_strategy(cur: &str) -> String {
     let i = STRATEGIES.iter().position(|s| *s == cur).unwrap_or(0);
     STRATEGIES[(i + 1) % STRATEGIES.len()].to_string()
+}
+
+fn cycle_preset(cur: &str, presets: &[&str]) -> String {
+    let i = presets.iter().position(|s| *s == cur).unwrap_or(presets.len().wrapping_sub(1));
+    presets[(i + 1) % presets.len()].to_string()
+}
+
+fn cycle_dns_final(cur: &str) -> String {
+    if cur.eq_ignore_ascii_case("direct") {
+        "remote".into()
+    } else {
+        "direct".into()
+    }
 }
 
 fn strategy_label(s: &str) -> String {
@@ -460,6 +516,7 @@ fn strategy_label(s: &str) -> String {
 
 type ClickFn = Rc<dyn Fn(&mut Window, &mut App)>;
 
+/// Labeled line-edit (upstream QLineEdit).
 fn field_row(
     id: impl Into<SharedString>,
     label: &'static str,
@@ -467,48 +524,113 @@ fn field_row(
     focused: bool,
     on_focus: ClickFn,
 ) -> impl IntoElement {
+    let id: SharedString = id.into();
     div()
-        .id(id.into())
+        .id(SharedString::from(format!("{id}-row")))
         .flex()
         .items_center()
-        .gap_3()
+        .gap_2()
         .mb_1p5()
-        .cursor_pointer()
-        .on_click(move |_, w, cx| on_focus(w, cx))
         .child(
             div()
-                .w(px(140.))
+                .w(px(120.))
                 .text_xs()
                 .text_color(Theme::text_muted())
                 .child(label),
         )
-        .child(
+        .child(line_edit(id, value, focused, None, on_focus, None))
+}
+
+/// Upstream editable QComboBox / QLineEdit chrome.
+/// Click to focus + type; optional ▼ cycles presets.
+fn line_edit(
+    id: impl Into<SharedString>,
+    value: String,
+    focused: bool,
+    placeholder: Option<&str>,
+    on_focus: ClickFn,
+    on_preset: Option<ClickFn>,
+) -> impl IntoElement {
+    let id: SharedString = id.into();
+    let box_id = SharedString::from(format!("{id}-box"));
+    let ph = placeholder.unwrap_or("").to_string();
+    let showing_placeholder = !focused && value.is_empty() && !ph.is_empty();
+    let display = if focused {
+        if value.is_empty() {
+            "▌".to_string()
+        } else {
+            format!("{value}▌")
+        }
+    } else if value.is_empty() {
+        ph
+    } else {
+        value
+    };
+
+    let preset_id = SharedString::from(format!("{id}-preset"));
+    let mut row = div().id(id).flex().items_center().gap_1().flex_1();
+
+    let input = div()
+        .id(box_id)
+        .flex_1()
+        .min_w(px(140.))
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .border_1()
+        .border_color(if focused {
+            Theme::accent()
+        } else {
+            Theme::border()
+        })
+        // Light elevated fill like QLineEdit — not disabled gray.
+        .bg(Theme::bg_elevated())
+        .text_sm()
+        .text_color(if showing_placeholder {
+            Theme::text_muted()
+        } else {
+            Theme::text()
+        })
+        .cursor_text()
+        .on_mouse_down(gpui::MouseButton::Left, {
+            let on_focus = on_focus.clone();
+            move |_, w, cx| {
+                cx.stop_propagation();
+                on_focus(w, cx);
+            }
+        })
+        .on_click({
+            let on_focus = on_focus;
+            move |_, w, cx| {
+                cx.stop_propagation();
+                on_focus(w, cx);
+            }
+        })
+        .child(display);
+
+    row = row.child(input);
+
+    if let Some(on_preset) = on_preset {
+        row = row.child(
             div()
-                .flex_1()
+                .id(preset_id)
                 .px_2()
                 .py_1()
                 .rounded_sm()
                 .border_1()
-                .border_color(if focused {
-                    Theme::accent()
-                } else {
-                    Theme::border_light()
-                })
+                .border_color(Theme::border_light())
                 .bg(Theme::bg_app())
-                .text_sm()
-                .text_color(Theme::text())
-                .child(if focused {
-                    if value.is_empty() {
-                        "▌".into()
-                    } else {
-                        format!("{value}▌")
-                    }
-                } else if value.is_empty() {
-                    "…".into()
-                } else {
-                    value
+                .text_xs()
+                .text_color(Theme::text_muted())
+                .cursor_pointer()
+                .child("▼")
+                .on_click(move |_, w, cx| {
+                    cx.stop_propagation();
+                    on_preset(w, cx);
                 }),
-        )
+        );
+    }
+    row
 }
 
 fn multi_field(
@@ -527,7 +649,20 @@ fn multi_field(
         .flex_col()
         .mb_2()
         .cursor_text()
-        .on_click(move |_, w, cx| on_focus(w, cx))
+        .on_mouse_down(gpui::MouseButton::Left, {
+            let on_focus = on_focus.clone();
+            move |_, w, cx| {
+                cx.stop_propagation();
+                on_focus(w, cx);
+            }
+        })
+        .on_click({
+            let on_focus = on_focus;
+            move |_, w, cx| {
+                cx.stop_propagation();
+                on_focus(w, cx);
+            }
+        })
         .child(
             div()
                 .text_xs()
@@ -548,9 +683,9 @@ fn multi_field(
                 .border_color(if focused {
                     Theme::accent()
                 } else {
-                    Theme::border_light()
+                    Theme::border()
                 })
-                .bg(Theme::bg_app())
+                .bg(Theme::bg_elevated())
                 .text_xs()
                 .font_family("Menlo")
                 .text_color(Theme::text())
@@ -1027,6 +1162,10 @@ fn tab_dns(
     draft: &RoutingDraft,
     on_event: &Rc<dyn Fn(RoutingEvent, &mut Window, &mut App)>,
 ) -> impl IntoElement {
+    // Layout mirrors upstream DialogManageRoutes DNS tab:
+    // editable combo (field + ▼ preset) + strategy on the same row;
+    // Local Override = QLineEdit; Default DNS = remote|direct combo;
+    // FakeIP / DNS Routing / cache flags beside related fields.
     let s = &draft.settings;
     let f = draft.focus;
     let use_obj = s.use_dns_object;
@@ -1041,25 +1180,33 @@ fn tab_dns(
                 .child("Simple DNS Settings"),
         )
         .when(!use_obj, |d| {
-            d.child(field_row(
-                "rt-rdns",
-                "Remote DNS",
-                s.remote_dns.clone(),
-                f == RtFocus::RemoteDns,
-                emit(on_event, RoutingEvent::SetFocus(RtFocus::RemoteDns)),
-            ))
-            .child(
+            d.child(
+                // Remote DNS row: [label] [editable+▼] [Query Strategy] [cycle]
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
-                    .mb_2()
+                    .mb_1p5()
                     .child(
                         div()
-                            .w(px(140.))
+                            .w(px(100.))
                             .text_xs()
                             .text_color(Theme::text_muted())
-                            .child("Remote Query Strategy"),
+                            .child("Remote DNS"),
+                    )
+                    .child(line_edit(
+                        "rt-rdns",
+                        s.remote_dns.clone(),
+                        f == RtFocus::RemoteDns,
+                        Some("tls://8.8.8.8"),
+                        emit(on_event, RoutingEvent::SetFocus(RtFocus::RemoteDns)),
+                        Some(emit(on_event, RoutingEvent::Cycle("remote_dns_preset"))),
+                    ))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(Theme::text_muted())
+                            .child("Query Strategy"),
                     )
                     .child(cycle_btn(
                         "rt-rdns-s",
@@ -1067,25 +1214,32 @@ fn tab_dns(
                         emit(on_event, RoutingEvent::Cycle("remote_dns_strategy")),
                     )),
             )
-            .child(field_row(
-                "rt-ddns",
-                "Direct DNS",
-                s.direct_dns.clone(),
-                f == RtFocus::DirectDns,
-                emit(on_event, RoutingEvent::SetFocus(RtFocus::DirectDns)),
-            ))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
-                    .mb_2()
+                    .mb_1p5()
                     .child(
                         div()
-                            .w(px(140.))
+                            .w(px(100.))
                             .text_xs()
                             .text_color(Theme::text_muted())
-                            .child("Direct Query Strategy"),
+                            .child("Direct DNS"),
+                    )
+                    .child(line_edit(
+                        "rt-ddns",
+                        s.direct_dns.clone(),
+                        f == RtFocus::DirectDns,
+                        Some("localhost"),
+                        emit(on_event, RoutingEvent::SetFocus(RtFocus::DirectDns)),
+                        Some(emit(on_event, RoutingEvent::Cycle("direct_dns_preset"))),
+                    ))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(Theme::text_muted())
+                            .child("Query Strategy"),
                     )
                     .child(cycle_btn(
                         "rt-ddns-s",
@@ -1093,25 +1247,52 @@ fn tab_dns(
                         emit(on_event, RoutingEvent::Cycle("direct_dns_strategy")),
                     )),
             )
-            .child(field_row(
-                "rt-local",
-                "Local Override",
-                s.core_box_underlying_dns.clone(),
-                f == RtFocus::LocalOverride,
-                emit(on_event, RoutingEvent::SetFocus(RtFocus::LocalOverride)),
-            ))
-            .child(field_row(
-                "rt-final",
-                "Default DNS server",
-                s.dns_final_out.clone(),
-                f == RtFocus::DnsFinalOut,
-                emit(on_event, RoutingEvent::SetFocus(RtFocus::DnsFinalOut)),
-            ))
             .child(
                 div()
                     .flex()
-                    .gap_3()
-                    .mb_2()
+                    .items_center()
+                    .gap_2()
+                    .mb_1p5()
+                    .child(
+                        div()
+                            .w(px(100.))
+                            .text_xs()
+                            .text_color(Theme::text_muted())
+                            .child("Local Override"),
+                    )
+                    .child(line_edit(
+                        "rt-local",
+                        s.core_box_underlying_dns.clone(),
+                        f == RtFocus::LocalOverride,
+                        Some("macOS Tun: e.g. 223.5.5.5"),
+                        emit(on_event, RoutingEvent::SetFocus(RtFocus::LocalOverride)),
+                        None,
+                    )),
+            )
+            .child(
+                // Default DNS server + FakeIP + DNS Routing (upstream same row)
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .mb_1p5()
+                    .flex_wrap()
+                    .child(
+                        div()
+                            .w(px(100.))
+                            .text_xs()
+                            .text_color(Theme::text_muted())
+                            .child("Default DNS server"),
+                    )
+                    .child(cycle_btn(
+                        "rt-final",
+                        if s.dns_final_out.trim().eq_ignore_ascii_case("direct") {
+                            "direct".into()
+                        } else {
+                            "remote".into()
+                        },
+                        emit(on_event, RoutingEvent::Cycle("dns_final_out")),
+                    ))
                     .child(mode_checkbox("rt-fakeip", "Enable FakeIP", s.fake_dns, {
                         let on = emit(on_event, RoutingEvent::Toggle("fake_dns"));
                         move |_, w, cx| on(w, cx)
@@ -1126,19 +1307,29 @@ fn tab_dns(
                         },
                     )),
             )
-            .child(field_row(
-                "rt-cache",
-                "Cache Capacity",
-                s.dns_cache_capacity.to_string(),
-                f == RtFocus::CacheCap,
-                emit(on_event, RoutingEvent::SetFocus(RtFocus::CacheCap)),
-            ))
             .child(
+                // Cache Capacity + disable flags (upstream same row)
                 div()
                     .flex()
-                    .gap_3()
-                    .mb_2()
+                    .items_center()
+                    .gap_2()
+                    .mb_1p5()
                     .flex_wrap()
+                    .child(
+                        div()
+                            .w(px(100.))
+                            .text_xs()
+                            .text_color(Theme::text_muted())
+                            .child("Cache Capacity"),
+                    )
+                    .child(line_edit(
+                        "rt-cache",
+                        s.dns_cache_capacity.to_string(),
+                        f == RtFocus::CacheCap,
+                        Some("65536"),
+                        emit(on_event, RoutingEvent::SetFocus(RtFocus::CacheCap)),
+                        None,
+                    ))
                     .child(mode_checkbox(
                         "rt-dcache",
                         "Disable Cache",
@@ -1899,7 +2090,13 @@ impl RoutingDraft {
             RoutingEvent::Ok => RoutingSideEffect::Commit,
             RoutingEvent::SetTab(t) => {
                 self.tab = t;
-                self.focus = RtFocus::None;
+                // Upstream gives each tab a default focus widget so typing works immediately.
+                self.focus = match t {
+                    RoutingTab::Dns => RtFocus::RemoteDns,
+                    RoutingTab::Warp => RtFocus::WarpEp,
+                    RoutingTab::Hijack => RtFocus::DnsPort,
+                    RoutingTab::Common | RoutingTab::Route => RtFocus::None,
+                };
                 RoutingSideEffect::None
             }
             RoutingEvent::SetFocus(f) => {
@@ -2047,6 +2244,18 @@ impl RoutingDraft {
             }
             "direct_dns_strategy" => {
                 s.direct_dns_strategy = cycle_strategy(&s.direct_dns_strategy);
+            }
+            // Upstream editable combo presets (▼)
+            "remote_dns_preset" => {
+                s.remote_dns = cycle_preset(&s.remote_dns, REMOTE_DNS_PRESETS);
+                self.focus = RtFocus::RemoteDns;
+            }
+            "direct_dns_preset" => {
+                s.direct_dns = cycle_preset(&s.direct_dns, DIRECT_DNS_PRESETS);
+                self.focus = RtFocus::DirectDns;
+            }
+            "dns_final_out" => {
+                s.dns_final_out = cycle_dns_final(&s.dns_final_out);
             }
             _ => {}
         }
@@ -2399,5 +2608,58 @@ impl Default for RawEditorDraft {
             prevent_modifications: false,
             focus: ReFocus::Name,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use throne_domain::AppState;
+
+    fn draft_with_settings() -> RoutingDraft {
+        let state = AppState::default();
+        RoutingDraft::from_state(&state)
+    }
+
+    #[test]
+    fn dns_fields_accept_typed_text_after_focus() {
+        let mut d = draft_with_settings();
+        d.tab = RoutingTab::Dns;
+        d.focus = RtFocus::LocalOverride;
+        d.settings.core_box_underlying_dns.clear();
+        d.handle_key(Some("223"), false);
+        d.handle_key(Some("."), false);
+        d.handle_key(Some("5"), false);
+        d.handle_key(Some("."), false);
+        d.handle_key(Some("5"), false);
+        d.handle_key(Some("."), false);
+        d.handle_key(Some("5"), false);
+        assert_eq!(d.settings.core_box_underlying_dns, "223.5.5.5");
+        d.handle_key(None, true); // pop last '5'
+        assert_eq!(d.settings.core_box_underlying_dns, "223.5.5.");
+        d.handle_key(None, true); // pop '.'
+        assert_eq!(d.settings.core_box_underlying_dns, "223.5.5");
+    }
+
+    #[test]
+    fn dns_tab_auto_focuses_remote_and_accepts_input() {
+        let mut d = draft_with_settings();
+        let _ = d.apply_event(RoutingEvent::SetTab(RoutingTab::Dns));
+        assert_eq!(d.focus, RtFocus::RemoteDns);
+        d.settings.remote_dns.clear();
+        d.handle_key(Some("8.8.8.8"), false);
+        assert_eq!(d.settings.remote_dns, "8.8.8.8");
+    }
+
+    #[test]
+    fn remote_dns_preset_cycles_upstream_list() {
+        let mut d = draft_with_settings();
+        d.settings.remote_dns = "8.8.8.8".into();
+        d.cycle("remote_dns_preset");
+        assert_eq!(d.settings.remote_dns, "1.1.1.1");
+        d.cycle("dns_final_out");
+        assert_eq!(d.settings.dns_final_out, "direct");
+        d.cycle("dns_final_out");
+        assert_eq!(d.settings.dns_final_out, "remote");
     }
 }
