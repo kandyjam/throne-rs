@@ -1327,24 +1327,6 @@ impl AppState {
         let mut protected_running_id = None;
         if let CoreStatus::Running { profile_id, .. } = &self.core_status {
             if old_ids.contains(profile_id) {
-                let running = self
-                    .profiles
-                    .get(profile_id)
-                    .ok_or(StoreError::ProfileNotFound(*profile_id))?;
-                let running_identity = profile_identity_key(running);
-                let unchanged = items.iter().any(|(name, profile_type, outbound, insecure)| {
-                    subscription_item_identity_key(*profile_type, outbound) == running_identity
-                        && running.name == *name
-                        && running.profile_type == *profile_type
-                        && running.outbound == *outbound
-                        && running.insecure == *insecure
-                });
-                if !unchanged {
-                    return Err(StoreError::Msg(
-                        "subscription would remove or change the running profile; stop it first"
-                            .into(),
-                    ));
-                }
                 protected_running_id = Some(*profile_id);
             }
         }
@@ -1353,16 +1335,44 @@ impl AppState {
         let mut retained = HashSet::new();
         for (name, profile_type, outbound, insecure) in items {
             let identity = subscription_item_identity_key(profile_type, &outbound);
+            let exact_id = available.get(&identity).and_then(|ids| {
+                ids.iter().copied().find(|id| {
+                    self.profiles.get(id).is_some_and(|profile| {
+                        profile.name == name
+                            && profile.profile_type == profile_type
+                            && profile.outbound == outbound
+                            && profile.insecure == insecure
+                    })
+                })
+            });
+            let same_name_id = available.get(&identity).and_then(|ids| {
+                ids.iter().copied().find(|id| {
+                    self.profiles
+                        .get(id)
+                        .is_some_and(|profile| profile.name == name)
+                })
+            });
             let matches_running = protected_running_id.is_some_and(|running_id| {
                 !retained.contains(&running_id)
                     && self.profiles.get(&running_id).is_some_and(|running| {
-                        running.name == name
-                            && running.profile_type == profile_type
-                            && running.outbound == outbound
-                            && running.insecure == insecure
+                        profile_identity_key(running) == identity
                     })
             });
-            let existing_id = if matches_running {
+            let existing_id = if let Some(exact_id) = exact_id {
+                if let Some(ids) = available.get_mut(&identity) {
+                    if let Some(position) = ids.iter().position(|id| *id == exact_id) {
+                        ids.remove(position);
+                    }
+                }
+                Some(exact_id)
+            } else if let Some(same_name_id) = same_name_id {
+                if let Some(ids) = available.get_mut(&identity) {
+                    if let Some(position) = ids.iter().position(|id| *id == same_name_id) {
+                        ids.remove(position);
+                    }
+                }
+                Some(same_name_id)
+            } else if matches_running {
                 let running_id = protected_running_id.expect("running ID checked above");
                 if let Some(ids) = available.get_mut(&identity) {
                     if let Some(position) = ids.iter().position(|id| *id == running_id) {
@@ -1408,6 +1418,14 @@ impl AppState {
             }
         }
 
+        if let Some(running_id) = protected_running_id {
+            if !retained.contains(&running_id) {
+                retained.insert(running_id);
+                report.result_order.push(running_id);
+                report.unchanged += 1;
+            }
+        }
+
         for id in old_ids {
             if !retained.contains(&id) {
                 if let Some(profile) = self.profiles.remove(&id) {
@@ -1424,6 +1442,15 @@ impl AppState {
         group.sub_last_update = updated_at;
         if self.selected_profile_id.is_some_and(|id| !self.profiles.contains_key(&id)) {
             self.selected_profile_id = group.profile_ids.first().copied();
+        }
+        if let CoreStatus::Running {
+            profile_id,
+            profile_name,
+        } = &mut self.core_status
+        {
+            if let Some(profile) = self.profiles.get(profile_id) {
+                *profile_name = profile.name.clone();
+            }
         }
         Ok(report)
     }
@@ -1958,7 +1985,7 @@ mod tests {
     }
 
     #[test]
-    fn subscription_snapshot_rejects_removing_the_running_profile_without_mutation() {
+    fn subscription_snapshot_retains_running_profile_removed_by_remote_snapshot() {
         let mut state = AppState::empty();
         let group_id = state.add_group("subscription");
         let running_id = state.add_profile(group_id, "running", ProfileType::Vless);
@@ -1967,16 +1994,14 @@ mod tests {
             profile_name: "running".into(),
         });
 
-        let result = state.apply_subscription_snapshot(
-            group_id,
-            Vec::new(),
-            "new-info".into(),
-            123,
-        );
+        let report = state
+            .apply_subscription_snapshot(group_id, Vec::new(), "new-info".into(), 123)
+            .unwrap();
 
-        assert!(result.is_err());
         assert!(state.profile(running_id).is_some());
         assert_eq!(state.group(group_id).unwrap().profile_ids, vec![running_id]);
+        assert!(report.deleted.is_empty());
+        assert_eq!(report.result_order, vec![running_id]);
     }
 
     #[test]
@@ -2016,6 +2041,172 @@ mod tests {
         assert_eq!(report.result_order, vec![ids[1]]);
         assert!(state.profile(ids[1]).is_some());
         assert!(state.profile(ids[0]).is_none());
+    }
+
+    #[test]
+    fn subscription_snapshot_updates_running_profile_when_identity_is_unchanged() {
+        let mut state = AppState::empty();
+        let group_id = state.add_group("subscription");
+        let old = ParsedOutbound {
+            server: Some("same.example".into()),
+            server_port: Some(443),
+            uuid: Some("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into()),
+            sni: Some("old.example".into()),
+            ..Default::default()
+        };
+        state
+            .replace_group_profiles(
+                group_id,
+                vec![("old name".into(), ProfileType::Vless, old.clone(), false)],
+            )
+            .unwrap();
+        let running_id = state.group(group_id).unwrap().profile_ids[0];
+        state.set_core_status(CoreStatus::Running {
+            profile_id: running_id,
+            profile_name: "old name".into(),
+        });
+        let mut changed = old;
+        changed.sni = Some("new.example".into());
+
+        let report = state
+            .apply_subscription_snapshot(
+                group_id,
+                vec![("new name".into(), ProfileType::Vless, changed, false)],
+                String::new(),
+                123,
+            )
+            .unwrap();
+
+        assert_eq!(report.result_order, vec![running_id]);
+        assert_eq!(report.updated.len(), 1);
+        assert_eq!(state.profile(running_id).unwrap().name, "new name");
+        assert!(matches!(
+            state.core_status(),
+            CoreStatus::Running { profile_name, .. } if profile_name == "new name"
+        ));
+    }
+
+    #[test]
+    fn subscription_snapshot_does_not_swap_duplicate_identity_profiles() {
+        let mut state = AppState::empty();
+        let group_id = state.add_group("subscription");
+        let shared = ParsedOutbound {
+            server: Some("same.example".into()),
+            server_port: Some(443),
+            uuid: Some("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into()),
+            ..Default::default()
+        };
+        state
+            .replace_group_profiles(
+                group_id,
+                vec![
+                    ("first".into(), ProfileType::Vless, shared.clone(), false),
+                    ("running".into(), ProfileType::Vless, shared.clone(), false),
+                ],
+            )
+            .unwrap();
+        let ids = state.group(group_id).unwrap().profile_ids.clone();
+        state.set_core_status(CoreStatus::Running {
+            profile_id: ids[1],
+            profile_name: "running".into(),
+        });
+        let mut changed_running = shared.clone();
+        changed_running.sni = Some("changed.example".into());
+
+        let report = state
+            .apply_subscription_snapshot(
+                group_id,
+                vec![
+                    ("first".into(), ProfileType::Vless, shared, false),
+                    (
+                        "running".into(),
+                        ProfileType::Vless,
+                        changed_running,
+                        false,
+                    ),
+                ],
+                String::new(),
+                123,
+            )
+            .unwrap();
+
+        assert_eq!(report.result_order, ids);
+        assert_eq!(state.profile(ids[0]).unwrap().name, "first");
+        assert_eq!(state.profile(ids[1]).unwrap().name, "running");
+        assert_eq!(
+            state.profile(ids[1]).unwrap().outbound.sni.as_deref(),
+            Some("changed.example")
+        );
+    }
+
+    #[test]
+    fn subscription_snapshot_matches_changed_duplicate_identities_by_name() {
+        let mut state = AppState::empty();
+        let group_id = state.add_group("subscription");
+        let first = ParsedOutbound {
+            server: Some("same.example".into()),
+            server_port: Some(443),
+            uuid: Some("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into()),
+            sni: Some("old-first.example".into()),
+            ..Default::default()
+        };
+        let mut running = first.clone();
+        running.sni = Some("old-running.example".into());
+        state
+            .replace_group_profiles(
+                group_id,
+                vec![
+                    ("first".into(), ProfileType::Vless, first.clone(), false),
+                    (
+                        "running".into(),
+                        ProfileType::Vless,
+                        running.clone(),
+                        false,
+                    ),
+                ],
+            )
+            .unwrap();
+        let ids = state.group(group_id).unwrap().profile_ids.clone();
+        state.set_core_status(CoreStatus::Running {
+            profile_id: ids[1],
+            profile_name: "running".into(),
+        });
+        let mut changed_first = first;
+        changed_first.sni = Some("new-first.example".into());
+        let mut changed_running = running;
+        changed_running.sni = Some("new-running.example".into());
+
+        let report = state
+            .apply_subscription_snapshot(
+                group_id,
+                vec![
+                    (
+                        "first".into(),
+                        ProfileType::Vless,
+                        changed_first,
+                        false,
+                    ),
+                    (
+                        "running".into(),
+                        ProfileType::Vless,
+                        changed_running,
+                        false,
+                    ),
+                ],
+                String::new(),
+                123,
+            )
+            .unwrap();
+
+        assert_eq!(report.result_order, ids);
+        assert_eq!(
+            state.profile(ids[0]).unwrap().outbound.sni.as_deref(),
+            Some("new-first.example")
+        );
+        assert_eq!(
+            state.profile(ids[1]).unwrap().outbound.sni.as_deref(),
+            Some("new-running.example")
+        );
     }
 
     #[test]
