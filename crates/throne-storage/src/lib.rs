@@ -869,7 +869,34 @@ pub fn load_or_seed_demo(db: &Database) -> Result<AppState, StorageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use throne_domain::ProfileType;
+    use throne_domain::{ProfileSortColumn, ProfileType};
+
+    #[test]
+    fn sorted_profile_order_survives_database_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("throne.db");
+        let mut state = AppState::empty();
+        let group = state.add_group("G");
+        let slow = state.add_profile(group, "slow", ProfileType::Vless);
+        let fast = state.add_profile(group, "fast", ProfileType::Vless);
+        state.set_profile_latency(slow, 200);
+        state.set_profile_latency(fast, 40);
+        state
+            .sort_active_group_profiles(ProfileSortColumn::TestResult, true)
+            .unwrap();
+
+        Database::open(&path).unwrap().save_state(&state).unwrap();
+        let reopened = Database::open(&path).unwrap().load_state().unwrap();
+
+        assert_eq!(
+            reopened
+                .visible_profiles()
+                .iter()
+                .map(|profile| profile.id)
+                .collect::<Vec<_>>(),
+            vec![fast, slow],
+        );
+    }
 
     #[test]
     fn roundtrip_profiles_compatible_schema() {

@@ -22,7 +22,10 @@ pub use privilege::{
     reexec_off_nosuid_volume, request_core_privileges,
 };
 pub use proto_wire::{ConnectionRow, IpTestResult, SpeedTestResult, UrlTestResult};
-pub use sys_proxy::{force_clear_system_proxy, set_system_proxy};
+pub use sys_proxy::{
+    force_clear_system_proxy, proxy_client_host, set_system_proxy, set_tun_system_dns,
+    tun_dns_address,
+};
 
 use std::io::{Read, Write};
 use std::net::Shutdown;
@@ -196,8 +199,8 @@ pub struct LoadConfigRequest {
     pub disable_stats: bool,
 }
 
-/// A live IPC process is reusable after a successful Stop. Only an active
-/// profile needs an in-band Stop before a new Start.
+/// Match upstream: only stop before Start when a profile is still tracked.
+/// A completed Stop leaves the core IPC process alive and ready for reuse.
 fn should_stop_before_start(running_profile: Option<ProfileId>) -> bool {
     running_profile.is_some()
 }
@@ -411,8 +414,8 @@ impl CoreSession {
 
         self.ensure_connected()?;
 
-        // A caller that did not complete Stop may have left boxInstance up.
-        // After a completed Stop, retain the live IPC process for the next Start.
+        // Switching an active profile requires an in-band Stop. An idle IPC
+        // session is reused directly, matching the upstream Qt client.
         if should_stop_before_start(self.running_profile) {
             let _ = self.call(
                 "Stop",
@@ -429,29 +432,44 @@ impl CoreSession {
             &built.xray_config,
             &built.tun_ipv4_cidr,
         );
-        let resp = match self.call("Start", &payload, Duration::from_secs(30)) {
+        // 12s is enough for normal Start; longer hangs freeze node switching UI.
+        let resp = match self.call("Start", &payload, Duration::from_secs(12)) {
             Ok(r) => r,
             Err(e) => {
-                // Don't leave system proxy pointing at a dead port.
+                // Don't leave system proxy / Tun DNS pointing at a dead stack.
                 force_clear_system_proxy();
+                let _ = set_tun_system_dns(false, "");
                 return Err(e);
             }
         };
         let err = proto_wire::decode_error_resp(&resp)?;
         if !err.is_empty() {
-            // "instance already started" → recycle core once and retry.
-            if err.contains("already started") {
-                warn!("Start: instance already started — recycling core");
-                self.force_kill_core();
-                self.ensure_connected()?;
-                let resp2 = self.call("Start", &payload, Duration::from_secs(30))?;
+            // "already started" → one quick Stop, then one Start retry (no full
+            // process recycle unless Stop itself fails).
+            if err.to_ascii_lowercase().contains("already started") {
+                warn!("Start: instance already started — Stop then retry once");
+                let stop_ok = self
+                    .call(
+                        "Stop",
+                        &proto_wire::encode_empty_req(),
+                        Duration::from_secs(2),
+                    )
+                    .is_ok();
+                if !stop_ok {
+                    self.force_kill_core();
+                    self.ensure_connected()?;
+                }
+                self.running_profile = None;
+                let resp2 = self.call("Start", &payload, Duration::from_secs(12))?;
                 let err2 = proto_wire::decode_error_resp(&resp2)?;
                 if !err2.is_empty() {
                     force_clear_system_proxy();
+                    let _ = set_tun_system_dns(false, "");
                     return Err(CoreError::Rpc(format_core_error(&err2)));
                 }
             } else {
                 force_clear_system_proxy();
+                let _ = set_tun_system_dns(false, "");
                 return Err(CoreError::Rpc(format_core_error(&err)));
             }
         }
@@ -466,6 +484,19 @@ impl CoreSession {
             };
             if let Err(e) = set_system_proxy(true, host, settings.inbound_socks_port) {
                 warn!(%e, "system proxy enable failed (core is still running)");
+            }
+        }
+
+        // Client-side Tun DNS (macOS): point Wi-Fi/Ethernet at tunIP+1 so apps
+        // hit hijack-dns even when an older ThroneCore skipped SetSystemDNS.
+        if settings.tun_mode_enabled && !built.tun_ipv4_cidr.is_empty() {
+            if let Err(e) = set_tun_system_dns(true, &built.tun_ipv4_cidr) {
+                warn!(%e, "Tun system DNS enable failed — DNS may leak/pollute");
+            } else {
+                info!(
+                    dns = %tun_dns_address(&built.tun_ipv4_cidr).unwrap_or_default(),
+                    "Tun system DNS applied on primary NICs"
+                );
             }
         }
 
@@ -605,17 +636,21 @@ impl CoreSession {
     /// 3. **Keep ThroneCore alive** for the next Start (cold spawn is the main lag).
     ///    Only force-kill when Stop RPC fails (wedged core).
     pub fn stop_profile(&mut self, settings: &AppSettings) -> Result<(), CoreError> {
-        // 1) Always drop system proxy first — networksetup must not run after a
-        //    long blocked Stop, or the UI feels frozen for 15s+.
+        // 1) Always drop system proxy + Tun DNS first — browsers unblock even if
+        //    core Stop wedges. Keep networksetup on primary NICs only.
         let host = if settings.inbound_address.trim().is_empty() {
             "127.0.0.1"
         } else {
             settings.inbound_address.trim()
         };
-        // Clear proxy thoroughly — leftover system proxy to :2080 = no web at all.
         if let Err(e) = set_system_proxy(false, host, settings.inbound_socks_port) {
-            warn!(%e, "system proxy clear on stop failed — force clear all services");
+            warn!(%e, "system proxy clear on stop failed — force clear primary services");
             force_clear_system_proxy();
+        }
+        // Always try to clear Tun DNS (idempotent Empty). Leaving 172.19.0.2
+        // after Stop = total DNS blackhole.
+        if let Err(e) = set_tun_system_dns(false, "") {
+            warn!(%e, "Tun system DNS clear on stop failed");
         }
 
         // 2) Stop RPC — sing-box CloseWithTimeout is ~2s server-side.
@@ -1037,6 +1072,12 @@ fn clear_quarantine(path: &Path) {
 }
 
 fn read_child_stderr(child: &mut Child) -> String {
+    // Reading a piped stream to EOF blocks while the core is still alive. RPC
+    // timeouts must return promptly, matching the upstream client behavior.
+    if !matches!(child.try_wait(), Ok(Some(_))) {
+        return String::new();
+    }
+
     let mut s = String::new();
     if let Some(mut err) = child.stderr.take() {
         let _ = err.read_to_string(&mut s);
@@ -1067,6 +1108,28 @@ pub fn looks_like_core(path: &Path) -> bool {
 mod tests {
     use super::*;
     use throne_domain::{ParsedOutbound, Profile, ProfileType};
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostic_output_does_not_wait_for_a_live_core_process() {
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 2"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn live child");
+        let started = Instant::now();
+
+        let output = read_child_stderr(&mut child);
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "reading diagnostics waited for the live child to exit"
+        );
+        assert!(output.is_empty());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 
     #[test]
     fn build_and_encode_start_payload() {
@@ -1116,8 +1179,10 @@ mod tests {
     }
 
     #[test]
-    fn starting_after_a_completed_stop_does_not_stop_the_live_ipc_session_again() {
+    fn stop_before_start_only_when_profile_is_tracked() {
+        // Cold or idle IPC session: no Stop needed.
         assert!(!should_stop_before_start(None));
+        // An actively tracked profile must be stopped before switching.
         assert!(should_stop_before_start(Some(42)));
     }
 }

@@ -25,7 +25,10 @@ use gpui::{
 use throne_core_client::{
     ConnectionRow, CoreConfig, CoreSession, force_clear_system_proxy, set_system_proxy,
 };
-use throne_domain::{AppState, CoreStatus, GroupId, Profile, ProfileId, TrafficSnapshot};
+use throne_domain::{
+    AppState, CoreStatus, GroupId, Profile, ProfileId, ProfileSortColumn, ProfileType,
+    TrafficSnapshot,
+};
 use throne_import::import_from_url;
 
 use crate::theme::{self, Theme, latency_color};
@@ -81,7 +84,7 @@ enum MgFocus {
 }
 
 /// Profile table sort column (click header to toggle).
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum SortColumn {
     #[default]
     None,
@@ -90,6 +93,29 @@ enum SortColumn {
     Name,
     TestResult,
     Traffic,
+}
+
+fn next_sort_state(
+    current: SortColumn,
+    ascending: bool,
+    clicked: SortColumn,
+) -> (SortColumn, bool) {
+    if current == clicked {
+        (clicked, !ascending)
+    } else {
+        (clicked, true)
+    }
+}
+
+fn domain_sort_column(column: SortColumn) -> Option<ProfileSortColumn> {
+    match column {
+        SortColumn::None => None,
+        SortColumn::Type => Some(ProfileSortColumn::Type),
+        SortColumn::Address => Some(ProfileSortColumn::Address),
+        SortColumn::Name => Some(ProfileSortColumn::Name),
+        SortColumn::TestResult => Some(ProfileSortColumn::TestResult),
+        SortColumn::Traffic => Some(ProfileSortColumn::Traffic),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,12 +127,49 @@ enum CoreAction {
 
 fn next_core_action(status: &CoreStatus, profile_id: ProfileId) -> CoreAction {
     match status {
+        // Clicking another node while running/starting always means "switch to that node".
         CoreStatus::Running {
             profile_id: running_id,
             ..
         } if *running_id != profile_id => CoreAction::Switch(profile_id),
-        CoreStatus::Running { .. } | CoreStatus::Starting => CoreAction::Stop,
+        CoreStatus::Starting => CoreAction::Switch(profile_id),
+        CoreStatus::Running { .. } => CoreAction::Stop,
         CoreStatus::Stopped | CoreStatus::Stopping | CoreStatus::Error(_) => CoreAction::Start,
+    }
+}
+
+const FAILED_STOP_PROFILE_LOG: &str =
+    "<<<<<<<< Failed to stop, please restart the program.";
+
+fn runtime_profile_display(profile_type: ProfileType, profile_name: &str) -> String {
+    format!("[{}] {profile_name}", profile_type.display_name())
+}
+
+fn resolve_stop_profile_display(
+    running_profile_display: Option<&String>,
+    current_profile_display: Option<String>,
+) -> Option<String> {
+    running_profile_display.cloned().or(current_profile_display)
+}
+
+fn start_profile_log(profile_display: &str) -> String {
+    format!(">>>>>>>> Starting profile {profile_display}")
+}
+
+fn stop_profile_log(profile_display: &str) -> String {
+    format!(">>>>>>>> Stopping profile {profile_display}")
+}
+
+fn failed_start_profile_log(profile_display: &str) -> String {
+    format!("<<<<<<<< Failed to start profile {profile_display}")
+}
+
+fn running_mode_marker(tun_enabled: bool, system_proxy_enabled: bool) -> &'static str {
+    match (tun_enabled, system_proxy_enabled) {
+        (true, true) => "[Tun+System Proxy]",
+        (true, false) => "[Tun]",
+        (false, true) => "[System Proxy]",
+        (false, false) => "",
     }
 }
 
@@ -118,16 +181,28 @@ fn should_update_rendered_log_text(logs_tab_active: bool) -> bool {
     logs_tab_active
 }
 
+/// Latest node the user wants after the current core op finishes.
+///
+/// Always keeps the **most recent** click (rapid switching must not stick on
+/// the first target — that left the UI on "Starting…" while ignoring later nodes).
 #[derive(Default)]
 struct PendingProfileSwitch(Option<ProfileId>);
 
 impl PendingProfileSwitch {
+    /// Record `profile_id` as the desired target. Returns `true` when the caller
+    /// should kick off stop→start (no prior target was queued).
     fn schedule(&mut self, profile_id: ProfileId) -> bool {
-        if self.0.is_some() {
-            return false;
-        }
+        let was_empty = self.0.is_none();
         self.0 = Some(profile_id);
-        true
+        was_empty
+    }
+
+    fn set(&mut self, profile_id: ProfileId) {
+        self.0 = Some(profile_id);
+    }
+
+    fn peek(&self) -> Option<ProfileId> {
+        self.0
     }
 
     fn clear(&mut self) {
@@ -159,6 +234,10 @@ pub struct MainWindow {
     core_op_busy: bool,
     /// When Tun/Proxy mode changes during a busy start/stop, restart once idle.
     restart_when_idle: bool,
+    /// User asked to Stop while Start was still in flight — run stop once idle.
+    pending_stop: bool,
+    /// Display captured from the profile actually passed to the running core.
+    running_profile_display: Option<String>,
     /// Target profile to start once the current core has fully stopped.
     pending_profile_switch: PendingProfileSwitch,
     /// Frame index for the Start/Stop transition indicator.
@@ -231,6 +310,8 @@ impl MainWindow {
             core: Arc::new(Mutex::new(CoreSession::new(core_cfg))),
             core_op_busy: false,
             restart_when_idle: false,
+            pending_stop: false,
+            running_profile_display: None,
             pending_profile_switch: PendingProfileSwitch::default(),
             loading_frame: 0,
             background_busy: false,
@@ -305,63 +386,30 @@ impl MainWindow {
     }
 
     fn toggle_sort(&mut self, col: SortColumn, cx: &mut Context<Self>) {
-        if self.sort_column == col {
-            if self.sort_asc {
-                self.sort_asc = false;
-            } else {
-                // third click clears sort (back to group order)
-                self.sort_column = SortColumn::None;
-                self.sort_asc = true;
-            }
-        } else {
-            self.sort_column = col;
-            // Latency: ascending = fastest first; strings: A→Z
-            self.sort_asc = true;
+        (self.sort_column, self.sort_asc) = next_sort_state(self.sort_column, self.sort_asc, col);
+        let result = domain_sort_column(self.sort_column)
+            .ok_or_else(|| "no sortable column selected".to_string())
+            .and_then(|column| {
+                self.state
+                    .sort_active_group_profiles(column, self.sort_asc)
+                    .map_err(|error| error.to_string())
+            })
+            .and_then(|()| self.persist_db());
+        if let Err(error) = result {
+            self.state
+                .set_status_message(format!("Sort failed: {error}"));
         }
         cx.notify();
     }
 
-    /// Visible profiles with optional column sort applied.
+    /// Visible profiles follow the active group's persisted profile ID order.
     fn sorted_profiles(&self) -> Vec<Profile> {
-        let mut profiles: Vec<Profile> = self
+        self
             .state
             .visible_profiles()
             .into_iter()
             .cloned()
-            .collect();
-        if self.sort_column == SortColumn::None {
-            return profiles;
-        }
-        let asc = self.sort_asc;
-        profiles.sort_by(|a, b| {
-            let ord = match self.sort_column {
-                SortColumn::None => std::cmp::Ordering::Equal,
-                SortColumn::Type => a
-                    .profile_type
-                    .display_name()
-                    .cmp(b.profile_type.display_name()),
-                SortColumn::Address => a
-                    .display_address()
-                    .to_lowercase()
-                    .cmp(&b.display_address().to_lowercase()),
-                SortColumn::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-                SortColumn::TestResult => {
-                    // Untested (0) sorts after measured values; fail (<0) last.
-                    latency_sort_key(a.latency_ms).cmp(&latency_sort_key(b.latency_ms))
-                }
-                SortColumn::Traffic => {
-                    let ta = a.traffic_downlink.saturating_add(a.traffic_uplink);
-                    let tb = b.traffic_downlink.saturating_add(b.traffic_uplink);
-                    ta.cmp(&tb)
-                }
-            };
-            if asc {
-                ord
-            } else {
-                ord.reverse()
-            }
-        });
-        profiles
+            .collect()
     }
 
     fn sort_label(&self, col: SortColumn, base: &str) -> String {
@@ -992,19 +1040,28 @@ impl MainWindow {
     pub(crate) fn toggle_proxy(&mut self, cx: &mut Context<Self>) {
         self.close_menus();
         if self.core_op_busy {
-            self.state
-                .set_status_message("Core is busy (start/stop in progress)…");
+            if matches!(self.state.core_status(), CoreStatus::Starting) {
+                // Cancel in-flight start → stop when it finishes.
+                self.pending_stop = true;
+                self.restart_when_idle = false;
+                self.pending_profile_switch.clear();
+                self.state
+                    .set_status_message_only("Stop queued — finishing current start first…");
+            } else {
+                self.state
+                    .set_status_message_only("Core is busy (start/stop in progress)…");
+            }
             cx.notify();
             return;
         }
         if self.state.core_status().is_running()
             || matches!(self.state.core_status(), CoreStatus::Starting)
         {
-            // Allow Stop even from Starting if user wants to cancel.
             if matches!(self.state.core_status(), CoreStatus::Stopping) {
                 return;
             }
             self.pending_profile_switch.clear();
+            self.pending_stop = false;
             self.stop_proxy(cx);
         } else {
             self.start_proxy(cx);
@@ -1019,44 +1076,77 @@ impl MainWindow {
     }
 
     fn switch_profile(&mut self, profile_id: ProfileId, cx: &mut Context<Self>) {
+        // Highlight the node immediately so rapid clicks feel responsive.
+        let _ = self.state.select_profile(profile_id);
+        let name = self
+            .state
+            .profile(profile_id)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| format!("#{profile_id}"));
+
+        // Always keep the latest desired node (overwrite prior queue entry).
+        let kick_stop = self.pending_profile_switch.schedule(profile_id);
+        self.pending_stop = false;
+        self.restart_when_idle = false;
+
         if self.core_op_busy {
             self.state
-                .set_status_message("Core is busy (start/stop in progress)…");
+                .set_status_message_only(format!("Switch queued → {name}"));
             cx.notify();
             return;
         }
-        if self.pending_profile_switch.schedule(profile_id) {
-            self.stop_proxy(cx);
+
+        if self.state.core_status().is_running()
+            || matches!(self.state.core_status(), CoreStatus::Starting)
+        {
+            if kick_stop || matches!(self.state.core_status(), CoreStatus::Running { .. }) {
+                self.state
+                    .set_status_message_only(format!("Switching → {name}…"));
+                self.stop_proxy(cx);
+            }
+        } else {
+            // Idle: start the queued profile directly.
+            let _ = self.pending_profile_switch.take();
+            self.start_proxy(cx);
         }
+        cx.notify();
     }
 
     fn start_proxy(&mut self, cx: &mut Context<Self>) {
         if self.core_op_busy {
-            // Tun/Proxy toggles must not be lost while Start/Stop is in flight.
+            // Tun/Proxy mode changes during busy start/stop → restart once idle.
             self.restart_when_idle = true;
             return;
         }
+        // Prefer an explicit switch target over whatever row is selected.
+        if let Some(id) = self.pending_profile_switch.take() {
+            let _ = self.state.select_profile(id);
+        }
         let Some(id) = self.state.selected_profile_id() else {
             self.state
-                .set_status_message("Select a profile before Start");
+                .set_status_message_only("Select a profile before Start");
             cx.notify();
             return;
         };
         let Some(profile) = self.state.profile(id).cloned() else {
-            self.state.set_status_message("Profile not found");
+            self.state.set_status_message_only("Profile not found");
             cx.notify();
             return;
         };
 
         self.core_op_busy = true;
+        self.pending_stop = false;
         self.state.set_core_status(CoreStatus::Starting);
+        let profile_display = runtime_profile_display(profile.profile_type, &profile.name);
+        self.running_profile_display = Some(profile_display.clone());
+        self.state.push_log(start_profile_log(&profile_display));
         self.state
-            .set_status_message(format!("Starting {} …", profile.name));
+            .set_status_message_only(format!("Starting {} …", profile.name));
         cx.notify();
 
+        // Snapshot settings at kickoff; re-read proxy/tun flags after Start for apply.
         let settings = self.state.settings().clone();
         let route = self.state.active_route().cloned();
-        let apply_proxy = settings.system_proxy_enabled;
         let core = Arc::clone(&self.core);
         let profile_name = profile.name.clone();
         let profile_id = profile.id;
@@ -1073,45 +1163,113 @@ impl MainWindow {
                     let mut guard = core
                         .lock()
                         .map_err(|e| format!("core lock poisoned: {e}"))?;
+                    // Always pass apply_system_proxy=false here; we apply from
+                    // live settings after Start so mid-start toggles win.
                     guard
-                        .start_profile(&profile, &settings, route.as_ref(), apply_proxy)
+                        .start_profile(&profile, &settings, route.as_ref(), false)
                         .map_err(|e| e.to_string())
                 })
                 .await;
 
             this.update(cx, |this, cx| {
                 this.core_op_busy = false;
+                if let Err(e) = &result {
+                    this.state
+                        .push_log(failed_start_profile_log(&profile_display));
+                    this.state
+                        .set_status_message_only(format!("Start failed: {e}"));
+                }
+
+                // 1) User asked to stop while we were starting.
+                if this.pending_stop {
+                    this.pending_stop = false;
+                    this.restart_when_idle = false;
+                    match &result {
+                        Ok(()) => {
+                            this.state.set_core_status(CoreStatus::Running {
+                                profile_id,
+                                profile_name: profile_name.clone(),
+                            });
+                        }
+                        Err(e) => {
+                            this.state.set_core_status(CoreStatus::Error(e.clone()));
+                        }
+                    }
+                    this.stop_proxy(cx);
+                    return;
+                }
+
+                // 2) User clicked another node while starting — switch to latest.
+                if let Some(want) = this.pending_profile_switch.peek() {
+                    if want != profile_id {
+                        if result.is_ok() {
+                            this.state.set_core_status(CoreStatus::Running {
+                                profile_id,
+                                profile_name: profile_name.clone(),
+                            });
+                            this.stop_proxy(cx); // stop complete → starts `want`
+                        } else {
+                            // Start failed; just start the desired node.
+                            let want = this.pending_profile_switch.take().unwrap_or(want);
+                            let _ = this.state.select_profile(want);
+                            this.state.set_core_status(CoreStatus::Stopped);
+                            this.start_proxy(cx);
+                        }
+                        return;
+                    }
+                    this.pending_profile_switch.clear();
+                }
+
                 match result {
                     Ok(()) => {
                         this.state.set_core_status(CoreStatus::Running {
                             profile_id,
                             profile_name: profile_name.clone(),
                         });
-                        let tun = this.state.settings().tun_mode_enabled;
+                        // Apply system proxy from *current* settings (not kickoff snapshot).
+                        let live = this.state.settings();
+                        let tun = live.tun_mode_enabled;
+                        let proxy_on = live.system_proxy_enabled;
+                        if proxy_on {
+                            let host = throne_core_client::proxy_client_host(&live.inbound_address);
+                            let port = live.inbound_socks_port;
+                            cx.background_spawn(async move {
+                                if let Err(e) =
+                                    throne_core_client::set_system_proxy(true, &host, port)
+                                {
+                                    tracing::warn!(%e, "system proxy enable after Start failed");
+                                }
+                            })
+                            .detach();
+                        }
+                        let show_addr = throne_core_client::proxy_client_host(&addr);
+                        let marker = running_mode_marker(tun, proxy_on);
                         let mut msg = format!(
-                            "Running · {profile_name} · route {route_label} · mixed {addr}:{port}"
+                            "Running · {profile_name} · route {route_label} · mixed {show_addr}:{port}"
                         );
-                        if tun {
-                            msg.push_str(" · Tun ON");
+                        if !marker.is_empty() {
+                            msg.push_str(" · ");
+                            msg.push_str(marker);
                         }
-                        if apply_proxy {
-                            msg.push_str(" · system proxy ON");
-                        } else if !tun {
-                            msg.push_str(
-                                " · tip: enable Tun or System Proxy, or point apps to this port",
-                            );
-                        }
-                        this.state.set_status_message(msg);
+                        this.state.set_status_message_only(msg);
                         let _ = this.persist_db();
                     }
                     Err(e) => {
                         this.state.set_core_status(CoreStatus::Error(e.clone()));
-                        this.state.set_status_message(format!("Start failed: {e}"));
+                        this.state
+                            .set_status_message_only(format!("Start failed: {e}"));
                     }
                 }
                 if this.restart_when_idle {
                     this.restart_when_idle = false;
-                    this.start_proxy(cx);
+                    // Mode changed mid-start — bounce with latest settings.
+                    if this.state.core_status().is_running() {
+                        this.pending_profile_switch.set(profile_id);
+                        this.stop_proxy(cx);
+                    } else {
+                        this.start_proxy(cx);
+                    }
+                    return;
                 }
                 cx.notify();
             })
@@ -1121,12 +1279,37 @@ impl MainWindow {
     }
 
     fn stop_proxy(&mut self, cx: &mut Context<Self>) {
-        if self.core_op_busy && matches!(self.state.core_status(), CoreStatus::Stopping) {
+        if self.core_op_busy {
+            if matches!(self.state.core_status(), CoreStatus::Stopping) {
+                return;
+            }
+            // Start still running — queue stop (or keep switch target).
+            if self.pending_profile_switch.peek().is_none() {
+                self.pending_stop = true;
+                self.state
+                    .set_status_message_only("Stop queued — finishing current op…");
+            }
+            cx.notify();
             return;
         }
+        let stop_profile_id = match self.state.core_status() {
+            CoreStatus::Running { profile_id, .. } => Some(*profile_id),
+            _ => self.state.selected_profile_id(),
+        };
+        let current_profile_display = stop_profile_id
+            .and_then(|profile_id| self.state.profile(profile_id))
+            .map(|profile| runtime_profile_display(profile.profile_type, &profile.name));
+        let stop_profile_display = resolve_stop_profile_display(
+            self.running_profile_display.as_ref(),
+            current_profile_display,
+        );
         self.core_op_busy = true;
+        self.pending_stop = false;
+        if let Some(profile_display) = stop_profile_display {
+            self.state.push_log(stop_profile_log(&profile_display));
+        }
         self.state.set_core_status(CoreStatus::Stopping);
-        self.state.set_status_message("Stopping…");
+        self.state.set_status_message_only("Stopping…");
         cx.notify();
 
         let settings = self.state.settings().clone();
@@ -1148,10 +1331,17 @@ impl MainWindow {
                 // Always mark stopped locally — stop_profile force-kills core.
                 this.state.set_core_status(CoreStatus::Stopped);
                 match result {
-                    Ok(()) => this.state.set_status_message("Core stopped"),
-                    Err(e) => this
-                        .state
-                        .set_status_message(format!("Stopped (with errors): {e}")),
+                    Ok(()) => this.state.set_status_message_only("Core stopped"),
+                    Err(e) => {
+                        this.state.push_log(FAILED_STOP_PROFILE_LOG);
+                        this.state
+                            .set_status_message_only(format!("Stopped (with errors): {e}"));
+                    }
+                }
+                this.running_profile_display = None;
+                if this.pending_stop {
+                    this.pending_stop = false;
+                    // Already stopped.
                 }
                 if this.restart_when_idle {
                     this.restart_when_idle = false;
@@ -1168,7 +1358,7 @@ impl MainWindow {
                         "Selected profile was removed while switching".into(),
                     ));
                     this.state
-                        .set_status_message("Switch failed: selected profile was removed");
+                        .set_status_message_only("Switch failed: selected profile was removed");
                 }
                 let _ = this.persist_db();
                 cx.notify();
@@ -1664,7 +1854,7 @@ impl MainWindow {
         if on {
             let core = Arc::clone(&self.core);
             self.state
-                .set_status_message("Checking Tun privileges…");
+                .set_status_message_only("Checking Tun privileges…");
             cx.notify();
             cx.spawn(async move |this, cx| {
                 let result = cx
@@ -1688,12 +1878,12 @@ impl MainWindow {
                             if this.state.core_status().is_running()
                                 || matches!(this.state.core_status(), CoreStatus::Starting)
                             {
-                                this.state.set_status_message(
+                                this.state.set_status_message_only(
                                     "Tun Mode enabled — restarting profile with TUN…",
                                 );
                                 this.start_proxy(cx);
                             } else {
-                                this.state.set_status_message(
+                                this.state.set_status_message_only(
                                     "Tun Mode enabled — press Start to apply system-wide TUN",
                                 );
                             }
@@ -1710,7 +1900,7 @@ impl MainWindow {
                             let msg = e
                                 .strip_prefix("tun privilege required: ")
                                 .unwrap_or(&e);
-                            this.state.set_status_message(msg.to_string());
+                            this.state.set_status_message_only(msg.to_string());
                         }
                     }
                     cx.notify();
@@ -1723,7 +1913,7 @@ impl MainWindow {
 
         self.state.set_spmode_vpn(false);
         let _ = self.persist_db();
-        self.state.set_status_message("Tun Mode disabled");
+        self.state.set_status_message_only("Tun Mode disabled");
         if self.state.core_status().is_running() {
             self.start_proxy(cx);
         }
@@ -1740,14 +1930,14 @@ impl MainWindow {
 
         // networksetup can block — never run it on the UI thread.
         if on && !running {
-            self.state.set_status_message(
+            self.state.set_status_message_only(
                 "System Proxy will apply on next Start (core not running yet)",
             );
             cx.notify();
             return;
         }
 
-        self.state.set_status_message(if on {
+        self.state.set_status_message_only(if on {
             "Enabling System Proxy…"
         } else {
             "Disabling System Proxy…"
@@ -1762,11 +1952,11 @@ impl MainWindow {
                 match result {
                     Ok(()) if on => this
                         .state
-                        .set_status_message(format!("System Proxy ON → 127.0.0.1:{port}")),
-                    Ok(()) => this.state.set_status_message("System Proxy OFF"),
+                        .set_status_message_only(format!("System Proxy ON → 127.0.0.1:{port}")),
+                    Ok(()) => this.state.set_status_message_only("System Proxy OFF"),
                     Err(e) => this
                         .state
-                        .set_status_message(format!("System Proxy failed: {e}")),
+                        .set_status_message_only(format!("System Proxy failed: {e}")),
                 }
                 cx.notify();
             })
@@ -3350,17 +3540,6 @@ const COL_ADDR: f32 = 200.;
 const COL_TEST: f32 = 100.;
 const COL_TRAFFIC: f32 = 140.;
 
-/// Sort key for latency: measured values first (by ms), then untested (0), fail (<0) last.
-fn latency_sort_key(ms: i32) -> (u8, i32) {
-    if ms > 0 {
-        (0, ms)
-    } else if ms == 0 {
-        (1, 0)
-    } else {
-        (2, ms)
-    }
-}
-
 fn col_fixed(
     width: f32,
     text: impl Into<SharedString>,
@@ -3626,10 +3805,67 @@ impl Render for MainWindow {
 #[cfg(test)]
 mod tests {
     use super::{
-        CoreAction, PendingProfileSwitch, next_core_action, should_scroll_logs_to_bottom,
-        should_update_rendered_log_text,
+        CoreAction, FAILED_STOP_PROFILE_LOG, PendingProfileSwitch, SortColumn,
+        failed_start_profile_log, next_core_action, next_sort_state, resolve_stop_profile_display,
+        running_mode_marker, runtime_profile_display, should_scroll_logs_to_bottom,
+        should_update_rendered_log_text, start_profile_log, stop_profile_log,
     };
-    use throne_domain::CoreStatus;
+    use throne_domain::{CoreStatus, ProfileType};
+
+    #[test]
+    fn runtime_profile_logs_match_upstream_format() {
+        let profile = runtime_profile_display(ProfileType::Vless, "Tokyo");
+
+        assert_eq!(profile, "[VLESS] Tokyo");
+        assert_eq!(start_profile_log(&profile), ">>>>>>>> Starting profile [VLESS] Tokyo");
+        assert_eq!(stop_profile_log(&profile), ">>>>>>>> Stopping profile [VLESS] Tokyo");
+        assert_eq!(
+            failed_start_profile_log(&profile),
+            "<<<<<<<< Failed to start profile [VLESS] Tokyo"
+        );
+        assert_eq!(
+            FAILED_STOP_PROFILE_LOG,
+            "<<<<<<<< Failed to stop, please restart the program."
+        );
+    }
+
+    #[test]
+    fn running_mode_marker_matches_enabled_runtime_modes() {
+        assert_eq!(running_mode_marker(true, false), "[Tun]");
+        assert_eq!(running_mode_marker(false, true), "[System Proxy]");
+        assert_eq!(running_mode_marker(true, true), "[Tun+System Proxy]");
+        assert_eq!(running_mode_marker(false, false), "");
+    }
+
+    #[test]
+    fn preserved_runtime_display_wins_when_current_profile_lookup_is_absent_or_changed() {
+        let preserved = "[VLESS] Tokyo".to_owned();
+
+        assert_eq!(
+            resolve_stop_profile_display(Some(&preserved), None),
+            Some("[VLESS] Tokyo".to_owned())
+        );
+        assert_eq!(
+            resolve_stop_profile_display(Some(&preserved), Some("[VLESS] Renamed".to_owned())),
+            Some("[VLESS] Tokyo".to_owned())
+        );
+    }
+
+    #[test]
+    fn repeated_header_clicks_alternate_without_clearing_sort() {
+        assert_eq!(
+            next_sort_state(SortColumn::None, true, SortColumn::TestResult),
+            (SortColumn::TestResult, true)
+        );
+        assert_eq!(
+            next_sort_state(SortColumn::TestResult, true, SortColumn::TestResult),
+            (SortColumn::TestResult, false)
+        );
+        assert_eq!(
+            next_sort_state(SortColumn::TestResult, false, SortColumn::TestResult),
+            (SortColumn::TestResult, true)
+        );
+    }
 
     #[test]
     fn new_non_empty_log_text_requests_scroll_to_bottom() {
@@ -3686,12 +3922,22 @@ mod tests {
     }
 
     #[test]
-    fn pending_switch_keeps_its_target_while_stop_is_in_progress() {
+    fn clicking_another_profile_while_starting_queues_a_switch_not_stop() {
+        assert_eq!(
+            next_core_action(&CoreStatus::Starting, 9),
+            CoreAction::Switch(9)
+        );
+    }
+
+    #[test]
+    fn pending_switch_keeps_the_latest_target_while_stop_is_in_progress() {
         let mut pending = PendingProfileSwitch::default();
 
         assert!(pending.schedule(2));
+        // Rapid click on another node must replace the target.
         assert!(!pending.schedule(3));
-        assert_eq!(pending.take(), Some(2));
+        assert_eq!(pending.peek(), Some(3));
+        assert_eq!(pending.take(), Some(3));
     }
 
 }

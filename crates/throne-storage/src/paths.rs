@@ -15,7 +15,9 @@ pub const ENV_DB: &str = "THRONE_DB";
 ///
 /// Priority:
 /// 1. `$THRONE_DB`
-/// 2. First existing path from [`discover_throne_databases`]
+/// 2. First **valid** Throne DB from [`discover_throne_databases`]
+///    (skips empty/0-byte stubs that some packagers leave under
+///    `Application Support/Throne/throne.db`)
 /// 3. Fresh path under OS data dir: `…/throne-rs/throne.db` (new installs)
 pub fn resolve_db_path() -> PathBuf {
     if let Ok(p) = env::var(ENV_DB) {
@@ -26,11 +28,37 @@ pub fn resolve_db_path() -> PathBuf {
     }
     if let Some(existing) = discover_throne_databases()
         .into_iter()
-        .find(|p| p.is_file())
+        .find(|p| p.is_file() && is_usable_throne_db(p))
     {
         return existing;
     }
     default_db_path()
+}
+
+/// True when `path` is a non-empty SQLite file that looks like a Throne DB.
+///
+/// An empty touch-created `throne.db` (0 bytes) must not win over a real
+/// `throne-rs/throne.db` — that made Tun/Start load a blank profile set.
+fn is_usable_throne_db(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if meta.len() < 100 {
+        return false;
+    }
+    // Inline check (avoid circular crate path through Database): open and
+    // require profiles + settings tables.
+    let Ok(conn) = rusqlite::Connection::open(path) else {
+        return false;
+    };
+    let Ok(n): Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('profiles','groups','settings')",
+        [],
+        |r| r.get(0),
+    ) else {
+        return false;
+    };
+    n >= 2
 }
 
 /// New/default location when no legacy DB is found.

@@ -51,8 +51,13 @@ pub fn build_load_config(
         "listen_port": port
     })];
     // TUN inbound when toolbar Tun is on (needs privileges on macOS/Linux).
+    // Mirrors upstream `buildInboundSection` (generate.cpp).
     let mut tun_ipv4_cidr = String::new();
+    // Upstream `CalculatePrerequisities`: proxy server hostnames → dns-direct.
+    let proxy_direct_domains = collect_outbound_server_domains(profile);
     if settings.tun_mode_enabled {
+        // Upstream buildDNSSection: Darwin Tun requires core_box_underlying_dns.
+        validate_darwin_tun_underlying_dns(settings)?;
         tun_ipv4_cidr = normalize_tun_ipv4_cidr(&settings.vpn_tun_ipv4_cidr);
         // Platform stack defaults match upstream SettingsRepo (macOS → gvisor).
         let stack = default_tun_stack();
@@ -65,20 +70,22 @@ pub fn build_load_config(
             "stack": stack,
             "address": [tun_ipv4_cidr.clone()]
         });
-        // Darwin only accepts utunN (or empty = OS assigns). Linux/Windows accept
-        // arbitrary names; "throne-tun" is rejected on macOS as "bad tun name".
+        // Upstream genTunName(): macOS "" (omit); else "throne-tun".
         if let Some(name) = default_tun_interface_name() {
             tun.as_object_mut()
                 .unwrap()
                 .insert("interface_name".into(), json!(name));
         }
-        // Linux: newer kernels need auto_redirect for system/mixed stacks (upstream default on).
+        // Upstream: Linux + vpn_auto_redirect (default true).
         #[cfg(target_os = "linux")]
         {
             tun.as_object_mut()
                 .unwrap()
                 .insert("auto_redirect".into(), json!(true));
         }
+        // Upstream route_exclude_address: private LAN only when bypass enabled.
+        // (enable_tun_routing direct-IP sets are not wired yet.)
+        // Outbound dials rely on route.auto_detect_interface — same as Qt Throne.
         if !settings.disable_private_range_bypass {
             tun.as_object_mut().unwrap().insert(
                 "route_exclude_address".into(),
@@ -118,7 +125,31 @@ pub fn build_load_config(
         }));
     }
 
-    let (dns, default_resolver_tag) = build_dns_section(settings, settings.tun_mode_enabled);
+    let (dns, default_resolver_tag) =
+        build_dns_section(settings, settings.tun_mode_enabled, &proxy_direct_domains)?;
+
+    // Upstream buildRouteSection: default_domain_resolver = dns-direct (+ strategy);
+    // auto_detect_interface only when Tun is on.
+    let domain_strategy = if settings.default_domain_strategy.trim().is_empty() {
+        "prefer_ipv4"
+    } else {
+        settings.default_domain_strategy.trim()
+    };
+    let mut route = json!({
+        "rules": route_rules,
+        "rule_set": rule_sets,
+        "final": route_final,
+        "default_domain_resolver": {
+            "server": default_resolver_tag,
+            "strategy": domain_strategy
+        }
+    });
+    if settings.tun_mode_enabled {
+        route
+            .as_object_mut()
+            .unwrap()
+            .insert("auto_detect_interface".into(), json!(true));
+    }
 
     let config = json!({
         "log": { "level": log_level, "timestamp": true },
@@ -128,24 +159,18 @@ pub fn build_load_config(
             outbound,
             { "type": "direct", "tag": "direct" }
         ],
-        "route": {
-            "rules": route_rules,
-            "rule_set": rule_sets,
-            "final": route_final,
-            "auto_detect_interface": true,
-            "default_domain_resolver": {
-                "server": default_resolver_tag,
-                "strategy": "prefer_ipv4"
-            }
-        },
+        "route": route,
         // clash_api enables TrafficManager used by QueryStats / QueryConnections.
+        // Upstream cache_file also sets store_fakeip / store_rdrc when applicable.
         "experimental": {
             "clash_api": {
                 "external_controller": "127.0.0.1:0",
                 "default_mode": ""
             },
             "cache_file": {
-                "enabled": true
+                "enabled": true,
+                "store_fakeip": true,
+                "store_rdrc": true
             }
         }
     });
@@ -1017,104 +1042,247 @@ fn apply_tls(v: &mut Value, o: &ParsedOutbound, default_on: bool) {
     obj.insert("tls".into(), tls);
 }
 
-/// Build DNS object + tag used by `route.default_domain_resolver`.
+/// Upstream `buildDNSSection` (generate.cpp) + tag for `route.default_domain_resolver`.
 ///
-/// Upstream: on Darwin + Tun, `type: local` is forbidden (DNS loops into the
-/// tunnel). Use remote DoH via proxy + a concrete UDP "underlying" IP for
-/// bootstrap / direct (see `core_box_underlying_dns`).
-fn build_dns_section(settings: &AppSettings, tun_enabled: bool) -> (Value, &'static str) {
+/// Tun path mirrors Qt Throne:
+/// - `dns-remote` detour=proxy, domain_resolver=dns-local
+/// - `dns-direct` from `direct_dns`, domain_resolver=dns-local (no detour)
+/// - `dns-local` from `core_box_underlying_dns` (required on Darwin Tun)
+/// - proxy server hostnames → route to dns-direct
+/// - final DNS rule from `dns_final_out`
+/// - no top-level `dns.final` (rules carry the final server)
+fn build_dns_section(
+    settings: &AppSettings,
+    tun_enabled: bool,
+    proxy_domains: &[String],
+) -> Result<(Value, &'static str), CoreError> {
     if !tun_enabled {
-        return (
+        // Mixed/system-proxy path: OS resolver is proven-stable here.
+        return Ok((
             json!({
                 "servers": [ { "type": "local", "tag": "local" } ],
                 "final": "local",
                 "strategy": "prefer_ipv4"
             }),
             "local",
-        );
+        ));
     }
 
-    // Tun path — never use OS `local` resolver as final on macOS.
-    let underlying = resolve_underlying_dns(settings);
-    // Upstream generate.cpp: only dns-remote gets detour=proxy.
-    // dns-direct must NOT set detour=direct — sing-box rejects
-    // "detour to an empty direct outbound makes no sense".
-    let mut remote = build_dns_server_obj(&settings.remote_dns);
+    let underlying = underlying_dns_address(settings)?;
+
+    // remote — upstream: only dns-remote gets detour=proxy
+    let mut remote = build_dns_obj(&settings.remote_dns, tun_enabled, &underlying);
     if let Some(obj) = remote.as_object_mut() {
         obj.insert("tag".into(), json!("dns-remote"));
         obj.insert("detour".into(), json!("proxy"));
         obj.insert("domain_resolver".into(), json!("dns-local"));
     }
 
-    let mut direct = build_dns_server_obj(&underlying);
-    // Force UDP IP for direct/underlying — never `local` under Tun.
-    if direct.get("type").and_then(|t| t.as_str()) == Some("local") {
-        direct = json!({ "type": "udp", "server": underlying });
-    }
+    // direct — upstream: buildDnsObj(direct_dns); no detour
+    let mut direct = build_dns_obj(&settings.direct_dns, tun_enabled, &underlying);
     if let Some(obj) = direct.as_object_mut() {
         obj.insert("tag".into(), json!("dns-direct"));
         obj.insert("domain_resolver".into(), json!("dns-local"));
     }
 
-    // Bootstrap resolver — no detour (plain dial), same as upstream dns-local.
-    let local = json!({
-        "type": "udp",
-        "tag": "dns-local",
-        "server": underlying
-    });
-
-    let final_tag = match settings.dns_final_out.trim().to_ascii_lowercase().as_str() {
-        "direct" => "dns-direct",
-        _ => "dns-remote",
+    // local — upstream: empty underlying → "local"; Darwin Tun rewrites to UDP underlying
+    let dns_local_address = if settings.core_box_underlying_dns.trim().is_empty() {
+        "local".to_string()
+    } else {
+        settings.core_box_underlying_dns.trim().to_string()
     };
+    let mut local = build_dns_obj(&dns_local_address, tun_enabled, &underlying);
+    if let Some(obj) = local.as_object_mut() {
+        obj.insert("tag".into(), json!("dns-local"));
+    }
 
-    (
+    let use_direct_final = settings.dns_final_out.trim().eq_ignore_ascii_case("direct");
+    let final_tag = if use_direct_final {
+        "dns-direct"
+    } else {
+        "dns-remote"
+    };
+    let final_strategy = if use_direct_final {
+        settings.direct_dns_strategy.trim()
+    } else {
+        settings.remote_dns_strategy.trim()
+    };
+    let direct_strategy = settings.direct_dns_strategy.trim();
+
+    // Upstream rule order (subset we support): localhost → proxy domains → final
+    let mut rules = vec![
         json!({
-            "servers": [remote, direct, local],
-            "final": final_tag,
-            "strategy": "prefer_ipv4"
+            "domain": "localhost",
+            "action": "predefined",
+            "query_type": "A",
+            "rcode": "NOERROR",
+            "answer": "localhost. IN A 127.0.0.1"
         }),
-        "dns-local",
-    )
+        json!({
+            "domain": "localhost",
+            "action": "predefined",
+            "query_type": "AAAA",
+            "rcode": "NXDOMAIN"
+        }),
+    ];
+
+    // Upstream needDirectDnsRules: proxy server domains must not go via dns-remote
+    // (chicken-egg before the outbound is up).
+    if !proxy_domains.is_empty() {
+        let mut rule = json!({
+            "domain": proxy_domains,
+            "action": "route",
+            "server": "dns-direct"
+        });
+        if !direct_strategy.is_empty() {
+            rule.as_object_mut()
+                .unwrap()
+                .insert("strategy".into(), json!(direct_strategy));
+        }
+        rules.push(rule);
+    }
+
+    let mut final_rule = json!({
+        "action": "route",
+        "server": final_tag
+    });
+    if !final_strategy.is_empty() {
+        final_rule
+            .as_object_mut()
+            .unwrap()
+            .insert("strategy".into(), json!(final_strategy));
+    }
+    rules.push(final_rule);
+
+    // Upstream dns object: servers + rules + cache_* — no top-level final.
+    let mut dns = json!({
+        "servers": [remote, direct, local],
+        "rules": rules,
+        "cache_capacity": settings.dns_cache_capacity.max(0)
+    });
+    if let Some(obj) = dns.as_object_mut() {
+        if settings.dns_disable_cache {
+            obj.insert("disable_cache".into(), json!(true));
+        }
+        if settings.dns_disable_expire {
+            obj.insert("disable_expire".into(), json!(true));
+        }
+        if settings.dns_reverse_mapping {
+            obj.insert("reverse_mapping".into(), json!(true));
+        }
+    }
+
+    // Upstream buildRouteSection always uses dns-direct as default_domain_resolver.
+    Ok((dns, "dns-direct"))
 }
 
-/// Upstream `core_box_underlying_dns`, with a safe public fallback when empty
-/// (Darwin Tun requires a real IP — empty is a hard error in Qt Throne).
-fn resolve_underlying_dns(settings: &AppSettings) -> String {
+/// Upstream `outboundServerDomains` / `getEntDomains` for a single profile.
+/// Only non-IP server addresses — IPs need no DNS direct rule.
+fn collect_outbound_server_domains(profile: &Profile) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut push = |s: &str| {
+        let t = s.trim().trim_matches(|c| c == '[' || c == ']');
+        if t.is_empty() || t.parse::<std::net::IpAddr>().is_ok() {
+            return;
+        }
+        if !out.iter().any(|x: &String| x.eq_ignore_ascii_case(t)) {
+            out.push(t.to_string());
+        }
+    };
+    if let Some(s) = &profile.outbound.server {
+        push(s);
+    }
+    if let Ok(v) = serde_json::from_str::<Value>(&profile.outbound_json) {
+        if let Some(s) = v.get("server").and_then(|x| x.as_str()) {
+            push(s);
+        }
+        // Chain-like hop lists are rare in outbound_json; collect nested servers
+        // when present (urltest/selector export blobs).
+        if let Some(arr) = v.get("outbounds").and_then(|x| x.as_array()) {
+            for item in arr {
+                if let Some(s) = item.get("server").and_then(|x| x.as_str()) {
+                    push(s);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Upstream generate.cpp Darwin Tun guard:
+/// "Local DNS and Tun mode do not work together, please set an IP…"
+fn validate_darwin_tun_underlying_dns(settings: &AppSettings) -> Result<(), CoreError> {
+    #[cfg(target_os = "macos")]
+    {
+        if !settings.tun_mode_enabled {
+            return Ok(());
+        }
+        let t = settings.core_box_underlying_dns.trim();
+        if t.is_empty() || t.eq_ignore_ascii_case("local") || t.eq_ignore_ascii_case("localhost") {
+            return Err(CoreError::Config(
+                "Local DNS and Tun mode do not work together, please set an IP to be used as the Local DNS server in the Routing Settings -> Local override".into(),
+            ));
+        }
+    }
+    let _ = settings;
+    Ok(())
+}
+
+/// Concrete IP/host for dns-local under Tun (after Darwin validation).
+fn underlying_dns_address(settings: &AppSettings) -> Result<String, CoreError> {
+    validate_darwin_tun_underlying_dns(settings)?;
     let t = settings.core_box_underlying_dns.trim();
     if !t.is_empty()
         && !t.eq_ignore_ascii_case("local")
         && !t.eq_ignore_ascii_case("localhost")
     {
-        return t.to_string();
+        return Ok(t.to_string());
     }
-    let d = settings.direct_dns.trim();
-    if !d.is_empty()
-        && !d.eq_ignore_ascii_case("local")
-        && !d.eq_ignore_ascii_case("localhost")
-        && !d.contains("://")
-    {
-        // bare IP / host OK
-        if d.parse::<std::net::Ipv4Addr>().is_ok() {
-            return d.to_string();
-        }
-    }
-    // Public resolver used only as bootstrap for domain_resolver / direct DNS.
-    "1.1.1.1".into()
+    // Non-Darwin: allow empty → "local" type; callers pass through build_dns_obj.
+    Ok(String::new())
 }
 
-fn build_dns_server_obj(address: &str) -> Value {
+/// Upstream `buildDnsObj(address, ctx)`.
+///
+/// On Darwin + Tun, `local`/`localhost` is rewritten to UDP against
+/// `core_box_underlying_dns` (must already be validated non-empty).
+fn build_dns_obj(address: &str, tun_enabled: bool, underlying: &str) -> Value {
     let address = address.trim();
-    if address.is_empty() || address.eq_ignore_ascii_case("local") || address == "localhost" {
+    if address.is_empty()
+        || address.eq_ignore_ascii_case("local")
+        || address.eq_ignore_ascii_case("localhost")
+    {
+        if tun_enabled {
+            #[cfg(target_os = "macos")]
+            {
+                // Upstream: type udp + server = core_box_underlying_dns
+                if !underlying.is_empty() {
+                    return json!({ "type": "udp", "server": underlying });
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = underlying;
+            }
+        }
         return json!({ "type": "local" });
+    }
+
+    if let Some(ifc) = address.strip_prefix("dhcp://") {
+        let ifc = if ifc == "auto" { "" } else { ifc };
+        return json!({ "type": "dhcp", "interface": ifc });
     }
 
     let (ty, rest) = if let Some(rest) = address.strip_prefix("https://") {
         ("https", rest)
+    } else if let Some(rest) = address.strip_prefix("h3://") {
+        ("h3", rest)
     } else if let Some(rest) = address.strip_prefix("http://") {
         ("http", rest)
     } else if let Some(rest) = address.strip_prefix("udp://") {
         ("udp", rest)
+    } else if let Some(rest) = address.strip_prefix("tcp://") {
+        ("tcp", rest)
     } else if let Some(rest) = address.strip_prefix("tls://") {
         ("tls", rest)
     } else if let Some(rest) = address.strip_prefix("quic://") {
@@ -1122,7 +1290,8 @@ fn build_dns_server_obj(address: &str) -> Value {
     } else {
         ("udp", address)
     };
-    let (host_port, path) = if ty == "https" || ty == "http" {
+
+    let (host_port, path) = if ty == "https" || ty == "http" || ty == "h3" {
         match rest.split_once('/') {
             Some((host, path)) => (host, format!("/{path}")),
             None => (rest, "/dns-query".into()),
@@ -1150,13 +1319,29 @@ fn build_dns_server_obj(address: &str) -> Value {
     obj
 }
 
+/// Back-compat alias used by unit tests that still call the old name.
+#[cfg(test)]
+fn build_dns_server_obj(address: &str) -> Value {
+    build_dns_obj(address, false, "")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use throne_domain::{ParsedOutbound, Profile, ProfileType, RulesetMirror};
 
+    fn tun_settings() -> AppSettings {
+        let mut settings = AppSettings::default();
+        settings.tun_mode_enabled = true;
+        // Upstream Darwin Tun hard-requires Local override (core_box_underlying_dns).
+        settings.core_box_underlying_dns = "223.5.5.5".into();
+        settings.direct_dns = "223.5.5.5".into();
+        settings.remote_dns = "8.8.8.8".into();
+        settings
+    }
+
     #[test]
-    fn tun_inbound_uses_platform_safe_interface_name() {
+    fn tun_inbound_matches_upstream_generate() {
         let mut p = Profile::new(1, 1, "n1", ProfileType::Vless);
         p.outbound = ParsedOutbound {
             server: Some("1.2.3.4".into()),
@@ -1164,8 +1349,7 @@ mod tests {
             uuid: Some("11111111-1111-1111-1111-111111111111".into()),
             ..Default::default()
         };
-        let mut settings = AppSettings::default();
-        settings.tun_mode_enabled = true;
+        let settings = tun_settings();
         let built = build_load_config(&p, &settings, None).unwrap();
         let v: Value = serde_json::from_str(&built.core_config_json).unwrap();
         let tun = v["inbounds"]
@@ -1175,37 +1359,36 @@ mod tests {
             .find(|ib| ib["type"] == "tun")
             .expect("tun inbound");
         assert_eq!(tun["tag"], "tun-in");
+        assert_eq!(tun["auto_route"], true);
+        assert_eq!(tun["strict_route"], false);
         assert_eq!(tun["address"][0], "172.19.0.1/24");
         assert_eq!(built.tun_ipv4_cidr, "172.19.0.1/24");
-        // Tun must not use OS `local` DNS as final (Darwin loops into the tunnel).
-        assert_ne!(v["dns"]["final"], "local");
-        assert_eq!(v["route"]["default_domain_resolver"]["server"], "dns-local");
+        // Upstream: private ranges only (not bare proxy IPs).
+        let excludes = tun["route_exclude_address"].as_array().unwrap();
+        assert!(excludes.iter().any(|e| e.as_str() == Some("192.168.0.0/16")));
+        assert!(!excludes.iter().any(|e| e.as_str() == Some("1.2.3.4/32")));
+        // Upstream buildRouteSection
+        assert_eq!(v["route"]["default_domain_resolver"]["server"], "dns-direct");
+        assert_eq!(v["route"]["auto_detect_interface"], true);
+        // Upstream dns object has no top-level final
+        assert!(v["dns"].get("final").is_none());
         let servers = v["dns"]["servers"].as_array().unwrap();
-        assert!(
-            servers.iter().any(|s| s["tag"] == "dns-remote"),
-            "expected dns-remote: {servers:?}"
-        );
-        assert!(
-            servers
-                .iter()
-                .any(|s| s["tag"] == "dns-local" && s["type"] != "local"),
-            "dns-local must be concrete under Tun: {servers:?}"
-        );
-        // sing-box rejects detour=direct on DNS servers.
+        assert!(servers.iter().any(|s| s["tag"] == "dns-remote" && s["detour"] == "proxy"));
+        assert!(servers.iter().any(|s| {
+            s["tag"] == "dns-local" && s["type"] == "udp" && s["server"] == "223.5.5.5"
+        }));
         for s in servers {
             if s["tag"] == "dns-direct" || s["tag"] == "dns-local" {
-                assert!(
-                    s.get("detour").is_none(),
-                    "dns server must not detour=direct: {s}"
-                );
+                assert!(s.get("detour").is_none(), "no detour on {s}");
             }
         }
         #[cfg(target_os = "macos")]
         {
-            // Empty/omitted name — kernel assigns utunN. "throne-tun" is invalid on Darwin.
             assert!(
                 tun.get("interface_name").is_none()
-                    || tun["interface_name"].as_str().is_some_and(|n| n.is_empty() || n.starts_with("utun")),
+                    || tun["interface_name"]
+                        .as_str()
+                        .is_some_and(|n| n.is_empty() || n.starts_with("utun")),
                 "macOS tun name must be utun* or omitted, got {:?}",
                 tun.get("interface_name")
             );
@@ -1215,6 +1398,98 @@ mod tests {
         {
             assert_eq!(tun["interface_name"], "throne-tun");
         }
+    }
+
+    #[test]
+    fn tun_dns_routes_proxy_hostname_via_direct() {
+        // Upstream CalculatePrerequisities → directDomains for getEntDomains.
+        let mut p = Profile::new(1, 1, "hy2", ProfileType::Hysteria2);
+        p.outbound = ParsedOutbound {
+            server: Some("node.example.com".into()),
+            server_port: Some(443),
+            password: Some("x".into()),
+            ..Default::default()
+        };
+        p.outbound_json = r#"{"type":"hysteria2","server":"node.example.com","server_port":443,"password":"x","tag":"proxy"}"#.into();
+        let settings = tun_settings();
+        let built = build_load_config(&p, &settings, None).unwrap();
+        let v: Value = serde_json::from_str(&built.core_config_json).unwrap();
+        let rules = v["dns"]["rules"].as_array().expect("dns.rules");
+        let has_proxy_direct = rules.iter().any(|r| {
+            r.get("server").and_then(|s| s.as_str()) == Some("dns-direct")
+                && r.get("domain")
+                    .and_then(|d| d.as_array())
+                    .is_some_and(|a| a.iter().any(|x| x.as_str() == Some("node.example.com")))
+        });
+        assert!(
+            has_proxy_direct,
+            "proxy hostname must resolve via dns-direct: {rules:?}"
+        );
+        assert_eq!(v["route"]["default_domain_resolver"]["server"], "dns-direct");
+        let servers = v["dns"]["servers"].as_array().unwrap();
+        let direct = servers.iter().find(|s| s["tag"] == "dns-direct").unwrap();
+        assert_eq!(direct["server"], "223.5.5.5");
+        let remote = servers.iter().find(|s| s["tag"] == "dns-remote").unwrap();
+        assert_eq!(remote["detour"], "proxy");
+        assert_eq!(remote["domain_resolver"], "dns-local");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn tun_requires_underlying_dns_on_darwin() {
+        // Upstream generate.cpp hard error when core_box_underlying_dns empty.
+        let mut p = Profile::new(1, 1, "n1", ProfileType::Vless);
+        p.outbound = ParsedOutbound {
+            server: Some("1.2.3.4".into()),
+            server_port: Some(443),
+            uuid: Some("u".into()),
+            ..Default::default()
+        };
+        let mut settings = AppSettings::default();
+        settings.tun_mode_enabled = true;
+        settings.core_box_underlying_dns.clear();
+        let err = build_load_config(&p, &settings, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Local DNS and Tun mode do not work together"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn tun_collects_nested_outbound_hostnames_for_dns_direct() {
+        // Nested hop hostnames (urltest/selector export) → dns-direct, like chain hops.
+        let mut p = Profile::new(1, 1, "grp", ProfileType::Vless);
+        p.outbound_json = r#"{
+            "type": "urltest",
+            "tag": "proxy",
+            "outbounds": [
+                {"type":"vless","server":"10.1.2.3","server_port":443,"uuid":"u","tag":"a"},
+                {"type":"trojan","server":"node.group.example","server_port":443,"password":"x","tag":"b"}
+            ]
+        }"#
+        .into();
+        let settings = tun_settings();
+        let built = build_load_config(&p, &settings, None).unwrap();
+        let v: Value = serde_json::from_str(&built.core_config_json).unwrap();
+        let rules = v["dns"]["rules"].as_array().unwrap();
+        let has_member_host = rules.iter().any(|r| {
+            r.get("server").and_then(|s| s.as_str()) == Some("dns-direct")
+                && r.get("domain")
+                    .and_then(|d| d.as_array())
+                    .is_some_and(|a| a.iter().any(|x| x.as_str() == Some("node.group.example")))
+        });
+        assert!(
+            has_member_host,
+            "group member hostname must use dns-direct: {rules:?}"
+        );
+        // Bare IPs are not DNS domains (upstream outboundServerDomains skips IsIpAddress).
+        let has_ip_domain = rules.iter().any(|r| {
+            r.get("domain")
+                .and_then(|d| d.as_array())
+                .is_some_and(|a| a.iter().any(|x| x.as_str() == Some("10.1.2.3")))
+        });
+        assert!(!has_ip_domain);
     }
 
     #[test]

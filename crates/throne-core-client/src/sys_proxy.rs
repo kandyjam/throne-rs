@@ -134,18 +134,21 @@ fn disable_service(svc: &str) -> Result<(), String> {
     let ns = "/usr/sbin/networksetup";
     // ONLY flip state off. Never rewrite host/port to :0 — if something later
     // turns Enabled back on, Port 0 makes every browser fail instantly.
-    let _ = run_ns(ns, &["-setautoproxystate", svc, "off"]);
+    // Keep this minimal: each call has a 1s ceiling; extra flags made Stop feel stuck.
     run_ns(ns, &["-setwebproxystate", svc, "off"])?;
     run_ns(ns, &["-setsecurewebproxystate", svc, "off"])?;
     let _ = run_ns(ns, &["-setsocksfirewallproxystate", svc, "off"]);
     Ok(())
 }
 
-/// Best-effort clear of system proxy on **all** listed services (recovery path).
+/// Best-effort clear of system proxy on primary hardware services (recovery path).
+///
+/// Only touches Wi-Fi / Ethernet-class services — sweeping *every* service
+/// (bridges, Tailscale, …) made Stop block for 20–30s when networksetup stalled.
 pub fn force_clear_system_proxy() {
     #[cfg(target_os = "macos")]
     {
-        if let Ok(services) = list_all_network_services() {
+        if let Ok(services) = list_network_services() {
             for svc in services {
                 let _ = disable_service(&svc);
             }
@@ -153,23 +156,77 @@ pub fn force_clear_system_proxy() {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn list_all_network_services() -> Result<Vec<String>, String> {
-    let out = Command::new("/usr/sbin/networksetup")
-        .arg("-listallnetworkservices")
-        .output()
-        .map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+/// Point primary NICs at Tun DNS (`172.19.0.2`) or clear them (`Empty`).
+///
+/// Complements Go `sys.SetSystemDNS` so Tun works even when ThroneCore is an
+/// older build that failed to bind DNS on the physical interface after
+/// `auto_route` flipped the default route to utun.
+pub fn set_tun_system_dns(enable: bool, tun_ipv4_cidr: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        if enable {
+            let dns = tun_dns_address(tun_ipv4_cidr)
+                .ok_or_else(|| format!("invalid tun_ipv4_cidr {tun_ipv4_cidr:?}"))?;
+            set_macos_dns(Some(&dns))
+        } else {
+            set_macos_dns(None)
+        }
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    Ok(text
-        .lines()
-        .skip(1)
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('*'))
-        .map(str::to_string)
-        .collect())
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (enable, tun_ipv4_cidr);
+        Ok(())
+    }
+}
+
+/// Derive system DNS IP from Tun CIDR (upstream: tunIP + 1 → `172.19.0.2`).
+pub fn tun_dns_address(tun_ipv4_cidr: &str) -> Option<String> {
+    let (addr, _pfx) = tun_ipv4_cidr.trim().split_once('/')?;
+    let parts: Vec<u8> = addr
+        .split('.')
+        .filter_map(|p| p.parse().ok())
+        .collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    // Next IPv4 address (wrapping within last octet is fine for /24 defaults).
+    let mut last = parts[3] as u16 + 1;
+    if last > 255 {
+        last = 1;
+    }
+    Some(format!(
+        "{}.{}.{}.{}",
+        parts[0], parts[1], parts[2], last as u8
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn set_macos_dns(dns: Option<&str>) -> Result<(), String> {
+    let services = list_network_services()?;
+    if services.is_empty() {
+        return Err("no suitable network services found".into());
+    }
+    let ns = "/usr/sbin/networksetup";
+    let mut errors = Vec::new();
+    for svc in &services {
+        let r = match dns {
+            Some(ip) => run_ns(ns, &["-setdnsservers", svc, ip]),
+            // "Empty" is the networksetup token that clears manual DNS.
+            None => run_ns(ns, &["-setdnsservers", svc, "Empty"]),
+        };
+        if let Err(e) = r {
+            warn!(service = %svc, %e, "system DNS update failed for service");
+            errors.push(format!("{svc}: {e}"));
+        }
+    }
+    if errors.len() == services.len() {
+        return Err(format!(
+            "system DNS failed on all services: {}",
+            errors.join("; ")
+        ));
+    }
+    info!(dns = ?dns, services = ?services, "system DNS updated for Tun");
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -276,7 +333,7 @@ fn run_ns_timeout(bin: &str, args: &[&str], timeout: std::time::Duration) -> Res
 
 #[cfg(test)]
 mod tests {
-    use super::proxy_client_host;
+    use super::{proxy_client_host, tun_dns_address};
 
     #[test]
     fn client_host_never_any_address() {
@@ -286,6 +343,15 @@ mod tests {
         assert_eq!(proxy_client_host("[::]"), "127.0.0.1");
         assert_eq!(proxy_client_host("127.0.0.1"), "127.0.0.1");
         assert_eq!(proxy_client_host("192.168.1.2"), "127.0.0.1");
+    }
+
+    #[test]
+    fn tun_dns_is_next_address() {
+        assert_eq!(
+            tun_dns_address("172.19.0.1/24").as_deref(),
+            Some("172.19.0.2")
+        );
+        assert_eq!(tun_dns_address("not-a-cidr"), None);
     }
 
     #[cfg(target_os = "macos")]

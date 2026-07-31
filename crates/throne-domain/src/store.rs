@@ -32,6 +32,15 @@ pub struct SubUpdateSummary {
     pub kept: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProfileSortColumn {
+    Type,
+    Address,
+    Name,
+    TestResult,
+    Traffic,
+}
+
 impl SubUpdateSummary {
     pub fn format_status(&self) -> String {
         format!(
@@ -170,6 +179,10 @@ impl AppState {
         self.push_log(msg);
     }
 
+    pub fn set_status_message_only(&mut self, msg: impl Into<String>) {
+        self.status_message = msg.into();
+    }
+
     /// Append a log line and update the status strip. Dedupes consecutive identical lines.
     pub fn push_log(&mut self, msg: impl Into<String>) {
         let msg = msg.into();
@@ -285,6 +298,38 @@ impl AppState {
                     || p.test_country.to_lowercase().contains(&q)
             })
             .collect()
+    }
+
+    pub fn sort_active_group_profiles(
+        &mut self,
+        column: ProfileSortColumn,
+        ascending: bool,
+    ) -> Result<(), StoreError> {
+        let group_id = self.active_group_id;
+        let mut ids = self
+            .groups
+            .get(&group_id)
+            .ok_or(StoreError::GroupNotFound(group_id))?
+            .profile_ids
+            .clone();
+        ids.sort_by(|left_id, right_id| {
+            let ordering = match (self.profiles.get(left_id), self.profiles.get(right_id)) {
+                (Some(left), Some(right)) => compare_profiles(left, right, column),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => left_id.cmp(right_id),
+            };
+            if ascending {
+                ordering
+            } else {
+                ordering.reverse()
+            }
+        });
+        self.groups
+            .get_mut(&group_id)
+            .expect("active group checked above")
+            .profile_ids = ids;
+        Ok(())
     }
 
     pub fn add_group(&mut self, name: impl Into<String>) -> GroupId {
@@ -1266,6 +1311,44 @@ fn profile_dedupe_key(p: &Profile) -> String {
     )
 }
 
+fn compare_profiles(
+    left: &Profile,
+    right: &Profile,
+    column: ProfileSortColumn,
+) -> std::cmp::Ordering {
+    match column {
+        ProfileSortColumn::Type => left
+            .profile_type
+            .display_name()
+            .cmp(right.profile_type.display_name()),
+        ProfileSortColumn::Address => left
+            .display_address()
+            .to_lowercase()
+            .cmp(&right.display_address().to_lowercase()),
+        ProfileSortColumn::Name => left.name.to_lowercase().cmp(&right.name.to_lowercase()),
+        ProfileSortColumn::TestResult => upstream_latency_sort_key(left.latency_ms)
+            .cmp(&upstream_latency_sort_key(right.latency_ms)),
+        ProfileSortColumn::Traffic => left
+            .traffic_downlink
+            .saturating_add(left.traffic_uplink)
+            .cmp(
+                &right
+                    .traffic_downlink
+                    .saturating_add(right.traffic_uplink),
+            ),
+    }
+}
+
+fn upstream_latency_sort_key(ms: i32) -> i32 {
+    if ms == 0 {
+        100_000
+    } else if ms < 0 {
+        99_999
+    } else {
+        ms
+    }
+}
+
 fn human_rate(bytes: i64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut v = bytes.max(0) as f64;
@@ -1324,6 +1407,18 @@ mod tests {
     }
 
     #[test]
+    fn status_only_message_does_not_append_to_logs() {
+        let mut state = AppState::empty();
+        state.push_log("Existing log");
+        let logs_before = state.logs_text();
+
+        state.set_status_message_only("Running [Tun]");
+
+        assert_eq!(state.status_message(), "Running [Tun]");
+        assert_eq!(state.logs_text(), logs_before);
+    }
+
+    #[test]
     fn demo_has_groups_and_profiles() {
         let s = AppState::with_demo_data();
         assert!(s.group_order().len() >= 2);
@@ -1359,6 +1454,44 @@ mod tests {
         state.apply_url_test_results(&[(profile_id, 0, "")]);
 
         assert_eq!(state.profile(profile_id).unwrap().latency_ms, 0);
+    }
+
+    #[test]
+    fn active_group_sort_by_latency_persists_upstream_order() {
+        let mut state = AppState::empty();
+        let group = state.add_group("G");
+        let slow = state.add_profile(group, "slow", ProfileType::Vless);
+        let untested = state.add_profile(group, "untested", ProfileType::Vless);
+        let failed = state.add_profile(group, "failed", ProfileType::Vless);
+        let fast = state.add_profile(group, "fast", ProfileType::Vless);
+        state.set_profile_latency(slow, 180);
+        state.set_profile_latency(untested, 0);
+        state.set_profile_latency(failed, -1);
+        state.set_profile_latency(fast, 47);
+
+        state
+            .sort_active_group_profiles(ProfileSortColumn::TestResult, true)
+            .unwrap();
+        assert_eq!(
+            state
+                .visible_profiles()
+                .iter()
+                .map(|profile| profile.id)
+                .collect::<Vec<_>>(),
+            vec![fast, slow, failed, untested],
+        );
+
+        state
+            .sort_active_group_profiles(ProfileSortColumn::TestResult, false)
+            .unwrap();
+        assert_eq!(
+            state
+                .visible_profiles()
+                .iter()
+                .map(|profile| profile.id)
+                .collect::<Vec<_>>(),
+            vec![untested, failed, slow, fast],
+        );
     }
 
     #[test]
