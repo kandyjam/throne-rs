@@ -73,6 +73,6 @@ Status legend: ✅ done · 🧩 partial · ⏳ planned · ❌ out of scope (Go c
 
 - **Core upgrades**: sing-box / xray / amnezia bumps dominate release cadence → pin Go module when packaging core binary.  
 - **Xray depth**: interface bind, geo assets, full-config test, UDP → core-client must expose `need_xray` + asset paths.  
-- **Subscription UX**: diff popup, custom config sub, group context menu → import result should return added/removed sets.  
+- **Subscription UX**: ✅ group cards and metadata, manual diff popup, serialized update-all, identity-preserving apply, and explicit local-proxy routing. Remaining gaps: scheduled auto-update, `sub_clear`, HWID/custom device headers, and custom-config subscription parity.
 - **Routing**: remote route profiles via deeplink, raw routes, warp-bypass outbound.  
 - **Platform**: Linux TUN on new kernels, installer, Wayland hotkey branch (`upstream/dev-wayland-hotkey`).

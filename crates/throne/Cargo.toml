@@ -15,6 +15,10 @@ default-run = "Throne"
 name = "Throne"
 path = "src/main.rs"
 
+[features]
+# Compatibility feature referenced by objc 0.2's exported macros.
+cargo-clippy = []
+
 [dependencies]
 throne-domain = { workspace = true }
 throne-core-client = { workspace = true }
@@ -26,6 +30,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
+chrono = { workspace = true }
 smol = "2"
 tray-icon = "0.24.1"
 

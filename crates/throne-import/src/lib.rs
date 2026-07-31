@@ -22,6 +22,36 @@ pub use route_share::{
     RouteImportReport, import_route_payload, to_share_link, to_share_object, try_import_routes,
 };
 
+#[derive(Debug, Clone)]
+pub struct SubscriptionImport {
+    pub report: ImportReport,
+    pub user_info: Option<String>,
+}
+
+pub fn import_subscription_response(
+    response: FetchResponse,
+) -> Result<SubscriptionImport, String> {
+    let user_info = response
+        .header("Subscription-UserInfo")
+        .map(str::to_string);
+    let report = import_text(&response.body);
+    if !report.errors.is_empty() {
+        return Err(format!(
+            "subscription was only partially parsed: {}",
+            report.errors.join("; ")
+        ));
+    }
+    if report.profiles.is_empty() {
+        let detail = if report.errors.is_empty() {
+            "no profiles recognized".into()
+        } else {
+            report.errors.join("; ")
+        };
+        return Err(format!("subscription contained no usable profiles: {detail}"));
+    }
+    Ok(SubscriptionImport { report, user_info })
+}
+
 /// Fetch `url` and run [`import_text`] on the body.
 pub fn import_from_url(url: &str) -> ImportReport {
     match fetch_url(url) {
@@ -287,6 +317,36 @@ fn parse_wireguard_file(text: &str) -> Option<ImportedProfile> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscription_response_carries_provider_info() {
+        let response = FetchResponse {
+            body: "vless://11111111-1111-1111-1111-111111111111@example.com:443#Demo".into(),
+            headers: vec![("Subscription-UserInfo".into(), "total=100".into())],
+        };
+        let imported = import_subscription_response(response).unwrap();
+        assert_eq!(imported.user_info.as_deref(), Some("total=100"));
+        assert_eq!(imported.report.profiles.len(), 1);
+    }
+
+    #[test]
+    fn subscription_response_rejects_unrecognized_body() {
+        let response = FetchResponse {
+            body: "not a subscription".into(),
+            headers: Vec::new(),
+        };
+        assert!(import_subscription_response(response).is_err());
+    }
+
+    #[test]
+    fn subscription_response_rejects_partial_parse_to_protect_existing_snapshot() {
+        let response = FetchResponse {
+            body: "vless://11111111-1111-1111-1111-111111111111@example.com:443#Demo\nnot-a-link".into(),
+            headers: Vec::new(),
+        };
+
+        assert!(import_subscription_response(response).is_err());
+    }
 
     #[test]
     fn import_vless_line() {

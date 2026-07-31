@@ -202,6 +202,8 @@ mod tests {
         assert_eq!(source.matches("cmd-shift-r").count(), 1);
         assert_eq!(source.matches("ctrl-shift-r").count(), 1);
         assert!(source.contains("ConfirmDeleteUnavailable"));
+        assert!(source.contains("ConfirmUpdateAllSubscriptions"));
+        assert!(source.contains("SubscriptionDiff"));
     }
 
     #[test]

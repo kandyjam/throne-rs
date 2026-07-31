@@ -32,6 +32,21 @@ pub struct SubUpdateSummary {
     pub kept: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionChange {
+    pub profile_id: ProfileId,
+    pub display: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubscriptionUpdateReport {
+    pub added: Vec<SubscriptionChange>,
+    pub updated: Vec<SubscriptionChange>,
+    pub deleted: Vec<SubscriptionChange>,
+    pub unchanged: usize,
+    pub result_order: Vec<ProfileId>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProfileSortColumn {
     Type,
@@ -1284,6 +1299,135 @@ impl AppState {
         Ok(summary)
     }
 
+    /// Apply one successfully parsed subscription snapshot while retaining local
+    /// measurements for profiles whose stable remote identity still exists.
+    pub fn apply_subscription_snapshot(
+        &mut self,
+        group_id: GroupId,
+        items: Vec<(String, ProfileType, ParsedOutbound, bool)>,
+        info: String,
+        updated_at: i64,
+    ) -> Result<SubscriptionUpdateReport, StoreError> {
+        let old_ids = self
+            .groups
+            .get(&group_id)
+            .ok_or(StoreError::GroupNotFound(group_id))?
+            .profile_ids
+            .clone();
+        let mut available: HashMap<String, VecDeque<ProfileId>> = HashMap::new();
+        for id in &old_ids {
+            if let Some(profile) = self.profiles.get(id) {
+                available
+                    .entry(profile_identity_key(profile))
+                    .or_default()
+                    .push_back(*id);
+            }
+        }
+
+        let mut protected_running_id = None;
+        if let CoreStatus::Running { profile_id, .. } = &self.core_status {
+            if old_ids.contains(profile_id) {
+                let running = self
+                    .profiles
+                    .get(profile_id)
+                    .ok_or(StoreError::ProfileNotFound(*profile_id))?;
+                let running_identity = profile_identity_key(running);
+                let unchanged = items.iter().any(|(name, profile_type, outbound, insecure)| {
+                    subscription_item_identity_key(*profile_type, outbound) == running_identity
+                        && running.name == *name
+                        && running.profile_type == *profile_type
+                        && running.outbound == *outbound
+                        && running.insecure == *insecure
+                });
+                if !unchanged {
+                    return Err(StoreError::Msg(
+                        "subscription would remove or change the running profile; stop it first"
+                            .into(),
+                    ));
+                }
+                protected_running_id = Some(*profile_id);
+            }
+        }
+
+        let mut report = SubscriptionUpdateReport::default();
+        let mut retained = HashSet::new();
+        for (name, profile_type, outbound, insecure) in items {
+            let identity = subscription_item_identity_key(profile_type, &outbound);
+            let matches_running = protected_running_id.is_some_and(|running_id| {
+                !retained.contains(&running_id)
+                    && self.profiles.get(&running_id).is_some_and(|running| {
+                        running.name == name
+                            && running.profile_type == profile_type
+                            && running.outbound == outbound
+                            && running.insecure == insecure
+                    })
+            });
+            let existing_id = if matches_running {
+                let running_id = protected_running_id.expect("running ID checked above");
+                if let Some(ids) = available.get_mut(&identity) {
+                    if let Some(position) = ids.iter().position(|id| *id == running_id) {
+                        ids.remove(position);
+                    }
+                }
+                Some(running_id)
+            } else {
+                available.get_mut(&identity).and_then(VecDeque::pop_front)
+            };
+            if let Some(id) = existing_id {
+                retained.insert(id);
+                let profile = self
+                    .profiles
+                    .get_mut(&id)
+                    .ok_or(StoreError::ProfileNotFound(id))?;
+                let changed = profile.name != name
+                    || profile.profile_type != profile_type
+                    || profile.outbound != outbound
+                    || profile.insecure != insecure;
+                if changed {
+                    profile.name = name;
+                    profile.profile_type = profile_type;
+                    profile.outbound_json = outbound.to_db_json();
+                    profile.outbound = outbound;
+                    profile.insecure = insecure;
+                    report.updated.push(subscription_change(profile));
+                } else {
+                    report.unchanged += 1;
+                }
+                report.result_order.push(id);
+            } else {
+                let id = self.next_profile_id;
+                self.next_profile_id += 1;
+                let mut profile = Profile::new(id, group_id, name, profile_type);
+                profile.outbound_json = outbound.to_db_json();
+                profile.outbound = outbound;
+                profile.insecure = insecure;
+                report.added.push(subscription_change(&profile));
+                self.profiles.insert(id, profile);
+                retained.insert(id);
+                report.result_order.push(id);
+            }
+        }
+
+        for id in old_ids {
+            if !retained.contains(&id) {
+                if let Some(profile) = self.profiles.remove(&id) {
+                    report.deleted.push(subscription_change(&profile));
+                }
+            }
+        }
+        let group = self
+            .groups
+            .get_mut(&group_id)
+            .ok_or(StoreError::GroupNotFound(group_id))?;
+        group.profile_ids = report.result_order.clone();
+        group.info = info;
+        group.sub_last_update = updated_at;
+        if self.selected_profile_id.is_some_and(|id| !self.profiles.contains_key(&id)) {
+            self.selected_profile_id = group.profile_ids.first().copied();
+        }
+        Ok(report)
+    }
+
     pub fn clear_test_results_in_group(&mut self, group_id: GroupId) {
         let Some(g) = self.groups.get(&group_id) else {
             return;
@@ -1311,6 +1455,35 @@ fn profile_dedupe_key(p: &Profile) -> String {
         o.uuid.as_deref().or(o.password.as_deref()).unwrap_or(""),
         o.sni.as_deref().unwrap_or("")
     )
+}
+
+fn profile_identity_key(profile: &Profile) -> String {
+    subscription_item_identity_key(profile.profile_type, &profile.outbound)
+}
+
+fn subscription_item_identity_key(profile_type: ProfileType, outbound: &ParsedOutbound) -> String {
+    let has_structured_identity = outbound.server.is_some()
+        || outbound.server_port.is_some()
+        || outbound.uuid.is_some()
+        || outbound.password.is_some()
+        || outbound.username.is_some();
+    serde_json::json!({
+        "type": profile_type.as_str(),
+        "server": outbound.server,
+        "port": outbound.server_port,
+        "uuid": outbound.uuid,
+        "password": outbound.password,
+        "username": outbound.username,
+        "raw": if has_structured_identity { None } else { outbound.raw_json.as_deref() },
+    })
+    .to_string()
+}
+
+fn subscription_change(profile: &Profile) -> SubscriptionChange {
+    SubscriptionChange {
+        profile_id: profile.id,
+        display: format!("{} {}", profile.profile_type.display_name(), profile.name),
+    }
 }
 
 fn compare_profiles(
@@ -1782,5 +1955,103 @@ mod tests {
         assert_eq!(report.deleted.len(), 1);
         assert_eq!(report.deleted[0].profile_id, removed_id);
         assert!(state.profile(removed_id).is_none());
+    }
+
+    #[test]
+    fn subscription_snapshot_rejects_removing_the_running_profile_without_mutation() {
+        let mut state = AppState::empty();
+        let group_id = state.add_group("subscription");
+        let running_id = state.add_profile(group_id, "running", ProfileType::Vless);
+        state.set_core_status(CoreStatus::Running {
+            profile_id: running_id,
+            profile_name: "running".into(),
+        });
+
+        let result = state.apply_subscription_snapshot(
+            group_id,
+            Vec::new(),
+            "new-info".into(),
+            123,
+        );
+
+        assert!(result.is_err());
+        assert!(state.profile(running_id).is_some());
+        assert_eq!(state.group(group_id).unwrap().profile_ids, vec![running_id]);
+    }
+
+    #[test]
+    fn subscription_snapshot_preserves_running_id_with_duplicate_identities() {
+        let mut state = AppState::empty();
+        let group_id = state.add_group("subscription");
+        let outbound = ParsedOutbound {
+            server: Some("same.example".into()),
+            server_port: Some(443),
+            uuid: Some("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into()),
+            ..Default::default()
+        };
+        state
+            .replace_group_profiles(
+                group_id,
+                vec![
+                    ("first".into(), ProfileType::Vless, outbound.clone(), false),
+                    ("running".into(), ProfileType::Vless, outbound.clone(), false),
+                ],
+            )
+            .unwrap();
+        let ids = state.group(group_id).unwrap().profile_ids.clone();
+        state.set_core_status(CoreStatus::Running {
+            profile_id: ids[1],
+            profile_name: "running".into(),
+        });
+
+        let report = state
+            .apply_subscription_snapshot(
+                group_id,
+                vec![("running".into(), ProfileType::Vless, outbound, false)],
+                String::new(),
+                123,
+            )
+            .unwrap();
+
+        assert_eq!(report.result_order, vec![ids[1]]);
+        assert!(state.profile(ids[1]).is_some());
+        assert!(state.profile(ids[0]).is_none());
+    }
+
+    #[test]
+    fn subscription_identity_does_not_collide_when_usernames_differ() {
+        let first = ParsedOutbound {
+            server: Some("proxy.example".into()),
+            server_port: Some(1080),
+            username: Some("alice".into()),
+            password: Some("secret".into()),
+            ..Default::default()
+        };
+        let second = ParsedOutbound {
+            username: Some("bob".into()),
+            ..first.clone()
+        };
+
+        assert_ne!(
+            subscription_item_identity_key(ProfileType::Socks, &first),
+            subscription_item_identity_key(ProfileType::Socks, &second)
+        );
+    }
+
+    #[test]
+    fn subscription_identity_uses_raw_config_when_no_structured_identity_exists() {
+        let first = ParsedOutbound {
+            raw_json: Some("{\"endpoint\":\"one\"}".into()),
+            ..Default::default()
+        };
+        let second = ParsedOutbound {
+            raw_json: Some("{\"endpoint\":\"two\"}".into()),
+            ..Default::default()
+        };
+
+        assert_ne!(
+            subscription_item_identity_key(ProfileType::Custom, &first),
+            subscription_item_identity_key(ProfileType::Custom, &second)
+        );
     }
 }

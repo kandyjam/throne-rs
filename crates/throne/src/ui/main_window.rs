@@ -14,6 +14,7 @@
 //! Toolbar menus are **relative under each button** (no absolute left offsets).
 //! Secondary features open as modal dialogs: Basic Settings / Manage Groups / Add from input.
 
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
@@ -30,12 +31,13 @@ use throne_domain::{
     AppState, CoreStatus, GroupId, Profile, ProfileId, ProfileSortColumn, ProfileType,
     TrafficSnapshot,
 };
-use throne_import::import_from_url;
+use throne_import::{FetchOptions, fetch_url_with_options, import_subscription_response};
 
 use crate::theme::{self, Theme, latency_color};
 use crate::ui::dialogs::{
     Dialog, add_input_body, basic_settings_body, confirm_delete_unavailable_body,
-    edit_profile_body, hotkey_settings_body, manage_groups_body, tun_settings_body,
+    confirm_update_all_body, edit_profile_body, hotkey_settings_body, manage_groups_body,
+    subscription_diff_body, tun_settings_body,
 };
 use crate::ui::routing::{
     RoutingEvent, RoutingNested, RoutingSideEffect, routing_settings_view,
@@ -215,6 +217,102 @@ impl PendingProfileSwitch {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UpdateOrigin {
+    Manual,
+    UpdateAll,
+}
+
+fn should_show_subscription_diff(origin: UpdateOrigin, enabled: bool) -> bool {
+    enabled && origin == UpdateOrigin::Manual
+}
+
+fn eligible_subscription_ids<'a>(
+    groups: impl IntoIterator<Item = &'a throne_domain::Group>,
+) -> Vec<GroupId> {
+    groups
+        .into_iter()
+        .filter(|group| !group.url.trim().is_empty() && !group.archive)
+        .map(|group| group.id)
+        .collect()
+}
+
+fn subscription_fetch_options(
+    settings: &throne_domain::AppSettings,
+    core_status: &CoreStatus,
+) -> Result<FetchOptions, String> {
+    if !settings.system_proxy_enabled {
+        return Ok(FetchOptions::default());
+    }
+    if !core_status.is_running() {
+        return Err("Request with proxy but no profile started.".into());
+    }
+    FetchOptions::with_http_proxy(&settings.inbound_address, settings.inbound_socks_port)
+}
+
+fn format_subscription_changes(report: &throne_domain::SubscriptionUpdateReport) -> String {
+    if report.added.is_empty() && report.updated.is_empty() && report.deleted.is_empty() {
+        return "Nothing".into();
+    }
+    let entries = |prefix: &str, changes: &[throne_domain::SubscriptionChange]| {
+        changes
+            .iter()
+            .map(|change| format!("{prefix} {}", change.display))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "Added {} profiles:\n{}\n\nUpdated {} profiles:\n{}\n\nDeleted {} profiles:\n{}",
+        report.added.len(),
+        entries("[+]", &report.added),
+        report.updated.len(),
+        entries("[~]", &report.updated),
+        report.deleted.len(),
+        entries("[-]", &report.deleted),
+    )
+}
+
+#[derive(Debug, Default)]
+struct SubscriptionUpdateQueue {
+    pending: VecDeque<GroupId>,
+    succeeded: usize,
+    failed: usize,
+}
+
+impl SubscriptionUpdateQueue {
+    fn new(ids: Vec<GroupId>) -> Self {
+        Self {
+            pending: ids.into(),
+            succeeded: 0,
+            failed: 0,
+        }
+    }
+
+    fn take_next(&mut self) -> Option<GroupId> {
+        self.pending.pop_front()
+    }
+
+    fn record_result(&mut self, succeeded: bool) {
+        if succeeded {
+            self.succeeded += 1;
+        } else {
+            self.failed += 1;
+        }
+    }
+
+    fn completion_message(&self) -> String {
+        format!(
+            "Subscription update finished · {} succeeded · {} failed",
+            self.succeeded, self.failed
+        )
+    }
+
+    #[cfg(test)]
+    fn is_finished(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
 pub struct MainWindow {
     state: AppState,
     focus_handle: FocusHandle,
@@ -245,6 +343,7 @@ pub struct MainWindow {
     loading_frame: usize,
     /// True while a URL-test / sub-update job is in flight.
     background_busy: bool,
+    subscription_queue: Option<SubscriptionUpdateQueue>,
     sort_column: SortColumn,
     /// `true` = ascending (A→Z, low latency first).
     sort_asc: bool,
@@ -325,6 +424,7 @@ impl MainWindow {
             pending_profile_switch: PendingProfileSwitch::default(),
             loading_frame: 0,
             background_busy: false,
+            subscription_queue: None,
             sort_column: SortColumn::None,
             sort_asc: true,
             connections: Vec::new(),
@@ -1818,95 +1918,197 @@ impl MainWindow {
 
     fn update_subscription(&mut self, all: bool, cx: &mut Context<Self>) {
         self.close_menus();
+        if all {
+            if self.subscription_queue.is_some() || self.background_busy {
+                self.state
+                    .push_log("The last subscription update has not exited.");
+            } else {
+                self.dialog = Dialog::ConfirmUpdateAllSubscriptions;
+            }
+            cx.notify();
+            return;
+        }
+        self.start_subscription_group(self.state.active_group_id(), UpdateOrigin::Manual, cx);
+    }
+
+    fn confirm_update_all_subscriptions(&mut self, cx: &mut Context<Self>) {
+        let ids = eligible_subscription_ids(self.state.all_groups());
+        self.dialog = Dialog::manage_groups_from_state(&self.state);
+        if ids.is_empty() {
+            self.state.set_status_message("No subscriptions to update");
+            cx.notify();
+            return;
+        }
+        self.subscription_queue = Some(SubscriptionUpdateQueue::new(ids));
+        self.start_next_subscription_update(cx);
+    }
+
+    fn start_next_subscription_update(&mut self, cx: &mut Context<Self>) {
+        let next = self
+            .subscription_queue
+            .as_mut()
+            .and_then(SubscriptionUpdateQueue::take_next);
+        if let Some(group_id) = next {
+            self.start_subscription_group(group_id, UpdateOrigin::UpdateAll, cx);
+        } else {
+            let message = self
+                .subscription_queue
+                .as_ref()
+                .map(SubscriptionUpdateQueue::completion_message)
+                .unwrap_or_else(|| "Subscription update finished".into());
+            self.subscription_queue = None;
+            self.background_busy = false;
+            self.state.set_status_message(message);
+            cx.notify();
+        }
+    }
+
+    fn start_subscription_group(
+        &mut self,
+        group_id: GroupId,
+        origin: UpdateOrigin,
+        cx: &mut Context<Self>,
+    ) {
         if self.background_busy {
             self.state.set_status_message("Busy — wait for current job");
             cx.notify();
             return;
         }
-        let groups: Vec<(GroupId, String, String)> = if all {
-            self.state
-                .all_groups()
-                .into_iter()
-                .filter(|g| !g.url.trim().is_empty())
-                .map(|g| (g.id, g.name.clone(), g.url.clone()))
-                .collect()
-        } else {
-            let gid = self.state.active_group_id();
-            self.state
-                .group(gid)
-                .filter(|g| !g.url.trim().is_empty())
-                .map(|g| vec![(g.id, g.name.clone(), g.url.clone())])
-                .unwrap_or_default()
-        };
-        if groups.is_empty() {
-            self.state.set_status_message(
-                "No subscription URL on this group — set one in Manage Groups",
-            );
+        let Some(group) = self.state.group(group_id) else {
+            self.state.set_status_message("Subscription group not found");
             cx.notify();
             return;
+        };
+        if group.url.trim().is_empty() || group.archive {
+            self.state
+                .set_status_message("This group has no updatable subscription");
+            if origin == UpdateOrigin::UpdateAll {
+                if let Some(queue) = self.subscription_queue.as_mut() {
+                    queue.record_result(false);
+                }
+                self.start_next_subscription_update(cx);
+            }
+            return;
         }
+        let name = group.name.clone();
+        let url = group.url.clone();
+        let options = match subscription_fetch_options(self.state.settings(), self.state.core_status()) {
+            Ok(options) => options,
+            Err(error) => {
+                self.state.set_status_message(format!("{name}: {error}"));
+                if origin == UpdateOrigin::UpdateAll {
+                    if let Some(queue) = self.subscription_queue.as_mut() {
+                        queue.record_result(false);
+                    }
+                    self.start_next_subscription_update(cx);
+                }
+                return;
+            }
+        };
         self.background_busy = true;
         self.state
-            .set_status_message(format!("Updating {} subscription(s) …", groups.len()));
+            .push_log(format!(">>>>>>>> Requesting subscription: {name}"));
+        self.state
+            .set_status_message(format!("Updating subscription {name} …"));
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let mut reports = Vec::new();
-                    for (id, name, url) in groups {
-                        let report = import_from_url(&url);
-                        reports.push((id, name, report));
-                    }
-                    reports
+                    let response = fetch_url_with_options(
+                        &url,
+                        std::time::Duration::from_secs(30),
+                        &options,
+                    )?;
+                    import_subscription_response(response)
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.background_busy = false;
-                let mut total = 0usize;
-                let mut added = 0usize;
-                let mut removed = 0usize;
-                let mut kept = 0usize;
-                let mut errs = Vec::new();
-                let show_sec = this.state.settings().show_config_security;
-                for (gid, name, report) in result {
-                    if !report.errors.is_empty() && report.profiles.is_empty() {
-                        errs.push(format!("{name}: {}", report.errors.join("; ")));
-                        continue;
-                    }
-                    let items: Vec<_> = report
-                        .profiles
-                        .into_iter()
-                        .map(|p| {
-                            let insecure = show_sec
-                                && (p.outbound.insecure == Some(true)
-                                    || p.outbound.tls == Some(false)
-                                    || p.source.contains("insecure=1"));
-                            (p.name, p.profile_type, p.outbound, insecure)
-                        })
-                        .collect();
-                    match this.state.replace_group_profiles(gid, items) {
-                        Ok(s) => {
-                            total += s.total;
-                            added += s.added;
-                            removed += s.removed;
-                            kept += s.kept;
+                let mut succeeded = false;
+                match result {
+                    Ok(imported) => {
+                        this.state.push_log(format!(
+                            "<<<<<<<< Subscription request finished: {name}"
+                        ));
+                        this.state
+                            .push_log(">>>>>>>> Processing subscription data...");
+                        let show_security = this.state.settings().show_config_security;
+                        let items = imported
+                            .report
+                            .profiles
+                            .into_iter()
+                            .map(|profile| {
+                                let insecure = show_security
+                                    && (profile.outbound.insecure == Some(true)
+                                        || profile.outbound.tls == Some(false)
+                                        || profile.source.contains("insecure=1"));
+                                (profile.name, profile.profile_type, profile.outbound, insecure)
+                            })
+                            .collect();
+                        this.state
+                            .push_log(">>>>>>>> Process complete, applying...");
+                        let previous_state = this.state.clone();
+                        match this.state.apply_subscription_snapshot(
+                            group_id,
+                            items,
+                            imported.user_info.unwrap_or_default(),
+                            chrono::Utc::now().timestamp(),
+                        ) {
+                            Ok(report) => {
+                                let body = format_subscription_changes(&report);
+                                match this.persist_db() {
+                                    Ok(()) => {
+                                        succeeded = true;
+                                        this.state.push_log(format!(
+                                            "<<<<<<<< Change of {name}:\n{body}"
+                                        ));
+                                        this.state.set_status_message(format!(
+                                            "Subscription updated · {} profile(s) · +{} ~{} −{} · {} kept",
+                                            report.result_order.len(),
+                                            report.added.len(),
+                                            report.updated.len(),
+                                            report.deleted.len(),
+                                            report.unchanged,
+                                        ));
+                                        if should_show_subscription_diff(
+                                            origin,
+                                            this.state.settings().sub_show_change_popup,
+                                        ) {
+                                            this.dialog = Dialog::SubscriptionDiff {
+                                                title: format!("Change of {name}"),
+                                                body,
+                                            };
+                                        }
+                                    }
+                                    Err(error) => {
+                                        this.state = previous_state;
+                                        this.state.set_status_message(format!(
+                                            "Subscription update {name} failed to persist: {error}"
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(error) => this.state.set_status_message(format!(
+                                "Subscription update {name} failed: {error}"
+                            )),
                         }
-                        Err(e) => errs.push(format!("{name}: {e}")),
+                    }
+                    Err(error) => {
+                        this.state.push_log(format!(
+                            "<<<<<<<< Requesting subscription {name} error: {error}"
+                        ));
+                        this.state.set_status_message(format!(
+                            "Subscription update {name} failed: {error}"
+                        ));
                     }
                 }
-                let summary = format!(
-                    "Subscription updated · {total} profile(s) · +{added} −{removed} · {kept} kept"
-                );
-                if !errs.is_empty() {
-                    this.state.set_status_message(format!(
-                        "{summary}; {}",
-                        errs.join(" · ")
-                    ));
-                } else {
-                    this.state.set_status_message(summary);
+                if origin == UpdateOrigin::UpdateAll {
+                    if let Some(queue) = this.subscription_queue.as_mut() {
+                        queue.record_result(succeeded);
+                    }
+                    this.start_next_subscription_update(cx);
                 }
-                let _ = this.persist_db();
                 cx.notify();
             })
             .ok();
@@ -2375,7 +2577,10 @@ impl MainWindow {
                 Some((field, false))
             }
             Dialog::EditProfile { name, .. } => Some((name, false)),
-            Dialog::ConfirmDeleteUnavailable { .. } | Dialog::None => None,
+            Dialog::ConfirmDeleteUnavailable { .. }
+            | Dialog::ConfirmUpdateAllSubscriptions
+            | Dialog::SubscriptionDiff { .. }
+            | Dialog::None => None,
         }
     }
 
@@ -2947,6 +3152,8 @@ impl MainWindow {
                 let e_add = entity.clone();
                 let e_apply = entity.clone();
                 let e_del = entity.clone();
+                let e_update = entity.clone();
+                let e_update_all = entity.clone();
                 let e_x = entity.clone();
                 modal_shell(
                     "Manage Groups",
@@ -3013,6 +3220,14 @@ impl MainWindow {
                         },
                         move |_, cx| {
                             e_del.update(cx, |t, cx| t.manage_delete(cx));
+                        },
+                        move |id, _, cx| {
+                            e_update.update(cx, |t, cx| {
+                                t.start_subscription_group(id, UpdateOrigin::Manual, cx)
+                            });
+                        },
+                        move |_, cx| {
+                            e_update_all.update(cx, |t, cx| t.update_subscription(true, cx));
                         },
                         move |_, cx| {
                             e_x.update(cx, |t, cx| {
@@ -3236,6 +3451,54 @@ impl MainWindow {
                     move |_, _, cx| {
                         e_close.update(cx, |t, cx| {
                             t.close_dialog();
+                            cx.notify();
+                        });
+                    },
+                )
+                .into_any_element()
+            }
+            Dialog::ConfirmUpdateAllSubscriptions => {
+                let e_close = entity.clone();
+                let e_confirm = entity.clone();
+                let e_cancel = entity.clone();
+                modal_shell(
+                    "Confirmation",
+                    confirm_update_all_body(
+                        move |_, cx| {
+                            e_confirm.update(cx, |t, cx| {
+                                t.confirm_update_all_subscriptions(cx)
+                            });
+                        },
+                        move |_, cx| {
+                            e_cancel.update(cx, |t, cx| {
+                                t.dialog = Dialog::manage_groups_from_state(&t.state);
+                                cx.notify();
+                            });
+                        },
+                    ),
+                    move |_, _, cx| {
+                        e_close.update(cx, |t, cx| {
+                            t.dialog = Dialog::manage_groups_from_state(&t.state);
+                            cx.notify();
+                        });
+                    },
+                )
+                .into_any_element()
+            }
+            Dialog::SubscriptionDiff { title, body } => {
+                let e_close = entity.clone();
+                let e_button = entity.clone();
+                modal_shell(
+                    title,
+                    subscription_diff_body(body, move |_, cx| {
+                        e_button.update(cx, |t, cx| {
+                            t.dialog = Dialog::manage_groups_from_state(&t.state);
+                            cx.notify();
+                        });
+                    }),
+                    move |_, _, cx| {
+                        e_close.update(cx, |t, cx| {
+                            t.dialog = Dialog::manage_groups_from_state(&t.state);
                             cx.notify();
                         });
                     },
@@ -4129,11 +4392,69 @@ impl Render for MainWindow {
 mod tests {
     use super::{
         CoreAction, FAILED_STOP_PROFILE_LOG, PendingProfileSwitch, SortColumn,
+        SubscriptionUpdateQueue, UpdateOrigin, eligible_subscription_ids,
         failed_start_profile_log, next_core_action, next_sort_state, resolve_stop_profile_display,
         running_mode_marker, runtime_profile_display, should_scroll_logs_to_bottom,
-        should_update_rendered_log_text, start_profile_log, stop_profile_log,
+        should_show_subscription_diff, should_update_rendered_log_text,
+        start_profile_log, stop_profile_log, subscription_fetch_options,
     };
-    use throne_domain::{CoreStatus, ProfileType};
+    use throne_domain::{AppSettings, CoreStatus, Group, ProfileType};
+
+    #[test]
+    fn update_all_skips_basic_and_archived_groups_in_order() {
+        let basic = Group::new(1, "basic");
+        let mut first = Group::new(2, "first");
+        first.url = "https://first.example/sub".into();
+        let mut archived = Group::new(3, "archived");
+        archived.url = "https://archived.example/sub".into();
+        archived.archive = true;
+        let mut second = Group::new(4, "second");
+        second.url = "https://second.example/sub".into();
+
+        assert_eq!(
+            eligible_subscription_ids([&basic, &first, &archived, &second]),
+            vec![2, 4]
+        );
+    }
+
+    #[test]
+    fn manual_update_only_requests_diff_when_enabled() {
+        assert!(should_show_subscription_diff(UpdateOrigin::Manual, true));
+        assert!(!should_show_subscription_diff(UpdateOrigin::UpdateAll, true));
+        assert!(!should_show_subscription_diff(UpdateOrigin::Manual, false));
+    }
+
+    #[test]
+    fn system_proxy_fetch_requires_running_profile() {
+        let mut settings = AppSettings::default();
+        settings.system_proxy_enabled = true;
+        assert!(subscription_fetch_options(&settings, &CoreStatus::Stopped).is_err());
+
+        let options = subscription_fetch_options(
+            &settings,
+            &CoreStatus::Running {
+                profile_id: 1,
+                profile_name: "node".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            options.proxy_url.as_deref(),
+            Some("http://127.0.0.1:2080")
+        );
+    }
+
+    #[test]
+    fn subscription_update_queue_advances_serially() {
+        let mut queue = SubscriptionUpdateQueue::new(vec![2, 4]);
+        assert_eq!(queue.take_next(), Some(2));
+        queue.record_result(true);
+        assert_eq!(queue.take_next(), Some(4));
+        queue.record_result(false);
+        assert_eq!(queue.take_next(), None);
+        assert!(queue.is_finished());
+        assert_eq!(queue.completion_message(), "Subscription update finished · 1 succeeded · 1 failed");
+    }
 
     #[test]
     fn runtime_profile_logs_match_upstream_format() {

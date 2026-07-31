@@ -40,3 +40,8 @@ url = "2"
 urlencoding = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde_yaml = "0.9"
+
+[patch.crates-io]
+# block 0.1.6 declares an extern static with an uninhabited enum, which future
+# Rust versions reject. Keep its public API while correcting the opaque FFI type.
+block = { path = "vendor/block-0.1.6" }

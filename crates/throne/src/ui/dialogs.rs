@@ -1,12 +1,58 @@
 //! Secondary feature dialogs (settings / groups / add / routing / tun / hotkeys).
 
 use gpui::{App, SharedString, Window, div, prelude::*, px};
+use chrono::{Local, TimeZone};
 
 use throne_domain::{AppState, GroupId, ProfileId, ProfileType, RulesetMirror};
 
 use crate::theme::Theme;
 use crate::ui::routing::RoutingDraft;
 use crate::ui::widgets::{form_row, modal_shell, mode_checkbox, primary_btn, secondary_btn};
+
+pub fn format_subscription_info(info: &str) -> Option<String> {
+    let value = |key: &str| -> Option<u64> {
+        info.split(';').find_map(|part| {
+            let (name, value) = part.trim().split_once('=')?;
+            name.trim()
+                .eq_ignore_ascii_case(key)
+                .then(|| value.trim().parse().ok())
+                .flatten()
+        })
+    };
+    let total = value("total")?;
+    let used = value("upload")
+        .unwrap_or(0)
+        .saturating_add(value("download").unwrap_or(0));
+    let remaining = if total == 0 {
+        "∞".to_string()
+    } else {
+        readable_size(total.saturating_sub(used))
+    };
+    let expiry = value("expire")
+        .filter(|seconds| *seconds > 0)
+        .and_then(|seconds| Local.timestamp_opt(seconds as i64, 0).single())
+        .map(|time| time.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "Never".into());
+    Some(format!(
+        "Used: {} Remain: {remaining} Expire: {expiry}",
+        readable_size(used)
+    ))
+}
+
+fn readable_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 || value.fract() == 0.0 {
+        format!("{value:.0}{}", UNITS[unit])
+    } else {
+        format!("{value:.1}{}", UNITS[unit])
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub enum Dialog {
@@ -64,6 +110,11 @@ pub enum Dialog {
     ConfirmDeleteUnavailable {
         group_id: GroupId,
         count: usize,
+    },
+    ConfirmUpdateAllSubscriptions,
+    SubscriptionDiff {
+        title: String,
+        body: String,
     },
 }
 
@@ -349,6 +400,8 @@ pub fn manage_groups_body(
     on_add: impl Fn(&mut Window, &mut App) + 'static,
     on_apply: impl Fn(&mut Window, &mut App) + 'static,
     on_delete: impl Fn(&mut Window, &mut App) + 'static,
+    on_update: impl Fn(GroupId, &mut Window, &mut App) + Clone + 'static,
+    on_update_all: impl Fn(&mut Window, &mut App) + 'static,
     on_close: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let mut list = div()
@@ -357,28 +410,46 @@ pub fn manage_groups_body(
         .flex_col()
         .gap_1()
         .mb_3()
-        .max_h(px(160.))
+        .max_h(px(280.))
         .overflow_y_scroll();
     for g in state.all_groups() {
         let id = g.id;
         let sel = selected == Some(id);
         let on_select = on_select.clone();
-        let label = format!(
-            "{}  ({} profiles){}",
-            if g.name.is_empty() {
-                format!("Group {id}")
-            } else {
-                g.name.clone()
-            },
-            g.profile_ids.len(),
-            if g.url.is_empty() { "" } else { "  · sub" }
-        );
+        let on_update = on_update.clone();
+        let name = if g.name.is_empty() { format!("Group {id}") } else { g.name.clone() };
+        let kind = match (g.archive, g.url.trim().is_empty()) {
+            (true, true) => "Archive Basic",
+            (true, false) => "Archive Subscription",
+            (false, true) => "Basic",
+            (false, false) => "Subscription",
+        };
+        let url = g.url.clone();
+        let has_url = !url.trim().is_empty();
+        let metadata = group_subscription_metadata(g);
+        let mut header = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(format!("{kind} ({})  {name}", g.profile_ids.len()));
+        if has_url && !g.archive {
+            header = header.child(secondary_btn(
+                SharedString::from(format!("mg-update-{id}")),
+                "Update Subscription",
+                move |_, w, cx| on_update(id, w, cx),
+            ));
+        }
         list = list.child(
             div()
                 .id(SharedString::from(format!("mg-{id}")))
+                .flex()
+                .flex_col()
+                .gap_1()
                 .px_2()
-                .py_1()
+                .py_2()
                 .rounded_sm()
+                .border_1()
+                .border_color(if sel { Theme::accent() } else { Theme::border_light() })
                 .cursor_pointer()
                 .bg(if sel {
                     Theme::bg_selected()
@@ -391,7 +462,13 @@ pub fn manage_groups_body(
                     Theme::text()
                 })
                 .text_sm()
-                .child(label)
+                .child(header)
+                .when(has_url, |el| {
+                    el.child(div().text_xs().text_color(Theme::text_muted()).child(url))
+                })
+                .when_some(metadata, |el, text| {
+                    el.child(div().text_xs().text_color(Theme::text_muted()).child(text))
+                })
                 .on_click(move |_, w, cx| on_select(id, w, cx)),
         );
     }
@@ -433,7 +510,12 @@ pub fn manage_groups_body(
                 .flex()
                 .gap_2()
                 .mb_3()
-                .child(primary_btn("mg-add", "Add new Group", move |_, w, cx| on_add(w, cx))),
+                .child(primary_btn("mg-add", "New group", move |_, w, cx| on_add(w, cx)))
+                .child(secondary_btn(
+                    "mg-update-all",
+                    "Update all subscriptions",
+                    move |_, w, cx| on_update_all(w, cx),
+                )),
         )
         .child(menu_sep())
         .child(div().text_xs().text_color(Theme::text_muted()).mb_1().child("Edit current Group"))
@@ -480,6 +562,64 @@ pub fn manage_groups_body(
                     on_delete(w, cx)
                 }))
                 .child(secondary_btn("mg-close", "Close", move |_, w, cx| on_close(w, cx))),
+        )
+}
+
+fn group_subscription_metadata(group: &throne_domain::Group) -> Option<String> {
+    let mut parts = Vec::new();
+    if group.sub_last_update > 0 {
+        if let Some(time) = Local.timestamp_opt(group.sub_last_update, 0).single() {
+            parts.push(format!("Last update: {}", time.format("%Y-%m-%d %H:%M")));
+        }
+    }
+    if let Some(info) = format_subscription_info(&group.info) {
+        parts.push(info);
+    }
+    (!parts.is_empty()).then(|| parts.join(" | "))
+}
+
+pub fn confirm_update_all_body(
+    on_confirm: impl Fn(&mut Window, &mut App) + 'static,
+    on_cancel: impl Fn(&mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .child(div().mb_3().child("Update all subscriptions?"))
+        .child(
+            div()
+                .flex()
+                .justify_end()
+                .gap_2()
+                .child(secondary_btn("sub-all-no", "No", move |_, w, cx| on_cancel(w, cx)))
+                .child(primary_btn("sub-all-yes", "Yes", move |_, w, cx| on_confirm(w, cx))),
+        )
+}
+
+pub fn subscription_diff_body(
+    body: &str,
+    on_close: impl Fn(&mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .id("sub-diff-scroll")
+                .max_h(px(360.))
+                .overflow_y_scroll()
+                .p_2()
+                .mb_3()
+                .border_1()
+                .border_color(Theme::border_light())
+                .text_sm()
+                .child(body.to_string()),
+        )
+        .child(
+            div()
+                .flex()
+                .justify_end()
+                .child(primary_btn("sub-diff-close", "Close", move |_, w, cx| on_close(w, cx))),
         )
 }
 
@@ -751,4 +891,32 @@ fn _pt() -> ProfileType {
 fn _fr() {
     let _ = form_row("x", "y");
     let _ = modal_shell("t", div(), |_, _, _| {});
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_subscription_info;
+
+    #[test]
+    fn subscription_info_formats_usage_remaining_and_expiry() {
+        let text = format_subscription_info(
+            "upload=10; download=15; total=100; expire=1785500000",
+        )
+        .unwrap();
+        assert!(text.contains("Used: 25B"));
+        assert!(text.contains("Remain: 75B"));
+        assert!(text.contains("Expire:"));
+    }
+
+    #[test]
+    fn subscription_info_requires_valid_total() {
+        assert_eq!(format_subscription_info("upload=10; download=15"), None);
+        assert_eq!(format_subscription_info("total=broken"), None);
+    }
+
+    #[test]
+    fn zero_total_formats_as_unlimited_remaining() {
+        let text = format_subscription_info("upload=25; total=0").unwrap();
+        assert!(text.contains("Remain: ∞"));
+    }
 }
