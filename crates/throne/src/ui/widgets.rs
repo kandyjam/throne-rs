@@ -63,6 +63,7 @@ mod tests {
         assert_eq!(toolbar_icon_path(ToolbarIcon::Tools), "icons/wrench.svg");
     }
 
+
     #[test]
     fn transitional_start_stop_states_show_loading_feedback() {
         assert_eq!(
@@ -126,7 +127,12 @@ pub fn toolbar_btn(
             svg()
                 .path(toolbar_icon_path(icon))
                 .size(px(18.))
-                .text_color(if open { Theme::accent() } else { Theme::text() }),
+                // GPUI paints SVG as an alpha mask tinted by text_color — follows light/dark tokens.
+                .text_color(if open {
+                    Theme::accent()
+                } else {
+                    Theme::icon()
+                }),
         )
         .child(div().text_xs().text_color(Theme::text()).child(label))
         .on_click(on_toggle)
@@ -451,5 +457,36 @@ pub fn secondary_btn(
         .cursor_pointer()
         .hover(|e| e.bg(Theme::bg_hover()))
         .child(label.into())
+        .on_click(on_click)
+}
+
+/// Compact square icon button (toolbar / log panel actions).
+///
+/// `icon_path` is an asset path such as `"icons/copy.svg"`. The glyph is tinted
+/// with [`Theme::icon`] so it follows light/dark.
+pub fn icon_btn(
+    id: impl Into<SharedString>,
+    icon_path: &'static str,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id.into())
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(30.))
+        .h(px(28.))
+        .rounded_sm()
+        .border_1()
+        .border_color(Theme::border_light())
+        .bg(Theme::bg_toolbar_btn())
+        .cursor_pointer()
+        .hover(|e| e.bg(Theme::bg_hover()))
+        .child(
+            svg()
+                .path(icon_path)
+                .size(px(15.))
+                .text_color(Theme::icon()),
+        )
         .on_click(on_click)
 }

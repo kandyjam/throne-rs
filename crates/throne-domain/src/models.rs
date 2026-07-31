@@ -479,6 +479,12 @@ pub struct AppSettings {
     pub show_config_security: bool,
     pub current_route_id: i64,
     pub remember_id: i64,
+    /// Upstream `remember_enable` — tray "Remember last profile".
+    #[serde(default)]
+    pub remember_enable: bool,
+    /// Upstream AutoRun / "Start with system" preference (OS registration is best-effort).
+    #[serde(default)]
+    pub start_with_system: bool,
     pub system_proxy_enabled: bool,
     pub tun_mode_enabled: bool,
     /// Upstream `system_dns_set` checkbox on the main toolbar.
@@ -611,6 +617,8 @@ impl Default for AppSettings {
             show_config_security: true,
             current_route_id: -1,
             remember_id: -1,
+            remember_enable: false,
+            start_with_system: false,
             system_proxy_enabled: false,
             tun_mode_enabled: false,
             system_dns_set: false,

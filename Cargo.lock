@@ -5992,7 +5992,9 @@ name = "throne"
 version = "1.2.2"
 dependencies = [
  "anyhow",
+ "cocoa 0.26.0",
  "gpui",
+ "objc",
  "serde_json",
  "smol",
  "throne-core-client",

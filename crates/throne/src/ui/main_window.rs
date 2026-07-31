@@ -41,8 +41,8 @@ use crate::ui::routing::{
     RoutingEvent, RoutingNested, RoutingSideEffect, routing_settings_view,
 };
 use crate::ui::widgets::{
-    TOOLBAR_BTN_GAP, TOOLBAR_BTN_W, TOOLBAR_MENU_TOP, TOOLBAR_PAD_X, menu_item, menu_label,
-    menu_separator, modal_shell, mode_checkbox, secondary_btn, start_stop_btn, toolbar_btn,
+    TOOLBAR_BTN_GAP, TOOLBAR_BTN_W, TOOLBAR_MENU_TOP, TOOLBAR_PAD_X, icon_btn, menu_item, menu_label,
+    menu_separator, modal_shell, mode_checkbox, start_stop_btn, toolbar_btn,
     toolbar_menu_panel, StartStopState, ToolbarIcon,
 };
 
@@ -350,7 +350,11 @@ impl MainWindow {
 
     fn sync_theme_from_window(&self, window: &Window) {
         let system_dark = theme::system_is_dark(window.appearance());
-        theme::apply_preference(&self.state.settings().theme, system_dark);
+        let scheme = theme::apply_preference(&self.state.settings().theme, system_dark);
+        // Tray glyph follows scheme (template on macOS; light/dark swap on Win/Linux).
+        crate::tray::apply_scheme(scheme);
+        // Dock icon: white/black line-art masters (macOS runtime switch).
+        crate::dock_icon::apply_for_scheme(scheme.is_dark());
     }
 
     fn spawn_runtime_poller(&self, cx: &mut Context<Self>) {
@@ -1052,6 +1056,128 @@ impl MainWindow {
             .ok();
         })
         .detach();
+    }
+
+    /// Snapshot for tray checkmarks (upstream SettingsRepo / AutoRun flags).
+    pub(crate) fn tray_menu_state(&self) -> crate::tray::TrayMenuState {
+        let s = self.state.settings();
+        crate::tray::TrayMenuState {
+            start_with_system: s.start_with_system,
+            remember_last: s.remember_enable,
+            allow_lan: crate::tray::allow_lan_from_address(&s.inbound_address),
+            system_proxy: s.system_proxy_enabled,
+            tun: s.tun_mode_enabled,
+        }
+    }
+
+    fn sync_tray_menu(&self) {
+        crate::tray::sync_menu_state(self.tray_menu_state());
+    }
+
+    /// Upstream tray "Select Server" — show main list (popup selector later).
+    pub(crate) fn tray_select_server(&mut self, cx: &mut Context<Self>) {
+        self.state
+            .set_status_message_only("Select Server — pick a profile in the main window");
+        cx.notify();
+    }
+
+    /// Upstream tray "Select Routing" — open Routes dialog.
+    pub(crate) fn tray_select_routing(&mut self, cx: &mut Context<Self>) {
+        self.open_routing_settings(cx);
+    }
+
+    pub(crate) fn tray_toggle_start_with_system(&mut self, cx: &mut Context<Self>) {
+        let next = !self.state.settings().start_with_system;
+        self.state.settings_mut().start_with_system = next;
+        let _ = self.persist_db();
+        // Best-effort OS registration is platform-specific; preference is always saved.
+        self.state.set_status_message_only(if next {
+            "Start with system: enabled (preference saved)"
+        } else {
+            "Start with system: disabled"
+        });
+        self.sync_tray_menu();
+        cx.notify();
+    }
+
+    pub(crate) fn tray_toggle_remember_last(&mut self, cx: &mut Context<Self>) {
+        let next = !self.state.settings().remember_enable;
+        self.state.settings_mut().remember_enable = next;
+        if next {
+            // Capture current selection as remember_id when enabling (upstream Save).
+            if let Some(id) = self.state.selected_profile_id() {
+                self.state.settings_mut().remember_id = id;
+            }
+        }
+        let _ = self.persist_db();
+        self.state.set_status_message_only(if next {
+            "Remember last profile: on"
+        } else {
+            "Remember last profile: off"
+        });
+        self.sync_tray_menu();
+        cx.notify();
+    }
+
+    pub(crate) fn tray_toggle_allow_lan(&mut self, cx: &mut Context<Self>) {
+        let allow = !crate::tray::allow_lan_from_address(&self.state.settings().inbound_address);
+        let addr = crate::tray::inbound_address_for_allow_lan(allow).to_string();
+        let port = self.state.settings().inbound_socks_port;
+        // Preserve other basic settings while updating inbound address.
+        let s = self.state.settings().clone();
+        self.state.apply_basic_settings(
+            addr,
+            port,
+            s.test_latency_url,
+            s.remote_dns,
+            s.direct_dns,
+            s.log_level,
+            s.ruleset_mirror,
+            s.adblock_enable,
+        );
+        let _ = self.persist_db();
+        self.state.set_status_message_only(if allow {
+            "Allow other devices to connect: on (inbound ::)"
+        } else {
+            "Allow other devices to connect: off (127.0.0.1)"
+        });
+        self.sync_tray_menu();
+        cx.notify();
+    }
+
+    pub(crate) fn tray_set_system_proxy(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.set_sys_proxy(on, cx);
+        self.sync_tray_menu();
+    }
+
+    pub(crate) fn tray_set_tun(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.set_vpn(on, cx);
+        self.sync_tray_menu();
+    }
+
+    pub(crate) fn tray_disable_spmode(&mut self, cx: &mut Context<Self>) {
+        // Upstream menu_spmode_disabled: both off.
+        self.set_sys_proxy(false, cx);
+        self.set_vpn(false, cx);
+        self.sync_tray_menu();
+    }
+
+    /// Upstream `actionRestart_Proxy` / "Restart Core" — stop + kill core process.
+    pub(crate) fn tray_restart_core(&mut self, cx: &mut Context<Self>) {
+        self.state
+            .set_status_message_only("Restart Core — stopping…");
+        if self.state.core_status().is_running()
+            || matches!(self.state.core_status(), CoreStatus::Starting)
+        {
+            self.restart_when_idle = true;
+            self.stop_proxy(cx);
+        } else {
+            // Not running — just clear status.
+            self.state
+                .set_status_message_only("Restart Core — core was not running");
+            cx.notify();
+        }
+        self.sync_tray_menu();
     }
 
     pub(crate) fn toggle_proxy(&mut self, cx: &mut Context<Self>) {
@@ -1920,6 +2046,7 @@ impl MainWindow {
                             this.state.set_status_message_only(msg.to_string());
                         }
                     }
+                    this.sync_tray_menu();
                     cx.notify();
                 })
                 .ok();
@@ -1931,6 +2058,7 @@ impl MainWindow {
         self.state.set_spmode_vpn(false);
         let _ = self.persist_db();
         self.state.set_status_message_only("Tun Mode disabled");
+        self.sync_tray_menu();
         if self.state.core_status().is_running() {
             self.start_proxy(cx);
         }
@@ -1944,6 +2072,7 @@ impl MainWindow {
         let port = s.inbound_socks_port;
         let running = self.state.core_status().is_running();
         let _ = self.persist_db();
+        self.sync_tray_menu();
 
         // networksetup can block — never run it on the UI thread.
         if on && !running {
@@ -1975,6 +2104,7 @@ impl MainWindow {
                         .state
                         .set_status_message_only(format!("System Proxy failed: {e}")),
                 }
+                this.sync_tray_menu();
                 cx.notify();
             })
             .ok();
@@ -3468,10 +3598,10 @@ impl MainWindow {
                     .when(tab == 0, |row| {
                         let e_copy = entity.clone();
                         let e_clear = entity.clone();
-                        row.child(secondary_btn("log-copy", "Copy", move |_, _, cx| {
+                        row.child(icon_btn("log-copy", "icons/copy.svg", move |_, _, cx| {
                             e_copy.update(cx, |t, cx| t.copy_logs(cx));
                         }))
-                        .child(secondary_btn("log-clear", "Clear", move |_, _, cx| {
+                        .child(icon_btn("log-clear", "icons/trash.svg", move |_, _, cx| {
                             e_clear.update(cx, |t, cx| {
                                 t.state.clear_logs();
                                 cx.notify();

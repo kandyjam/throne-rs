@@ -1,4 +1,5 @@
 mod assets;
+mod dock_icon;
 mod theme;
 mod tray;
 mod ui;
@@ -33,7 +34,8 @@ fn main() {
         let window_slot: Rc<RefCell<Option<WindowHandle<MainWindow>>>> =
             Rc::new(RefCell::new(Some(open_main_window(cx, root.clone()))));
 
-        match tray::install() {
+        let tray_state = root.read(cx).tray_menu_state();
+        match tray::install(tray_state) {
             Ok(()) => {
                 let window_slot = window_slot.clone();
                 let root = root.clone();
@@ -44,16 +46,8 @@ fn main() {
                             smol::Timer::after(std::time::Duration::from_millis(100)).await;
                             while let Some(command) = tray::next_command() {
                                 if async_cx
-                                    .update(|cx| match command {
-                                        tray::TrayCommand::ShowWindow => {
-                                            show_main_window(cx, &window_slot, &root);
-                                        }
-                                        tray::TrayCommand::ToggleProxy => {
-                                            root.update(cx, |view, cx| {
-                                                view.toggle_proxy(cx);
-                                            });
-                                        }
-                                        tray::TrayCommand::Quit => cx.quit(),
+                                    .update(|cx| {
+                                        dispatch_tray_command(command, cx, &window_slot, &root)
                                     })
                                     .is_err()
                                 {
@@ -127,6 +121,72 @@ fn show_main_window(
     }
 }
 
+/// Upstream tray action routing (labels/order match `MainWindow` Setup Tray).
+fn dispatch_tray_command(
+    command: tray::TrayCommand,
+    cx: &mut App,
+    window_slot: &Rc<RefCell<Option<WindowHandle<MainWindow>>>>,
+    root: &Entity<MainWindow>,
+) {
+    match command {
+        tray::TrayCommand::ShowWindow | tray::TrayCommand::SelectServer => {
+            show_main_window(cx, window_slot, root);
+            if matches!(command, tray::TrayCommand::SelectServer) {
+                root.update(cx, |view, cx| {
+                    view.tray_select_server(cx);
+                });
+            }
+        }
+        tray::TrayCommand::SelectRouting => {
+            show_main_window(cx, window_slot, root);
+            root.update(cx, |view, cx| {
+                view.tray_select_routing(cx);
+            });
+        }
+        tray::TrayCommand::ToggleStartWithSystem => {
+            root.update(cx, |view, cx| view.tray_toggle_start_with_system(cx));
+        }
+        tray::TrayCommand::ToggleRememberLast => {
+            root.update(cx, |view, cx| view.tray_toggle_remember_last(cx));
+        }
+        tray::TrayCommand::ToggleAllowLan => {
+            root.update(cx, |view, cx| view.tray_toggle_allow_lan(cx));
+        }
+        tray::TrayCommand::EnableSystemProxy => {
+            root.update(cx, |view, cx| view.tray_set_system_proxy(true, cx));
+        }
+        tray::TrayCommand::EnableTun => {
+            root.update(cx, |view, cx| view.tray_set_tun(true, cx));
+        }
+        tray::TrayCommand::DisableSpMode => {
+            root.update(cx, |view, cx| view.tray_disable_spmode(cx));
+        }
+        tray::TrayCommand::RestartCore => {
+            root.update(cx, |view, cx| view.tray_restart_core(cx));
+        }
+        tray::TrayCommand::RestartProgram => {
+            restart_program(cx);
+        }
+        tray::TrayCommand::Exit => cx.quit(),
+    }
+}
+
+/// Upstream `actionRestart_Program` — re-exec current binary then quit.
+fn restart_program(cx: &mut App) {
+    match std::env::current_exe() {
+        Ok(exe) => {
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.args(std::env::args_os().skip(1));
+            if let Err(error) = cmd.spawn() {
+                tracing::error!(%error, "failed to restart program");
+            } else {
+                cx.quit();
+            }
+        }
+        Err(error) => tracing::error!(%error, "current_exe failed; cannot restart"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::tray::{TrayCommand, command_from_menu_id};
@@ -157,9 +217,22 @@ mod tests {
 
     #[test]
     fn tray_menu_ids_map_to_their_application_actions() {
-        assert_eq!(command_from_menu_id("throne.show"), Some(TrayCommand::ShowWindow));
-        assert_eq!(command_from_menu_id("throne.toggle"), Some(TrayCommand::ToggleProxy));
-        assert_eq!(command_from_menu_id("throne.quit"), Some(TrayCommand::Quit));
+        assert_eq!(
+            command_from_menu_id("throne.show"),
+            Some(TrayCommand::ShowWindow)
+        );
+        assert_eq!(
+            command_from_menu_id("throne.exit"),
+            Some(TrayCommand::Exit)
+        );
+        assert_eq!(
+            command_from_menu_id("throne.select_server"),
+            Some(TrayCommand::SelectServer)
+        );
+        assert_eq!(
+            command_from_menu_id("throne.sp.system_proxy"),
+            Some(TrayCommand::EnableSystemProxy)
+        );
         assert_eq!(command_from_menu_id("unrelated"), None);
     }
 

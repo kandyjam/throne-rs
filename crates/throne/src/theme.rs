@@ -157,6 +157,11 @@ impl Theme {
         }
     }
 
+    /// Toolbar / inline glyph color. Tracks [`Self::text`] so SVG icons flip with light/dark.
+    pub fn icon() -> Hsla {
+        Self::text()
+    }
+
     pub fn text_muted() -> Hsla {
         match active_scheme() {
             ColorScheme::Light => rgb(0x606060).into(),

@@ -15,6 +15,8 @@ impl AssetSource for Assets {
             "icons/wrench.svg" => include_bytes!("../assets/icons/wrench.svg").as_slice(),
             "icons/play.svg" => include_bytes!("../assets/icons/play.svg").as_slice(),
             "icons/square.svg" => include_bytes!("../assets/icons/square.svg").as_slice(),
+            "icons/copy.svg" => include_bytes!("../assets/icons/copy.svg").as_slice(),
+            "icons/trash.svg" => include_bytes!("../assets/icons/trash.svg").as_slice(),
             _ => return Ok(None),
         };
         Ok(Some(Cow::Borrowed(bytes)))
@@ -30,6 +32,8 @@ impl AssetSource for Assets {
                 "wrench.svg",
                 "play.svg",
                 "square.svg",
+                "copy.svg",
+                "trash.svg",
             ]
             .into_iter()
             .map(SharedString::from)

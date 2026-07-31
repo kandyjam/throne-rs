@@ -29,6 +29,10 @@ serde_json = { workspace = true }
 smol = "2"
 tray-icon = "0.24.1"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+cocoa = "0.26"
+objc = "0.2"
+
 # ── Desktop packaging (Zed-style) ───────────────────────────────────────
 # macOS .app via cargo-bundle; DMG/tar.gz/deb/rpm/Inno via script/bundle-*.
 # Mirror of zed-industries/zed `crates/zed` + `script/bundle-{mac,linux,windows}`.

@@ -14,7 +14,9 @@ mod route_share;
 use throne_domain::{ParsedOutbound, ProfileType, RouteProfile};
 
 pub use deeplink::{Deeplink, parse_deeplink};
-pub use fetch::{fetch_url, fetch_url_with_timeout};
+pub use fetch::{
+    FetchOptions, FetchResponse, fetch_url, fetch_url_with_options, fetch_url_with_timeout,
+};
 pub use links::parse_share_link;
 pub use route_share::{
     RouteImportReport, import_route_payload, to_share_link, to_share_object, try_import_routes,

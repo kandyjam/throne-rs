@@ -85,11 +85,42 @@ fi
 cp "$CORE_BIN" "$MACOS_DIR/ThroneCore"
 chmod +x "$MACOS_DIR/ThroneCore"
 
-# Embed icon if cargo-bundle skipped icns
+# Embed app icon. cargo-bundle often drops CFBundleIconFile; always install
+# AppIcon.icns ourselves and point Info.plist at it so Finder/Dock show it.
 RESOURCES_DIR="$APP/Contents/Resources"
+PLIST="$APP/Contents/Info.plist"
 mkdir -p "$RESOURCES_DIR"
-if [[ ! -f "$RESOURCES_DIR/app-icon.icns" && -f "$ROOT/crates/throne/resources/app-icon.icns" ]]; then
-  cp "$ROOT/crates/throne/resources/app-icon.icns" "$RESOURCES_DIR/AppIcon.icns"
+ICON_SRC="$ROOT/crates/throne/resources/app-icon.icns"
+if [[ ! -f "$ICON_SRC" ]]; then
+  ICON_SRC="$ROOT/packaging/icons/icon.icns"
+fi
+if [[ -f "$ICON_SRC" ]]; then
+  # Default AppIcon = light (white bg). Dark variant ships alongside for runtime swap.
+  cp "$ICON_SRC" "$RESOURCES_DIR/AppIcon.icns"
+  for pair in \
+    "app-icon-light.icns:AppIcon-light.icns" \
+    "app-icon-dark.icns:AppIcon-dark.icns" \
+    "app-icon-light.png:AppIcon-light.png" \
+    "app-icon-dark.png:AppIcon-dark.png"
+  do
+    src_name="${pair%%:*}"
+    dst_name="${pair##*:}"
+    if [[ -f "$ROOT/crates/throne/resources/$src_name" ]]; then
+      cp "$ROOT/crates/throne/resources/$src_name" "$RESOURCES_DIR/$dst_name"
+    fi
+  done
+  # Value is the file base name (with or without .icns both work; Apple docs use no ext).
+  if [[ -f "$PLIST" ]]; then
+    /usr/libexec/PlistBuddy -c 'Set :CFBundleIconFile AppIcon' "$PLIST" 2>/dev/null \
+      || /usr/libexec/PlistBuddy -c 'Add :CFBundleIconFile string AppIcon' "$PLIST"
+    # Drop any stale cargo-bundle icon names that don't exist.
+    for stale in app-icon icon icon.icns app-icon.icns; do
+      rm -f "$RESOURCES_DIR/$stale" "$RESOURCES_DIR/${stale}.icns" 2>/dev/null || true
+    done
+  fi
+  log "Embedded AppIcon.icns (+ light/dark line-art variants) + CFBundleIconFile"
+else
+  warn "No app-icon.icns found — bundle will use the generic macOS icon"
 fi
 
 # Optional entitlements codesign (unsigned local builds are fine)

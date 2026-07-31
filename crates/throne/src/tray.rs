@@ -1,49 +1,274 @@
+//! System tray — menu layout mirrors upstream Throne `MainWindow` tray setup:
+//!
+//! ```text
+//! Show Window
+//! ───────────
+//! Start with system              [check]
+//! Remember last profile          [check]
+//! Allow other devices to connect [check]
+//! ───────────
+//! Select Server
+//! Select Routing
+//! System Proxy ▶
+//!   Enable System Proxy          [check]
+//!   Enable Tun                   [check]
+//!   Disable                      [check]
+//! ───────────
+//! Restart Core
+//! Restart Program
+//! Exit
+//! ```
+//!
+//! Source: `throneproj/Throne` `src/ui/mainwindow.cpp` (Setup Tray).
+
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use tray_icon::{
-    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
-    Icon, TrayIconBuilder,
+    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
+    Icon, TrayIcon, TrayIconBuilder,
 };
 
+use crate::theme::ColorScheme;
+
+// ── Menu item ids (stable strings for MenuEvent routing) ─────────────────
+
 pub const SHOW_WINDOW_ID: &str = "throne.show";
-pub const TOGGLE_PROXY_ID: &str = "throne.toggle";
-pub const QUIT_ID: &str = "throne.quit";
+pub const START_WITH_SYSTEM_ID: &str = "throne.start_with_system";
+pub const REMEMBER_LAST_ID: &str = "throne.remember_last";
+pub const ALLOW_LAN_ID: &str = "throne.allow_lan";
+pub const SELECT_SERVER_ID: &str = "throne.select_server";
+pub const SELECT_ROUTING_ID: &str = "throne.select_routing";
+pub const SP_SYSTEM_PROXY_ID: &str = "throne.sp.system_proxy";
+pub const SP_TUN_ID: &str = "throne.sp.tun";
+pub const SP_DISABLED_ID: &str = "throne.sp.disabled";
+pub const RESTART_CORE_ID: &str = "throne.restart_core";
+pub const RESTART_PROGRAM_ID: &str = "throne.restart_program";
+pub const EXIT_ID: &str = "throne.exit";
+
+/// White crown line-art (alpha mask). Used as macOS template and dark-bar glyph.
+/// 64×64 for sharper menu-bar rendering on retina displays.
+const TRAY_ICON_ON_DARK: &[u8] = include_bytes!("../assets/tray-icon-on-dark.rgba");
+/// Near-black crown line-art for light menu bars / taskbars (Win/Linux).
+const TRAY_ICON_ON_LIGHT: &[u8] = include_bytes!("../assets/tray-icon-on-light.rgba");
+const TRAY_ICON_SIZE: u32 = 64;
+
+struct TrayHandles {
+    tray: TrayIcon,
+    start_with_system: CheckMenuItem,
+    remember_last: CheckMenuItem,
+    allow_lan: CheckMenuItem,
+    sp_system_proxy: CheckMenuItem,
+    sp_tun: CheckMenuItem,
+    sp_disabled: CheckMenuItem,
+}
+
+// tray-icon::TrayIcon is !Send/!Sync — keep it on the UI thread only.
+thread_local! {
+    static TRAY: RefCell<Option<TrayHandles>> = const { RefCell::new(None) };
+}
+
+/// 0 = unset, 1 = light, 2 = dark — avoid redundant set_icon calls.
+static APPLIED_SCHEME: AtomicU8 = AtomicU8::new(0);
+
+/// Snapshot used to paint checkmarks (upstream reads SettingsRepo on show).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TrayMenuState {
+    pub start_with_system: bool,
+    pub remember_last: bool,
+    pub allow_lan: bool,
+    pub system_proxy: bool,
+    pub tun: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayCommand {
     ShowWindow,
-    ToggleProxy,
-    Quit,
+    ToggleStartWithSystem,
+    ToggleRememberLast,
+    ToggleAllowLan,
+    SelectServer,
+    SelectRouting,
+    EnableSystemProxy,
+    EnableTun,
+    DisableSpMode,
+    RestartCore,
+    RestartProgram,
+    Exit,
 }
 
 pub fn command_from_menu_id(id: &str) -> Option<TrayCommand> {
     match id {
         SHOW_WINDOW_ID => Some(TrayCommand::ShowWindow),
-        TOGGLE_PROXY_ID => Some(TrayCommand::ToggleProxy),
-        QUIT_ID => Some(TrayCommand::Quit),
+        START_WITH_SYSTEM_ID => Some(TrayCommand::ToggleStartWithSystem),
+        REMEMBER_LAST_ID => Some(TrayCommand::ToggleRememberLast),
+        ALLOW_LAN_ID => Some(TrayCommand::ToggleAllowLan),
+        SELECT_SERVER_ID => Some(TrayCommand::SelectServer),
+        SELECT_ROUTING_ID => Some(TrayCommand::SelectRouting),
+        SP_SYSTEM_PROXY_ID => Some(TrayCommand::EnableSystemProxy),
+        SP_TUN_ID => Some(TrayCommand::EnableTun),
+        SP_DISABLED_ID => Some(TrayCommand::DisableSpMode),
+        RESTART_CORE_ID => Some(TrayCommand::RestartCore),
+        RESTART_PROGRAM_ID => Some(TrayCommand::RestartProgram),
+        EXIT_ID => Some(TrayCommand::Exit),
         _ => None,
     }
 }
 
-pub fn install() -> Result<(), String> {
-    let menu = Menu::new();
-    let show_window = MenuItem::with_id(SHOW_WINDOW_ID, "Show Throne", true, None);
-    let toggle_proxy = MenuItem::with_id(TOGGLE_PROXY_ID, "Start / Stop Proxy", true, None);
-    let quit = MenuItem::with_id(QUIT_ID, "Quit Throne", true, None);
-    let separator = PredefinedMenuItem::separator();
-    menu.append_items(&[&show_window, &toggle_proxy, &separator, &quit])
-        .map_err(|error| format!("build tray menu: {error}"))?;
+/// Build the upstream-aligned tray menu and install the status item.
+pub fn install(initial: TrayMenuState) -> Result<(), String> {
+    let show_window = MenuItem::with_id(SHOW_WINDOW_ID, "Show Window", true, None);
 
-    let icon = Icon::from_rgba(throne_icon_rgba(), 16, 16)
+    let start_with_system = CheckMenuItem::with_id(
+        START_WITH_SYSTEM_ID,
+        "Start with system",
+        true,
+        initial.start_with_system,
+        None,
+    );
+    let remember_last = CheckMenuItem::with_id(
+        REMEMBER_LAST_ID,
+        "Remember last profile",
+        true,
+        initial.remember_last,
+        None,
+    );
+    let allow_lan = CheckMenuItem::with_id(
+        ALLOW_LAN_ID,
+        "Allow other devices to connect",
+        true,
+        initial.allow_lan,
+        None,
+    );
+
+    let select_server = MenuItem::with_id(SELECT_SERVER_ID, "Select Server", true, None);
+    let select_routing = MenuItem::with_id(SELECT_ROUTING_ID, "Select Routing", true, None);
+
+    let sp_system_proxy = CheckMenuItem::with_id(
+        SP_SYSTEM_PROXY_ID,
+        "Enable System Proxy",
+        true,
+        initial.system_proxy,
+        None,
+    );
+    let sp_tun = CheckMenuItem::with_id(SP_TUN_ID, "Enable Tun", true, initial.tun, None);
+    let sp_disabled = CheckMenuItem::with_id(
+        SP_DISABLED_ID,
+        "Disable",
+        true,
+        !initial.system_proxy && !initial.tun,
+        None,
+    );
+
+    let sp_menu = Submenu::with_id("throne.spmode", "System Proxy", true);
+    sp_menu
+        .append_items(&[&sp_system_proxy, &sp_tun, &sp_disabled])
+        .map_err(|error| format!("build System Proxy submenu: {error}"))?;
+
+    let restart_core = MenuItem::with_id(RESTART_CORE_ID, "Restart Core", true, None);
+    let restart_program = MenuItem::with_id(RESTART_PROGRAM_ID, "Restart Program", true, None);
+    let exit = MenuItem::with_id(EXIT_ID, "Exit", true, None);
+
+    let sep1 = PredefinedMenuItem::separator();
+    let sep2 = PredefinedMenuItem::separator();
+    let sep3 = PredefinedMenuItem::separator();
+
+    let menu = Menu::new();
+    menu.append_items(&[
+        &show_window,
+        &sep1,
+        &start_with_system,
+        &remember_last,
+        &allow_lan,
+        &sep2,
+        &select_server,
+        &select_routing,
+        &sp_menu,
+        &sep3,
+        &restart_core,
+        &restart_program,
+        &exit,
+    ])
+    .map_err(|error| format!("build tray menu: {error}"))?;
+
+    let scheme = crate::theme::active_scheme();
+    let (rgba, template) = icon_bytes_for_scheme(scheme);
+    let icon = Icon::from_rgba(rgba, TRAY_ICON_SIZE, TRAY_ICON_SIZE)
         .map_err(|error| format!("build tray icon: {error}"))?;
+
     let tray = TrayIconBuilder::new()
         .with_id("throne")
         .with_menu(Box::new(menu))
         .with_icon(icon)
-        .with_icon_as_template(true)
+        .with_icon_as_template(template)
         .with_tooltip("Throne")
         .build()
         .map_err(|error| format!("install system tray: {error}"))?;
-    Box::leak(Box::new(tray));
+
+    TRAY.with(|cell| {
+        *cell.borrow_mut() = Some(TrayHandles {
+            tray,
+            start_with_system,
+            remember_last,
+            allow_lan,
+            sp_system_proxy,
+            sp_tun,
+            sp_disabled,
+        });
+    });
+    store_applied(scheme);
     Ok(())
+}
+
+/// Refresh checkmarks from app settings (call after settings / spmode changes).
+pub fn sync_menu_state(state: TrayMenuState) {
+    TRAY.with(|cell| {
+        let guard = cell.borrow();
+        let Some(h) = guard.as_ref() else {
+            return;
+        };
+        h.start_with_system.set_checked(state.start_with_system);
+        h.remember_last.set_checked(state.remember_last);
+        h.allow_lan.set_checked(state.allow_lan);
+        h.sp_system_proxy.set_checked(state.system_proxy);
+        h.sp_tun.set_checked(state.tun);
+        h.sp_disabled
+            .set_checked(!state.system_proxy && !state.tun);
+    });
+}
+
+/// Re-tint / swap the tray glyph when UI scheme or OS appearance changes.
+///
+/// Must be called on the same thread that ran [`install`] (GPUI UI thread).
+pub fn apply_scheme(scheme: ColorScheme) {
+    if APPLIED_SCHEME.load(Ordering::Relaxed) == scheme_tag(scheme) {
+        return;
+    }
+    let (rgba, template) = icon_bytes_for_scheme(scheme);
+    let icon = match Icon::from_rgba(rgba, TRAY_ICON_SIZE, TRAY_ICON_SIZE) {
+        Ok(icon) => icon,
+        Err(error) => {
+            tracing::warn!(%error, "failed to build themed tray icon");
+            return;
+        }
+    };
+
+    TRAY.with(|cell| {
+        let guard = cell.borrow();
+        let Some(h) = guard.as_ref() else {
+            return;
+        };
+        let result = if cfg!(target_os = "macos") {
+            h.tray.set_icon_with_as_template(Some(icon), template)
+        } else {
+            h.tray.set_icon(Some(icon))
+        };
+        if let Err(error) = result {
+            tracing::warn!(%error, "failed to update tray icon for theme");
+            return;
+        }
+        store_applied(scheme);
+    });
 }
 
 pub fn next_command() -> Option<TrayCommand> {
@@ -55,45 +280,131 @@ pub fn next_command() -> Option<TrayCommand> {
     }
 }
 
-fn throne_icon_rgba() -> Vec<u8> {
-    let mut rgba = vec![0; 16 * 16 * 4];
-    for (y, ranges) in [
-        (2, &[7..9][..]),
-        (3, &[6..10][..]),
-        (4, &[3..5, 6..10, 11..13][..]),
-        (5, &[3..5, 5..11, 11..13][..]),
-        (6, &[3..13][..]),
-        (7, &[4..12][..]),
-        (8, &[4..12][..]),
-        (9, &[4..12][..]),
-        (10, &[5..11][..]),
-        (11, &[5..11][..]),
-        (12, &[4..12][..]),
-        (13, &[4..12][..]),
-    ] {
-        for range in ranges {
-            for x in range.clone() {
-                let offset = (y * 16 + x) * 4;
-                rgba[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
-            }
+/// Upstream Allow LAN: inbound `::` / `0.0.0.0` vs loopback `127.0.0.1`.
+pub fn allow_lan_from_address(addr: &str) -> bool {
+    matches!(addr.trim(), "::" | "0.0.0.0")
+}
+
+pub fn inbound_address_for_allow_lan(allow: bool) -> &'static str {
+    if allow {
+        "::"
+    } else {
+        "127.0.0.1"
+    }
+}
+
+fn store_applied(scheme: ColorScheme) {
+    APPLIED_SCHEME.store(scheme_tag(scheme), Ordering::Relaxed);
+}
+
+fn scheme_tag(scheme: ColorScheme) -> u8 {
+    match scheme {
+        ColorScheme::Light => 1,
+        ColorScheme::Dark => 2,
+    }
+}
+
+fn icon_bytes_for_scheme(scheme: ColorScheme) -> (Vec<u8>, bool) {
+    if cfg!(target_os = "macos") {
+        let _ = scheme;
+        (TRAY_ICON_ON_DARK.to_vec(), true)
+    } else {
+        match scheme {
+            ColorScheme::Light => (TRAY_ICON_ON_LIGHT.to_vec(), false),
+            ColorScheme::Dark => (TRAY_ICON_ON_DARK.to_vec(), false),
         }
     }
-    rgba
 }
 
 #[cfg(test)]
 mod tests {
-    use super::throne_icon_rgba;
+    use super::*;
 
     #[test]
-    fn tray_icon_uses_a_transparent_canvas_with_crown_peaks() {
-        let rgba = throne_icon_rgba();
-        let alpha = |x: usize, y: usize| rgba[(y * 16 + x) * 4 + 3];
+    fn menu_ids_map_to_upstream_tray_actions() {
+        assert_eq!(
+            command_from_menu_id(SHOW_WINDOW_ID),
+            Some(TrayCommand::ShowWindow)
+        );
+        assert_eq!(
+            command_from_menu_id(START_WITH_SYSTEM_ID),
+            Some(TrayCommand::ToggleStartWithSystem)
+        );
+        assert_eq!(
+            command_from_menu_id(REMEMBER_LAST_ID),
+            Some(TrayCommand::ToggleRememberLast)
+        );
+        assert_eq!(
+            command_from_menu_id(ALLOW_LAN_ID),
+            Some(TrayCommand::ToggleAllowLan)
+        );
+        assert_eq!(
+            command_from_menu_id(SELECT_SERVER_ID),
+            Some(TrayCommand::SelectServer)
+        );
+        assert_eq!(
+            command_from_menu_id(SELECT_ROUTING_ID),
+            Some(TrayCommand::SelectRouting)
+        );
+        assert_eq!(
+            command_from_menu_id(SP_SYSTEM_PROXY_ID),
+            Some(TrayCommand::EnableSystemProxy)
+        );
+        assert_eq!(
+            command_from_menu_id(SP_TUN_ID),
+            Some(TrayCommand::EnableTun)
+        );
+        assert_eq!(
+            command_from_menu_id(SP_DISABLED_ID),
+            Some(TrayCommand::DisableSpMode)
+        );
+        assert_eq!(
+            command_from_menu_id(RESTART_CORE_ID),
+            Some(TrayCommand::RestartCore)
+        );
+        assert_eq!(
+            command_from_menu_id(RESTART_PROGRAM_ID),
+            Some(TrayCommand::RestartProgram)
+        );
+        assert_eq!(command_from_menu_id(EXIT_ID), Some(TrayCommand::Exit));
+        assert_eq!(command_from_menu_id("unknown"), None);
+    }
 
-        assert_eq!(rgba.len(), 16 * 16 * 4);
-        assert_eq!(alpha(2, 2), 0);
-        assert_eq!(alpha(3, 5), 255);
-        assert_eq!(alpha(7, 2), 255);
-        assert_eq!(alpha(12, 5), 255);
+    #[test]
+    fn allow_lan_address_helpers_match_upstream() {
+        assert!(allow_lan_from_address("::"));
+        assert!(allow_lan_from_address("0.0.0.0"));
+        assert!(!allow_lan_from_address("127.0.0.1"));
+        assert_eq!(inbound_address_for_allow_lan(true), "::");
+        assert_eq!(inbound_address_for_allow_lan(false), "127.0.0.1");
+    }
+
+    #[test]
+    fn tray_assets_are_64x64_geometric_icon_with_transparent_corners() {
+        for bytes in [TRAY_ICON_ON_DARK, TRAY_ICON_ON_LIGHT] {
+            assert_eq!(bytes.len(), (TRAY_ICON_SIZE * TRAY_ICON_SIZE * 4) as usize);
+            let alpha = |x: u32, y: u32| bytes[((y * TRAY_ICON_SIZE + x) * 4 + 3) as usize];
+            // Transparent canvas corners.
+            assert_eq!(alpha(0, 0), 0);
+            assert_eq!(alpha(63, 0), 0);
+            assert_eq!(alpha(0, 63), 0);
+            assert_eq!(alpha(63, 63), 0);
+            let mut painted = 0u32;
+            for y in 0..TRAY_ICON_SIZE {
+                for x in 0..TRAY_ICON_SIZE {
+                    if alpha(x, y) > 0 {
+                        painted += 1;
+                    }
+                }
+            }
+            // Lucide-style outline crown strokes — sparse, not a full-canvas fill.
+            assert!(
+                painted > 200 && painted < 2800,
+                "expected outline crown stroke pixels, got {painted}"
+            );
+            // Some stroke ink near the crown body / base line.
+            let has_stroke = (20..48).any(|y| (16..48).any(|x| alpha(x, y) > 0));
+            assert!(has_stroke, "expected crown stroke pixels in center region");
+        }
     }
 }

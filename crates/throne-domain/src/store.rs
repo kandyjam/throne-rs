@@ -919,6 +919,8 @@ impl AppState {
             allow_stopping_active_profile: cur.allow_stopping_active_profile,
             show_config_security: cur.show_config_security,
             remember_id: cur.remember_id,
+            remember_enable: cur.remember_enable,
+            start_with_system: cur.start_with_system,
             system_proxy_enabled: cur.system_proxy_enabled,
             tun_mode_enabled: cur.tun_mode_enabled,
             system_dns_set: cur.system_dns_set,
@@ -1697,5 +1699,88 @@ mod tests {
         assert_eq!(sum2.added, 1);
         assert_eq!(sum2.removed, 2);
         assert!(sum2.format_status().contains("+1"));
+    }
+
+    #[test]
+    fn subscription_snapshot_preserves_identity_metadata_and_remote_order() {
+        let mut state = AppState::empty();
+        let group_id = state.add_group("sub");
+        let mut old_a = ParsedOutbound::default();
+        old_a.server = Some("a.example".into());
+        old_a.server_port = Some(443);
+        old_a.uuid = Some("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into());
+        old_a.sni = Some("old.example".into());
+        let mut old_b = ParsedOutbound::default();
+        old_b.server = Some("b.example".into());
+        old_b.server_port = Some(443);
+        old_b.uuid = Some("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".into());
+        state
+            .replace_group_profiles(
+                group_id,
+                vec![
+                    ("A".into(), ProfileType::Vless, old_a.clone(), false),
+                    ("B".into(), ProfileType::Vless, old_b.clone(), false),
+                ],
+            )
+            .unwrap();
+        let old_ids = state.group(group_id).unwrap().profile_ids.clone();
+        state.profiles.get_mut(&old_ids[0]).unwrap().latency_ms = 42;
+        state.profiles.get_mut(&old_ids[0]).unwrap().traffic_downlink = 900;
+
+        let mut changed_a = old_a;
+        changed_a.sni = Some("new.example".into());
+        let mut new_c = ParsedOutbound::default();
+        new_c.server = Some("c.example".into());
+        new_c.server_port = Some(8443);
+        new_c.password = Some("secret".into());
+        let report = state
+            .apply_subscription_snapshot(
+                group_id,
+                vec![
+                    ("B".into(), ProfileType::Vless, old_b, false),
+                    ("A renamed".into(), ProfileType::Vless, changed_a, true),
+                    ("C".into(), ProfileType::Trojan, new_c, false),
+                ],
+                "upload=1; download=2; total=10".into(),
+                1_785_500_000,
+            )
+            .unwrap();
+
+        assert_eq!(report.added.len(), 1);
+        assert_eq!(report.updated.len(), 1);
+        assert_eq!(report.deleted.len(), 0);
+        assert_eq!(report.unchanged, 1);
+        assert_eq!(report.result_order[..2], [old_ids[1], old_ids[0]]);
+        assert_eq!(state.profile(old_ids[0]).unwrap().latency_ms, 42);
+        assert_eq!(state.profile(old_ids[0]).unwrap().traffic_downlink, 900);
+        assert_eq!(state.profile(old_ids[0]).unwrap().name, "A renamed");
+        assert!(state.profile(old_ids[0]).unwrap().insecure);
+        let group = state.group(group_id).unwrap();
+        assert_eq!(group.info, "upload=1; download=2; total=10");
+        assert_eq!(group.sub_last_update, 1_785_500_000);
+    }
+
+    #[test]
+    fn subscription_snapshot_reports_deletions() {
+        let mut state = AppState::empty();
+        let group_id = state.add_group("sub");
+        let mut outbound = ParsedOutbound::default();
+        outbound.server = Some("gone.example".into());
+        outbound.server_port = Some(443);
+        state
+            .replace_group_profiles(
+                group_id,
+                vec![("Gone".into(), ProfileType::Trojan, outbound, false)],
+            )
+            .unwrap();
+        let removed_id = state.group(group_id).unwrap().profile_ids[0];
+
+        let report = state
+            .apply_subscription_snapshot(group_id, Vec::new(), String::new(), 123)
+            .unwrap();
+
+        assert_eq!(report.deleted.len(), 1);
+        assert_eq!(report.deleted[0].profile_id, removed_id);
+        assert!(state.profile(removed_id).is_none());
     }
 }

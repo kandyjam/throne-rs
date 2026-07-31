@@ -667,6 +667,8 @@ fn merge_settings_tx(
         ("show_config_security", bool_str(s.show_config_security)),
         ("current_route_id", s.current_route_id.to_string()),
         ("remember_id", s.remember_id.to_string()),
+        ("remember_enable", bool_str(s.remember_enable)),
+        ("start_with_system", bool_str(s.start_with_system)),
         ("system_proxy_enabled", bool_str(s.system_proxy_enabled)),
         ("tun_mode_enabled", bool_str(s.tun_mode_enabled)),
         ("system_dns_set", bool_str(s.system_dns_set)),
@@ -765,6 +767,8 @@ fn apply_setting(s: &mut AppSettings, key: &str, value: &str) {
                 s.remember_id = n;
             }
         }
+        "remember_enable" => s.remember_enable = parse_bool(value),
+        "start_with_system" => s.start_with_system = parse_bool(value),
         "system_proxy_enabled" => s.system_proxy_enabled = parse_bool(value),
         "tun_mode_enabled" => s.tun_mode_enabled = parse_bool(value),
         "system_dns_set" => s.system_dns_set = parse_bool(value),
