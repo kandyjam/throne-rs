@@ -184,6 +184,27 @@ fn should_update_rendered_log_text(logs_tab_active: bool) -> bool {
     logs_tab_active
 }
 
+fn runtime_poll_health(current_failures: u8, succeeded: bool) -> (u8, bool) {
+    if succeeded {
+        (0, false)
+    } else {
+        let failures = current_failures.saturating_add(1);
+        (failures, failures >= 3)
+    }
+}
+
+fn next_runtime_generation(current: u64) -> (u64, u8) {
+    (current.wrapping_add(1), 0)
+}
+
+fn runtime_poll_is_current(poll_generation: u64, current_generation: u64) -> bool {
+    poll_generation == current_generation
+}
+
+fn should_queue_recovery_restart(network_recovery_busy: bool) -> bool {
+    network_recovery_busy
+}
+
 /// Latest node the user wants after the current core op finishes.
 ///
 /// Always keeps the **most recent** click (rapid switching must not stick on
@@ -331,6 +352,8 @@ pub struct MainWindow {
     core: Arc<Mutex<CoreSession>>,
     /// True while a start/stop background job is in flight (ignore re-clicks).
     core_op_busy: bool,
+    /// OS proxy cleanup is running after repeated core health failures.
+    network_recovery_busy: bool,
     /// When Tun/Proxy mode changes during a busy start/stop, restart once idle.
     restart_when_idle: bool,
     /// User asked to Stop while Start was still in flight — run stop once idle.
@@ -352,6 +375,10 @@ pub struct MainWindow {
     prev_traffic_at: Option<std::time::Instant>,
     /// Prevent an overdue core request from queuing another poll.
     runtime_poll_busy: bool,
+    /// Consecutive QueryStats failures; three means the local proxy is unhealthy.
+    runtime_poll_failures: u8,
+    /// Invalidates overdue poll results across starts, stops, and profile switches.
+    runtime_generation: u64,
     /// Keeps the OS appearance observer alive for the current window.
     _appearance_sub: Option<Subscription>,
 }
@@ -418,6 +445,7 @@ impl MainWindow {
             mg_focus: MgFocus::NewName,
             core: Arc::new(Mutex::new(CoreSession::new(core_cfg))),
             core_op_busy: false,
+            network_recovery_busy: false,
             restart_when_idle: false,
             pending_stop: false,
             running_profile_display: None,
@@ -430,6 +458,8 @@ impl MainWindow {
             connections: Vec::new(),
             prev_traffic_at: None,
             runtime_poll_busy: false,
+            runtime_poll_failures: 0,
+            runtime_generation: 0,
             _appearance_sub: None,
         };
         window.spawn_runtime_poller(cx);
@@ -1266,6 +1296,14 @@ impl MainWindow {
     pub(crate) fn tray_restart_core(&mut self, cx: &mut Context<Self>) {
         self.state
             .set_status_message_only("Restart Core — stopping…");
+        if should_queue_recovery_restart(self.network_recovery_busy) {
+            self.restart_when_idle = true;
+            self.state
+                .set_status_message_only("Restart Core queued — restoring network first…");
+            self.sync_tray_menu();
+            cx.notify();
+            return;
+        }
         if self.state.core_status().is_running()
             || matches!(self.state.core_status(), CoreStatus::Starting)
         {
@@ -1283,7 +1321,11 @@ impl MainWindow {
     pub(crate) fn toggle_proxy(&mut self, cx: &mut Context<Self>) {
         self.close_menus();
         if self.core_op_busy {
-            if matches!(self.state.core_status(), CoreStatus::Starting) {
+            if should_queue_recovery_restart(self.network_recovery_busy) {
+                self.restart_when_idle = true;
+                self.state
+                    .set_status_message_only("Start queued — restoring network first…");
+            } else if matches!(self.state.core_status(), CoreStatus::Starting) {
                 // Cancel in-flight start → stop when it finishes.
                 self.pending_stop = true;
                 self.restart_when_idle = false;
@@ -1379,6 +1421,8 @@ impl MainWindow {
 
         self.core_op_busy = true;
         self.pending_stop = false;
+        (self.runtime_generation, self.runtime_poll_failures) =
+            next_runtime_generation(self.runtime_generation);
         self.state.set_core_status(CoreStatus::Starting);
         let profile_display = runtime_profile_display(profile.profile_type, &profile.name);
         self.running_profile_display = Some(profile_display.clone());
@@ -1548,6 +1592,8 @@ impl MainWindow {
         );
         self.core_op_busy = true;
         self.pending_stop = false;
+        (self.runtime_generation, self.runtime_poll_failures) =
+            next_runtime_generation(self.runtime_generation);
         if let Some(profile_display) = stop_profile_display {
             self.state.push_log(stop_profile_log(&profile_display));
         }
@@ -2121,27 +2167,35 @@ impl MainWindow {
             return;
         }
         self.runtime_poll_busy = true;
+        let poll_generation = self.runtime_generation;
         let core = Arc::clone(&self.core);
         let want_conn = self.bottom_tab == 1;
         cx.spawn(async move |this, cx| {
             let snap = cx
                 .background_executor()
                 .spawn(async move {
-                    let mut guard = core.lock().ok()?;
-                    let stats = guard.query_stats().ok();
+                    let mut guard = core
+                        .lock()
+                        .map_err(|_| "core session lock poisoned".to_string())?;
+                    let stats = guard.query_stats().map_err(|error| error.to_string())?;
                     let conns = if want_conn {
                         guard.query_connections().unwrap_or_default()
                     } else {
                         Vec::new()
                     };
-                    Some((stats, conns))
+                    Ok::<_, String>((stats, conns))
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.runtime_poll_busy = false;
-                if let Some((stats, conns)) = snap {
-                    let mut traffic_changed = false;
-                    if let Some(cum) = stats {
+                if !runtime_poll_is_current(poll_generation, this.runtime_generation) {
+                    return;
+                }
+                let (failures, recover_network) =
+                    runtime_poll_health(this.runtime_poll_failures, snap.is_ok());
+                this.runtime_poll_failures = failures;
+                match snap {
+                    Ok((cum, conns)) => {
                         let now = std::time::Instant::now();
                         let rates = if let Some(prev_at) = this.prev_traffic_at {
                             let dt = now.duration_since(prev_at).as_secs_f64().max(0.4);
@@ -2156,18 +2210,56 @@ impl MainWindow {
                             TrafficSnapshot::default()
                         };
                         this.prev_traffic_at = Some(now);
-                        traffic_changed = this.state.update_live_traffic(rates);
+                        let traffic_changed = this.state.update_live_traffic(rates);
                         if let CoreStatus::Running { profile_id, .. } = this.state.core_status() {
                             this.state
                                 .set_profile_traffic(*profile_id, cum.proxy_down, cum.proxy_up);
                         }
+                        if want_conn {
+                            this.connections = conns;
+                        }
+                        if traffic_changed || want_conn {
+                            cx.notify();
+                        }
                     }
-                    if want_conn {
-                        this.connections = conns;
-                    }
-                    if traffic_changed || want_conn {
+                    Err(error) if recover_network => {
+                        (this.runtime_generation, this.runtime_poll_failures) =
+                            next_runtime_generation(this.runtime_generation);
+                        this.core_op_busy = true;
+                        this.network_recovery_busy = true;
+                        this.prev_traffic_at = None;
+                        this.connections.clear();
+                        this.state.set_core_status(CoreStatus::Error(format!(
+                            "Core health check failed: {error}"
+                        )));
+                        this.state.push_log(format!(
+                            "Core health check failed 3 times; clearing system proxy: {error}"
+                        ));
+                        cx.spawn(async move |this, cx| {
+                            cx.background_spawn(async move {
+                                force_clear_system_proxy();
+                                let _ = throne_core_client::set_tun_system_dns(false, "");
+                            })
+                            .await;
+                            this.update(cx, |this, cx| {
+                                this.network_recovery_busy = false;
+                                this.core_op_busy = false;
+                                if this.pending_stop {
+                                    this.pending_stop = false;
+                                    this.stop_proxy(cx);
+                                } else if this.restart_when_idle {
+                                    this.restart_when_idle = false;
+                                    this.start_proxy(cx);
+                                } else {
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                        })
+                        .detach();
                         cx.notify();
                     }
+                    Err(_) => {}
                 }
             })
             .ok();
@@ -4393,8 +4485,10 @@ mod tests {
     use super::{
         CoreAction, FAILED_STOP_PROFILE_LOG, PendingProfileSwitch, SortColumn,
         SubscriptionUpdateQueue, UpdateOrigin, eligible_subscription_ids,
-        failed_start_profile_log, next_core_action, next_sort_state, resolve_stop_profile_display,
-        running_mode_marker, runtime_profile_display, should_scroll_logs_to_bottom,
+        failed_start_profile_log, next_core_action, next_runtime_generation, next_sort_state,
+        resolve_stop_profile_display, running_mode_marker, runtime_poll_health,
+        runtime_poll_is_current, runtime_profile_display, should_queue_recovery_restart,
+        should_scroll_logs_to_bottom,
         should_show_subscription_diff, should_update_rendered_log_text,
         start_profile_log, stop_profile_log, subscription_fetch_options,
     };
@@ -4454,6 +4548,39 @@ mod tests {
         assert_eq!(queue.take_next(), None);
         assert!(queue.is_finished());
         assert_eq!(queue.completion_message(), "Subscription update finished · 1 succeeded · 1 failed");
+    }
+
+    #[test]
+    fn runtime_poll_tolerates_two_consecutive_failures() {
+        assert_eq!(runtime_poll_health(0, false), (1, false));
+        assert_eq!(runtime_poll_health(1, false), (2, false));
+    }
+
+    #[test]
+    fn runtime_poll_recovers_direct_network_after_three_failures() {
+        assert_eq!(runtime_poll_health(2, false), (3, true));
+    }
+
+    #[test]
+    fn successful_runtime_poll_resets_failure_count() {
+        assert_eq!(runtime_poll_health(2, true), (0, false));
+    }
+
+    #[test]
+    fn lifecycle_transition_resets_poll_failures_and_advances_generation() {
+        assert_eq!(next_runtime_generation(7), (8, 0));
+    }
+
+    #[test]
+    fn stale_poll_result_cannot_recover_a_newer_core_run() {
+        assert!(runtime_poll_is_current(8, 8));
+        assert!(!runtime_poll_is_current(7, 8));
+    }
+
+    #[test]
+    fn start_during_network_recovery_is_queued() {
+        assert!(should_queue_recovery_restart(true));
+        assert!(!should_queue_recovery_restart(false));
     }
 
     #[test]
