@@ -107,7 +107,18 @@ impl Database {
         tx.execute("DELETE FROM groups_order", [])?;
         tx.execute("DELETE FROM groups", [])?;
 
-        for g in state.all_groups() {
+        // Prefer tab order, but always persist every group so profile FK(gid)
+        // cannot fail when group_order is a partial subset.
+        let mut saved_groups: Vec<&throne_domain::Group> = state.all_groups();
+        let ordered: std::collections::HashSet<_> =
+            saved_groups.iter().map(|g| g.id).collect();
+        for g in state.groups_map().values() {
+            if !ordered.contains(&g.id) {
+                saved_groups.push(g);
+            }
+        }
+
+        for g in &saved_groups {
             let profiles_json = serde_json::to_string(&g.profile_ids)?;
             tx.execute(
                 r#"INSERT INTO groups (
@@ -138,14 +149,35 @@ impl Database {
             )?;
         }
 
-        for (idx, gid) in state.group_order().iter().enumerate() {
+        let saved_ids: std::collections::HashSet<_> =
+            saved_groups.iter().map(|g| g.id).collect();
+        let mut order_idx = 0i64;
+        for gid in state.group_order() {
+            if !saved_ids.contains(gid) {
+                continue;
+            }
             tx.execute(
                 "INSERT INTO groups_order (group_id, display_order) VALUES (?1, ?2)",
-                params![gid, idx as i64],
+                params![gid, order_idx],
             )?;
+            order_idx += 1;
+        }
+        for g in &saved_groups {
+            if state.group_order().contains(&g.id) {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO groups_order (group_id, display_order) VALUES (?1, ?2)",
+                params![g.id, order_idx],
+            )?;
+            order_idx += 1;
         }
 
         for p in state.all_profiles() {
+            // Skip orphans — profiles.gid has FK → groups(id).
+            if !saved_ids.contains(&p.group_id) {
+                continue;
+            }
             let outbound_json = outbound_json_for_db(p);
             tx.execute(
                 r#"INSERT INTO profiles (

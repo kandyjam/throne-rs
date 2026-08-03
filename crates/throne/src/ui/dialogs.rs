@@ -1,13 +1,17 @@
 //! Secondary feature dialogs (settings / groups / add / routing / tun / hotkeys).
 
-use gpui::{App, SharedString, Window, div, prelude::*, px};
+use gpui::{App, Entity, SharedString, Window, div, prelude::*, px};
 use chrono::{Local, TimeZone};
+use gpui_component::input::InputState;
 
-use throne_domain::{AppState, GroupId, ProfileId, ProfileType, RulesetMirror};
+use throne_domain::{AppState, GroupId, ProfileId, RulesetMirror};
 
 use crate::theme::Theme;
 use crate::ui::routing::RoutingDraft;
-use crate::ui::widgets::{form_row, modal_shell, mode_checkbox, primary_btn, secondary_btn};
+use crate::ui::widgets::{
+    confirm_panel, dialog_actions, group_panel, hotkey_capture_row, input_area, input_field_row,
+    mode_switch, primary_btn, secondary_btn, section_hint,
+};
 
 pub fn format_subscription_info(info: &str) -> Option<String> {
     let value = |key: &str| -> Option<u64> {
@@ -70,14 +74,22 @@ pub enum Dialog {
         /// Which field is focused for keyboard edit: 0 addr 1 port 2 test 3 rdns 4 ddns 5 log
         focus: usize,
     },
-    ManageGroups {
-        /// draft name for "add group"
-        new_name: String,
-        /// selected group for edit/delete
-        selected: Option<GroupId>,
-        edit_name: String,
-        edit_url: String,
-        focus_new: bool,
+    /// Upstream DialogManageGroups — group list + New / Update all.
+    ManageGroups,
+    /// Upstream DialogEditGroup (new or existing).
+    EditGroup {
+        /// `None` = new group (type can change); `Some` = edit (type locked).
+        group_id: Option<GroupId>,
+        is_subscription: bool,
+        skip_auto_update: bool,
+        auto_clear_unavailable: bool,
+        front_proxy_id: i64,
+        landing_proxy_id: i64,
+    },
+    /// Confirm remove group (upstream GroupItem remove QMessageBox).
+    ConfirmRemoveGroup {
+        group_id: GroupId,
+        name: String,
     },
     AddFromInput {
         text: String,
@@ -134,18 +146,30 @@ impl Dialog {
         }
     }
 
-    pub fn manage_groups_from_state(state: &AppState) -> Self {
-        let selected = Some(state.active_group_id());
-        let (edit_name, edit_url) = selected
-            .and_then(|id| state.group(id))
-            .map(|g| (g.name.clone(), g.url.clone()))
-            .unwrap_or_default();
-        Self::ManageGroups {
-            new_name: String::new(),
-            selected,
-            edit_name,
-            edit_url,
-            focus_new: true,
+    pub fn manage_groups_from_state(_state: &AppState) -> Self {
+        Self::ManageGroups
+    }
+
+    pub fn edit_group_from_state(state: &AppState, group_id: GroupId) -> Option<Self> {
+        let g = state.group(group_id)?;
+        Some(Self::EditGroup {
+            group_id: Some(group_id),
+            is_subscription: !g.url.trim().is_empty(),
+            skip_auto_update: g.skip_auto_update,
+            auto_clear_unavailable: g.auto_clear_unavailable,
+            front_proxy_id: g.front_proxy_id,
+            landing_proxy_id: g.landing_proxy_id,
+        })
+    }
+
+    pub fn edit_group_new() -> Self {
+        Self::EditGroup {
+            group_id: None,
+            is_subscription: false,
+            skip_auto_update: false,
+            auto_clear_unavailable: false,
+            front_proxy_id: -1,
+            landing_proxy_id: -1,
         }
     }
 
@@ -201,7 +225,7 @@ impl Dialog {
 
 /// Edit-profile body: rename only (outbound JSON editing stays future work).
 pub fn edit_profile_body(
-    name: &str,
+    name_input: &Entity<InputState>,
     type_label: &str,
     on_save: impl Fn(&mut Window, &mut App) + 'static,
     on_cancel: impl Fn(&mut Window, &mut App) + 'static,
@@ -209,43 +233,16 @@ pub fn edit_profile_body(
     div()
         .flex()
         .flex_col()
-        .child(
-            div()
-                .text_xs()
-                .text_color(Theme::text_muted())
-                .mb_2()
-                .child(format!("Type: {type_label} · type to rename")),
-        )
-        .child(
-            div()
-                .id("ep-name")
-                .px_2()
-                .py_2()
-                .mb_3()
-                .rounded_sm()
-                .border_1()
-                .border_color(Theme::accent())
-                .bg(Theme::bg_app())
-                .text_sm()
-                .cursor_text()
-                .on_click(|_, _, cx| cx.stop_propagation())
-                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(if name.is_empty() {
-                    "Name…▌".to_string()
-                } else {
-                    format!("{name}▌")
-                }),
-        )
-        .child(
-            div()
-                .flex()
-                .justify_end()
-                .gap_2()
-                .child(secondary_btn("ep-cancel", "Cancel", move |_, w, cx| {
-                    on_cancel(w, cx)
-                }))
-                .child(primary_btn("ep-ok", "Save", move |_, w, cx| on_save(w, cx))),
-        )
+        .child(section_hint(format!("Type: {type_label} · edit name below")))
+        .child(div().mb_3().child(input_field_row("Name", name_input, 80.)))
+        .child(dialog_actions(
+            "ep-cancel",
+            "Cancel",
+            "ep-ok",
+            "Save",
+            on_cancel,
+            on_save,
+        ))
 }
 
 pub fn confirm_delete_unavailable_body(
@@ -253,97 +250,46 @@ pub fn confirm_delete_unavailable_body(
     on_confirm: impl Fn(&mut Window, &mut App) + 'static,
     on_cancel: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap_3()
-        .child(format!("Remove {count} unavailable item(s)?"))
-        .child(
-            div()
-                .flex()
-                .justify_end()
-                .gap_2()
-                .child(secondary_btn("du-cancel", "Cancel", move |_, w, cx| {
-                    on_cancel(w, cx)
-                }))
-                .child(primary_btn("du-confirm", "Remove", move |_, w, cx| {
-                    on_confirm(w, cx)
-                })),
-        )
+    confirm_panel(
+        "du-alert",
+        format!("Remove {count} unavailable item(s)?"),
+        true,
+        "du-cancel",
+        "Cancel",
+        "du-confirm",
+        "Remove",
+        on_cancel,
+        on_confirm,
+    )
 }
 
-/// Build basic settings body (fields are display + focus highlight; typing handled by parent).
+/// Build basic settings body with real gpui-component Inputs.
 pub fn basic_settings_body(
-    inbound_address: &str,
-    inbound_port: &str,
-    test_url: &str,
-    remote_dns: &str,
-    direct_dns: &str,
-    log_level: &str,
+    inbound_address: &Entity<InputState>,
+    inbound_port: &Entity<InputState>,
+    test_url: &Entity<InputState>,
+    remote_dns: &Entity<InputState>,
+    direct_dns: &Entity<InputState>,
+    log_level: &Entity<InputState>,
     ruleset_mirror: RulesetMirror,
     adblock_enable: bool,
-    focus: usize,
-    on_focus: impl Fn(usize, &mut Window, &mut App) + Clone + 'static,
     on_cycle_mirror: impl Fn(&mut Window, &mut App) + 'static,
     on_toggle_adblock: impl Fn(&mut Window, &mut App) + 'static,
     on_save: impl Fn(&mut Window, &mut App) + 'static,
     on_cancel: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    let mk = |idx: usize, label: &'static str, val: String| {
-        let on_focus = on_focus.clone();
-        let focused = focus == idx;
-        div()
-            .id(SharedString::from(format!("bs-f-{idx}")))
-            .flex()
-            .items_center()
-            .gap_3()
-            .mb_2()
-            .cursor_pointer()
-            .on_click(move |_, window, cx| on_focus(idx, window, cx))
-            .child(
-                div()
-                    .w(px(150.))
-                    .text_xs()
-                    .text_color(Theme::text_muted())
-                    .child(label),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(if focused {
-                        Theme::accent()
-                    } else {
-                        Theme::border_light()
-                    })
-                    .bg(Theme::bg_app())
-                    .text_sm()
-                    .text_color(Theme::text())
-                    .child(if val.is_empty() && focused {
-                        "▌".to_string()
-                    } else if focused {
-                        format!("{val}▌")
-                    } else {
-                        val
-                    }),
-            )
-    };
-
     div()
         .flex()
         .flex_col()
-        .child(div().text_xs().text_color(Theme::text_muted()).mb_3().child(
+        .child(section_hint(
             "Basic Settings · LAN: set Inbound address to 0.0.0.0, then restart (no auth)",
         ))
-        .child(mk(0, "Inbound address", inbound_address.to_string()))
-        .child(mk(1, "Mixed / SOCKS port", inbound_port.to_string()))
-        .child(mk(2, "Test URL", test_url.to_string()))
-        .child(mk(3, "Remote DNS", remote_dns.to_string()))
-        .child(mk(4, "Direct DNS", direct_dns.to_string()))
-        .child(mk(5, "Log level", log_level.to_string()))
+        .child(input_field_row("Inbound address", inbound_address, 150.))
+        .child(input_field_row("Mixed / SOCKS port", inbound_port, 150.))
+        .child(input_field_row("Test URL", test_url, 150.))
+        .child(input_field_row("Remote DNS", remote_dns, 150.))
+        .child(input_field_row("Direct DNS", direct_dns, 150.))
+        .child(input_field_row("Log level", log_level, 150.))
         .child(
             div()
                 .flex()
@@ -364,60 +310,53 @@ pub fn basic_settings_body(
                 )),
         )
         .child(
-            div()
-                .mb_2()
-                .child(mode_checkbox(
-                    "bs-adblock",
-                    "Adblock rule-set (Start)",
-                    adblock_enable,
-                    move |_, w, cx| on_toggle_adblock(w, cx),
-                )),
+            div().mb_2().child(mode_switch(
+                "bs-adblock",
+                "Adblock rule-set (Start)",
+                adblock_enable,
+                move |_, w, cx| on_toggle_adblock(w, cx),
+            )),
         )
-        .child(
-            div()
-                .flex()
-                .justify_end()
-                .gap_2()
-                .mt_4()
-                .child(secondary_btn("bs-cancel", "Cancel", move |_, w, cx| {
-                    on_cancel(w, cx)
-                }))
-                .child(primary_btn("bs-save", "Save", move |_, w, cx| on_save(w, cx))),
-        )
+        .child(dialog_actions(
+            "bs-cancel",
+            "Cancel",
+            "bs-save",
+            "Save",
+            on_cancel,
+            on_save,
+        ))
 }
 
+/// Upstream DialogManageGroups: list of GroupItems + New group / Update all.
 pub fn manage_groups_body(
     state: &AppState,
-    new_name: &str,
-    selected: Option<GroupId>,
-    edit_name: &str,
-    edit_url: &str,
-    focus_new: bool,
-    on_select: impl Fn(GroupId, &mut Window, &mut App) + Clone + 'static,
-    on_focus_new: impl Fn(&mut Window, &mut App) + 'static,
-    on_focus_edit_name: impl Fn(&mut Window, &mut App) + 'static,
-    on_focus_edit_url: impl Fn(&mut Window, &mut App) + 'static,
-    on_add: impl Fn(&mut Window, &mut App) + 'static,
-    on_apply: impl Fn(&mut Window, &mut App) + 'static,
-    on_delete: impl Fn(&mut Window, &mut App) + 'static,
+    on_edit: impl Fn(GroupId, &mut Window, &mut App) + Clone + 'static,
+    on_remove: impl Fn(GroupId, String, &mut Window, &mut App) + Clone + 'static,
     on_update: impl Fn(GroupId, &mut Window, &mut App) + Clone + 'static,
+    on_new: impl Fn(&mut Window, &mut App) + 'static,
     on_update_all: impl Fn(&mut Window, &mut App) + 'static,
-    on_close: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let mut list = div()
         .id("mg-list")
         .flex()
         .flex_col()
-        .gap_1()
+        .gap_2()
         .mb_3()
-        .max_h(px(280.))
+        .min_h(px(280.))
+        .max_h(px(360.))
         .overflow_y_scroll();
+
     for g in state.all_groups() {
         let id = g.id;
-        let sel = selected == Some(id);
-        let on_select = on_select.clone();
+        let on_edit = on_edit.clone();
+        let on_remove = on_remove.clone();
         let on_update = on_update.clone();
-        let name = if g.name.is_empty() { format!("Group {id}") } else { g.name.clone() };
+        let name = if g.name.is_empty() {
+            format!("Group {id}")
+        } else {
+            g.name.clone()
+        };
+        let name_for_remove = name.clone();
         let kind = match (g.archive, g.url.trim().is_empty()) {
             (true, true) => "Archive Basic",
             (true, false) => "Archive Subscription",
@@ -427,142 +366,248 @@ pub fn manage_groups_body(
         let url = g.url.clone();
         let has_url = !url.trim().is_empty();
         let metadata = group_subscription_metadata(g);
-        let mut header = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .child(format!("{kind} ({})  {name}", g.profile_ids.len()));
+        let count = g.profile_ids.len();
+
+        let mut actions = div().flex().items_center().gap_1().flex_shrink_0();
         if has_url && !g.archive {
-            header = header.child(secondary_btn(
-                SharedString::from(format!("mg-update-{id}")),
+            actions = actions.child(secondary_btn(
+                SharedString::from(format!("mg-upd-{id}")),
                 "Update Subscription",
                 move |_, w, cx| on_update(id, w, cx),
             ));
         }
+        actions = actions
+            .child(secondary_btn(
+                SharedString::from(format!("mg-edit-{id}")),
+                "Edit",
+                move |_, w, cx| on_edit(id, w, cx),
+            ))
+            .child(secondary_btn(
+                SharedString::from(format!("mg-rm-{id}")),
+                "Remove",
+                move |_, w, cx| on_remove(id, name_for_remove.clone(), w, cx),
+            ));
+
         list = list.child(
             div()
                 .id(SharedString::from(format!("mg-{id}")))
                 .flex()
                 .flex_col()
                 .gap_1()
-                .px_2()
+                .px_3()
                 .py_2()
-                .rounded_sm()
+                .rounded_md()
                 .border_1()
-                .border_color(if sel { Theme::accent() } else { Theme::border_light() })
-                .cursor_pointer()
-                .bg(if sel {
-                    Theme::bg_selected()
-                } else {
-                    Theme::bg_app()
-                })
-                .text_color(if sel {
-                    Theme::text_on_selected()
-                } else {
-                    Theme::text()
-                })
-                .text_sm()
-                .child(header)
+                .border_color(Theme::border_light())
+                .bg(Theme::bg_app())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(Theme::accent())
+                                .child(format!("{kind} ({count})")),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .text_sm()
+                                .text_color(Theme::text())
+                                .child(name),
+                        )
+                        .child(actions),
+                )
                 .when(has_url, |el| {
-                    el.child(div().text_xs().text_color(Theme::text_muted()).child(url))
+                    el.child(
+                        div()
+                            .text_xs()
+                            .text_color(Theme::text_muted())
+                            .child(url),
+                    )
                 })
                 .when_some(metadata, |el, text| {
                     el.child(div().text_xs().text_color(Theme::text_muted()).child(text))
-                })
-                .on_click(move |_, w, cx| on_select(id, w, cx)),
+                }),
         );
     }
 
     div()
         .flex()
         .flex_col()
-        .child(div().text_xs().text_color(Theme::text_muted()).mb_2().child("Groups"))
+        .w_full()
         .child(list)
-        .child(menu_sep())
-        .child(div().text_xs().text_color(Theme::text_muted()).mb_1().child("Add new group"))
-        .child(
-            div()
-                .id("mg-new")
-                .px_2()
-                .py_1()
-                .mb_2()
-                .rounded_sm()
-                .border_1()
-                .border_color(if focus_new {
-                    Theme::accent()
-                } else {
-                    Theme::border_light()
-                })
-                .bg(Theme::bg_app())
-                .text_sm()
-                .cursor_pointer()
-                .on_click(move |_, w, cx| on_focus_new(w, cx))
-                .child(if focus_new {
-                    format!("{}▌", new_name)
-                } else if new_name.is_empty() {
-                    "New group name…".into()
-                } else {
-                    new_name.to_string()
-                }),
-        )
         .child(
             div()
                 .flex()
                 .gap_2()
-                .mb_3()
-                .child(primary_btn("mg-add", "New group", move |_, w, cx| on_add(w, cx)))
+                .child(primary_btn("mg-add", "New group", move |_, w, cx| on_new(w, cx)))
                 .child(secondary_btn(
                     "mg-update-all",
                     "Update all subscriptions",
                     move |_, w, cx| on_update_all(w, cx),
                 )),
         )
-        .child(menu_sep())
-        .child(div().text_xs().text_color(Theme::text_muted()).mb_1().child("Edit current Group"))
-        .child(
-            div()
-                .id("mg-ename")
-                .px_2()
-                .py_1()
-                .mb_1()
-                .rounded_sm()
-                .border_1()
-                .border_color(Theme::border_light())
-                .bg(Theme::bg_app())
-                .text_sm()
-                .cursor_pointer()
-                .on_click(move |_, w, cx| on_focus_edit_name(w, cx))
-                .child(format!("Name: {edit_name}")),
-        )
-        .child(
-            div()
-                .id("mg-eurl")
-                .px_2()
-                .py_1()
-                .mb_2()
-                .rounded_sm()
-                .border_1()
-                .border_color(Theme::border_light())
-                .bg(Theme::bg_app())
-                .text_sm()
-                .cursor_pointer()
-                .on_click(move |_, w, cx| on_focus_edit_url(w, cx))
-                .child(if edit_url.is_empty() {
-                    "Subscription URL: (none)".into()
-                } else {
-                    format!("Subscription URL: {edit_url}")
-                }),
-        )
-        .child(
+}
+
+/// Upstream DialogEditGroup body.
+pub fn edit_group_body(
+    draft: &crate::ui::dialogs::EditGroupView,
+    name: &Entity<InputState>,
+    url: &Entity<InputState>,
+    on_cycle_type: impl Fn(&mut Window, &mut App) + 'static,
+    on_cycle_front: impl Fn(&mut Window, &mut App) + 'static,
+    on_cycle_landing: impl Fn(&mut Window, &mut App) + 'static,
+    on_toggle_auto_clear: impl Fn(&mut Window, &mut App) + 'static,
+    on_toggle_skip_auto: impl Fn(&mut Window, &mut App) + 'static,
+    on_copy_links: impl Fn(&mut Window, &mut App) + 'static,
+    on_copy_deep: impl Fn(&mut Window, &mut App) + 'static,
+    on_ok: impl Fn(&mut Window, &mut App) + 'static,
+    on_cancel: impl Fn(&mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let type_label = if draft.is_subscription {
+        "Subscription"
+    } else {
+        "Basic"
+    };
+    let type_locked = draft.group_id.is_some();
+    let show_share = draft.group_id.is_some() && draft.profile_count > 0;
+
+    let mut common = div().flex().flex_col();
+    common = common.child(div().mb_2().child(input_field_row("Name", name, 120.)));
+    common = common.child(
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .mb_2()
+            .child(
+                div()
+                    .w(px(120.))
+                    .text_xs()
+                    .text_color(Theme::text_muted())
+                    .child("Type"),
+            )
+            .child(if type_locked {
+                div()
+                    .text_sm()
+                    .text_color(Theme::text())
+                    .child(type_label)
+                    .into_any_element()
+            } else {
+                secondary_btn("eg-type", type_label, move |_, w, cx| on_cycle_type(w, cx))
+                    .into_any_element()
+            }),
+    );
+    common = common.child(
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .mb_2()
+            .child(
+                div()
+                    .w(px(120.))
+                    .text_xs()
+                    .text_color(Theme::text_muted())
+                    .child("Front Proxy"),
+            )
+            .child(secondary_btn(
+                "eg-front",
+                draft.front_label.clone(),
+                move |_, w, cx| on_cycle_front(w, cx),
+            )),
+    );
+    common = common.child(
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .mb_2()
+            .child(
+                div()
+                    .w(px(120.))
+                    .text_xs()
+                    .text_color(Theme::text_muted())
+                    .child("Landing Proxy"),
+            )
+            .child(secondary_btn(
+                "eg-land",
+                draft.landing_label.clone(),
+                move |_, w, cx| on_cycle_landing(w, cx),
+            )),
+    );
+    common = common.child(
+        div().mb_1().child(mode_switch(
+            "eg-clear",
+            "Auto Clear Unavailable Profiles",
+            draft.auto_clear_unavailable,
+            move |_, w, cx| on_toggle_auto_clear(w, cx),
+        )),
+    );
+
+    let mut root = div().flex().flex_col().w_full().child(group_panel("Common", common));
+
+    if draft.is_subscription {
+        root = root.child(group_panel(
+            "Subscription",
             div()
                 .flex()
+                .flex_col()
+                .child(div().mb_2().child(input_field_row("URL", url, 80.)))
+                .child(mode_switch(
+                    "eg-skip",
+                    "Skip automatic update",
+                    draft.skip_auto_update,
+                    move |_, w, cx| on_toggle_skip_auto(w, cx),
+                )),
+        ));
+    }
+
+    if show_share {
+        root = root.child(group_panel(
+            "Share",
+            div()
+                .flex()
+                .flex_col()
                 .gap_2()
-                .child(primary_btn("mg-apply", "Apply", move |_, w, cx| on_apply(w, cx)))
-                .child(secondary_btn("mg-del", "Delete current Group", move |_, w, cx| {
-                    on_delete(w, cx)
-                }))
-                .child(secondary_btn("mg-close", "Close", move |_, w, cx| on_close(w, cx))),
-        )
+                .child(secondary_btn(
+                    "eg-copy",
+                    "Copy profile share links",
+                    move |_, w, cx| on_copy_links(w, cx),
+                ))
+                .child(secondary_btn(
+                    "eg-copy-deep",
+                    "Copy profile share links (Deep Links)",
+                    move |_, w, cx| on_copy_deep(w, cx),
+                )),
+        ));
+    }
+
+    root.child(dialog_actions(
+        "eg-cancel",
+        "Cancel",
+        "eg-ok",
+        "OK",
+        on_cancel,
+        on_ok,
+    ))
+}
+
+/// View-model for Edit Group (labels resolved in main_window).
+#[derive(Clone)]
+pub struct EditGroupView {
+    pub group_id: Option<GroupId>,
+    pub is_subscription: bool,
+    pub skip_auto_update: bool,
+    pub auto_clear_unavailable: bool,
+    pub front_label: SharedString,
+    pub landing_label: SharedString,
+    pub profile_count: usize,
 }
 
 fn group_subscription_metadata(group: &throne_domain::Group) -> Option<String> {
@@ -582,18 +627,17 @@ pub fn confirm_update_all_body(
     on_confirm: impl Fn(&mut Window, &mut App) + 'static,
     on_cancel: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_col()
-        .child(div().mb_3().child("Update all subscriptions?"))
-        .child(
-            div()
-                .flex()
-                .justify_end()
-                .gap_2()
-                .child(secondary_btn("sub-all-no", "No", move |_, w, cx| on_cancel(w, cx)))
-                .child(primary_btn("sub-all-yes", "Yes", move |_, w, cx| on_confirm(w, cx))),
-        )
+    confirm_panel(
+        "sub-all-alert",
+        "Update all subscriptions?",
+        false,
+        "sub-all-no",
+        "No",
+        "sub-all-yes",
+        "Yes",
+        on_cancel,
+        on_confirm,
+    )
 }
 
 pub fn subscription_diff_body(
@@ -623,71 +667,32 @@ pub fn subscription_diff_body(
         )
 }
 
-fn menu_sep() -> impl IntoElement {
-    div()
-        .h(px(1.))
-        .w_full()
-        .my_2()
-        .bg(Theme::border_light())
-}
-
 pub fn add_input_body(
-    text: &str,
+    text_input: &Entity<InputState>,
+    type_hint: &str,
     on_save: impl Fn(&mut Window, &mut App) + 'static,
     on_cancel: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     div()
         .flex()
         .flex_col()
-        .child(
-            div()
-                .text_xs()
-                .text_color(Theme::text_muted())
-                .mb_2()
-                .child("New profile — paste share link(s), Clash YAML, or JSON (type to edit)"),
-        )
-        .child(
-            div()
-                .id("ai-box")
-                .min_h(px(160.))
-                .p_2()
-                .mb_3()
-                .rounded_sm()
-                .border_1()
-                .border_color(Theme::accent())
-                .bg(Theme::bg_app())
-                .text_sm()
-                .text_color(Theme::text())
-                .cursor_text()
-                // Capture clicks so they never fall through the modal stack.
-                .on_click(|_, _, cx| cx.stop_propagation())
-                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(if text.is_empty() {
-                    "▌".to_string()
-                } else {
-                    format!("{text}▌")
-                }),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(Theme::text_muted())
-                .mb_3()
-                .child(format!(
-                    "Detected type hint: {}",
-                    detect_hint(text)
-                )),
-        )
-        .child(
-            div()
-                .flex()
-                .justify_end()
-                .gap_2()
-                .child(secondary_btn("ai-cancel", "Cancel", move |_, w, cx| {
-                    on_cancel(w, cx)
-                }))
-                .child(primary_btn("ai-ok", "OK", move |_, w, cx| on_save(w, cx))),
-        )
+        .child(section_hint(
+            "New profile — paste share link(s), Clash YAML, or JSON",
+        ))
+        .child(div().mb_3().min_h(px(160.)).child(input_area(text_input)))
+        .child(section_hint(format!("Detected type hint: {type_hint}")))
+        .child(dialog_actions(
+            "ai-cancel",
+            "Cancel",
+            "ai-ok",
+            "OK",
+            on_cancel,
+            on_save,
+        ))
+}
+
+pub fn detect_hint_for_text(text: &str) -> &'static str {
+    detect_hint(text)
 }
 
 fn detect_hint(text: &str) -> &'static str {
@@ -708,11 +713,9 @@ fn detect_hint(text: &str) -> &'static str {
 }
 
 pub fn tun_settings_body(
-    vpn_mtu: &str,
+    mtu_input: &Entity<InputState>,
     vpn_strict_route: bool,
     disable_private_range_bypass: bool,
-    focus_mtu: bool,
-    on_focus_mtu: impl Fn(&mut Window, &mut App) + 'static,
     on_toggle_strict: impl Fn(&mut Window, &mut App) + 'static,
     on_toggle_bypass: impl Fn(&mut Window, &mut App) + 'static,
     on_save: impl Fn(&mut Window, &mut App) + 'static,
@@ -721,57 +724,15 @@ pub fn tun_settings_body(
     div()
         .flex()
         .flex_col()
+        .child(section_hint(
+            "Tun Mode settings — applied on next Start when Tun is checked. \
+             macOS/Linux require elevated ThroneCore (setuid). \
+             On macOS also set Routing → Local override to a plain DNS IP \
+             (same as upstream Throne; empty Local DNS + Tun will fail to start).",
+        ))
+        .child(input_field_row("MTU", mtu_input, 140.))
         .child(
-            div()
-                .text_xs()
-                .text_color(Theme::text_muted())
-                .mb_3()
-                .child(
-                    "Tun Mode settings — applied on next Start when Tun is checked. \
-                     macOS/Linux require elevated ThroneCore (setuid). \
-                     On macOS also set Routing → Local override to a plain DNS IP \
-                     (same as upstream Throne; empty Local DNS + Tun will fail to start).",
-                ),
-        )
-        .child(
-            div()
-                .id("tun-mtu")
-                .flex()
-                .items_center()
-                .gap_3()
-                .mb_3()
-                .cursor_pointer()
-                .on_click(move |_, w, cx| on_focus_mtu(w, cx))
-                .child(
-                    div()
-                        .w(px(140.))
-                        .text_xs()
-                        .text_color(Theme::text_muted())
-                        .child("MTU"),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .px_2()
-                        .py_1()
-                        .rounded_sm()
-                        .border_1()
-                        .border_color(if focus_mtu {
-                            Theme::accent()
-                        } else {
-                            Theme::border_light()
-                        })
-                        .bg(Theme::bg_app())
-                        .text_sm()
-                        .child(if focus_mtu {
-                            format!("{vpn_mtu}▌")
-                        } else {
-                            vpn_mtu.to_string()
-                        }),
-                ),
-        )
-        .child(
-            div().mb_2().child(mode_checkbox(
+            div().mb_2().child(mode_switch(
                 "tun-strict",
                 "Strict route",
                 vpn_strict_route,
@@ -779,23 +740,31 @@ pub fn tun_settings_body(
             )),
         )
         .child(
-            div().mb_3().child(mode_checkbox(
+            div().mb_3().child(mode_switch(
                 "tun-bypass",
                 "Bypass private LAN ranges (recommended)",
                 !disable_private_range_bypass,
                 move |_, w, cx| on_toggle_bypass(w, cx),
             )),
         )
-        .child(
-            div()
-                .flex()
-                .justify_end()
-                .gap_2()
-                .child(secondary_btn("tun-cancel", "Cancel", move |_, w, cx| {
-                    on_cancel(w, cx)
-                }))
-                .child(primary_btn("tun-save", "Save", move |_, w, cx| on_save(w, cx))),
-        )
+        .child(dialog_actions(
+            "tun-cancel",
+            "Cancel",
+            "tun-save",
+            "Save",
+            on_cancel,
+            on_save,
+        ))
+}
+
+/// Hotkey field index for capture callbacks (matches `HotkeySettings::focus`).
+#[derive(Clone, Copy, Debug)]
+pub enum HotkeyField {
+    StartStop,
+    Import,
+    Save,
+    UrlTest,
+    CopyLogs,
 }
 
 pub fn hotkey_settings_body(
@@ -804,93 +773,66 @@ pub fn hotkey_settings_body(
     save: &str,
     url_test: &str,
     copy_logs: &str,
-    focus: usize,
-    on_focus: impl Fn(usize, &mut Window, &mut App) + Clone + 'static,
+    on_capture: impl Fn(HotkeyField, String, &mut Window, &mut App) + 'static + Clone,
     on_save: impl Fn(&mut Window, &mut App) + 'static,
     on_cancel: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    let mk = |idx: usize, label: &'static str, val: &str| {
-        let on_focus = on_focus.clone();
-        let focused = focus == idx;
-        let val = val.to_string();
-        div()
-            .id(SharedString::from(format!("hk-f-{idx}")))
-            .flex()
-            .items_center()
-            .gap_3()
-            .mb_2()
-            .cursor_pointer()
-            .on_click(move |_, w, cx| on_focus(idx, w, cx))
-            .child(
-                div()
-                    .w(px(150.))
-                    .text_xs()
-                    .text_color(Theme::text_muted())
-                    .child(label),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(if focused {
-                        Theme::accent()
-                    } else {
-                        Theme::border_light()
-                    })
-                    .bg(Theme::bg_app())
-                    .text_sm()
-                    .child(if focused {
-                        format!("{val}▌")
-                    } else {
-                        val
-                    }),
-            )
-    };
-
+    fn bind(
+        field: HotkeyField,
+        on: impl Fn(HotkeyField, String, &mut Window, &mut App) + 'static + Clone,
+    ) -> impl Fn(String, &mut Window, &mut App) + 'static {
+        move |chord, window, cx| on(field, chord, window, cx)
+    }
     div()
         .flex()
         .flex_col()
-        .child(
-            div()
-                .text_xs()
-                .text_color(Theme::text_muted())
-                .mb_3()
-                .child(
-                    "Hotkey labels (stored in settings). Runtime rebind of custom chords \
-                     lands with global hotkey registration.",
-                ),
-        )
-        .child(mk(0, "Start / Stop", start_stop))
-        .child(mk(1, "Import clipboard", import))
-        .child(mk(2, "Save database", save))
-        .child(mk(3, "URL Test", url_test))
-        .child(mk(4, "Copy logs", copy_logs))
-        .child(
-            div()
-                .flex()
-                .justify_end()
-                .gap_2()
-                .mt_3()
-                .child(secondary_btn("hk-cancel", "Cancel", move |_, w, cx| {
-                    on_cancel(w, cx)
-                }))
-                .child(primary_btn("hk-save", "Save", move |_, w, cx| on_save(w, cx))),
-        )
-}
-
-// Keep imports available for future dialog fields.
-#[allow(dead_code)]
-fn _pt() -> ProfileType {
-    ProfileType::Vless
-}
-
-#[allow(dead_code)]
-fn _fr() {
-    let _ = form_row("x", "y");
-    let _ = modal_shell("t", div(), |_, _, _| {});
+        .child(section_hint(
+            "Click a field, then press the shortcut. Backspace clears. \
+             Labels are stored in settings; global rebind lands with hotkey registration.",
+        ))
+        .child(hotkey_capture_row(
+            "hk-start",
+            "Start / Stop",
+            start_stop,
+            150.,
+            bind(HotkeyField::StartStop, on_capture.clone()),
+        ))
+        .child(hotkey_capture_row(
+            "hk-import",
+            "Import clipboard",
+            import,
+            150.,
+            bind(HotkeyField::Import, on_capture.clone()),
+        ))
+        .child(hotkey_capture_row(
+            "hk-save-db",
+            "Save database",
+            save,
+            150.,
+            bind(HotkeyField::Save, on_capture.clone()),
+        ))
+        .child(hotkey_capture_row(
+            "hk-url",
+            "URL Test",
+            url_test,
+            150.,
+            bind(HotkeyField::UrlTest, on_capture.clone()),
+        ))
+        .child(hotkey_capture_row(
+            "hk-logs",
+            "Copy logs",
+            copy_logs,
+            150.,
+            bind(HotkeyField::CopyLogs, on_capture),
+        ))
+        .child(dialog_actions(
+            "hk-cancel",
+            "Cancel",
+            "hk-save",
+            "Save",
+            on_cancel,
+            on_save,
+        ))
 }
 
 #[cfg(test)]

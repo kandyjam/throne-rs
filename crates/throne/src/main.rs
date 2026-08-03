@@ -11,10 +11,11 @@ use gpui::{
     App, Application, Bounds, Entity, TitlebarOptions, WindowBounds, WindowHandle, WindowOptions,
     point, prelude::*, px, size,
 };
+use gpui_component::Root;
 use tracing_subscriber::EnvFilter;
 
 use throne_domain::{NKR_VERSION, display_name};
-use ui::MainWindow;
+use ui::{AppShell, MainWindow};
 
 fn main() {
     tracing_subscriber::fmt()
@@ -26,19 +27,22 @@ fn main() {
     tracing::info!(version = NKR_VERSION, "ThroneRs starting");
 
     Application::new().with_assets(assets::Assets).run(|cx: &mut App| {
+        // Required before any gpui-component widgets (Spinner, Button, Theme, …).
+        gpui_component::init(cx);
+
         cx.activate(true);
 
         // Keep the root view alive across window close so tray "Show" / "Toggle"
         // can reopen the same session instead of losing CoreSession state.
-        let root = cx.new(MainWindow::new);
-        let window_slot: Rc<RefCell<Option<WindowHandle<MainWindow>>>> =
-            Rc::new(RefCell::new(Some(open_main_window(cx, root.clone()))));
+        let main = cx.new(MainWindow::new);
+        let window_slot: Rc<RefCell<Option<WindowHandle<Root>>>> =
+            Rc::new(RefCell::new(Some(open_main_window(cx, main.clone()))));
 
-        let tray_state = root.read(cx).tray_menu_state();
+        let tray_state = main.read(cx).tray_menu_state();
         match tray::install(tray_state) {
             Ok(()) => {
                 let window_slot = window_slot.clone();
-                let root = root.clone();
+                let main = main.clone();
                 cx.spawn(move |cx: &mut gpui::AsyncApp| {
                     let async_cx = cx.clone();
                     async move {
@@ -47,7 +51,7 @@ fn main() {
                             while let Some(command) = tray::next_command() {
                                 if async_cx
                                     .update(|cx| {
-                                        dispatch_tray_command(command, cx, &window_slot, &root)
+                                        dispatch_tray_command(command, cx, &window_slot, &main)
                                     })
                                     .is_err()
                                 {
@@ -64,7 +68,7 @@ fn main() {
     });
 }
 
-fn open_main_window(cx: &mut App, root: Entity<MainWindow>) -> WindowHandle<MainWindow> {
+fn open_main_window(cx: &mut App, main: Entity<MainWindow>) -> WindowHandle<Root> {
     // Upstream mainwindow.ui minimum 800×600
     let bounds = Bounds::centered(None, size(px(960.), px(640.)), cx);
     cx.open_window(
@@ -82,10 +86,14 @@ fn open_main_window(cx: &mut App, root: Entity<MainWindow>) -> WindowHandle<Main
         },
         |window, cx| {
             // Follow OS light/dark and re-paint when the system appearance changes.
-            root.update(cx, |view, cx| {
+            main.update(cx, |view, cx| {
                 view.attach_window_appearance(window, cx);
             });
-            root
+            // AppShell paints MainWindow + Dialog layer as siblings so open_dialog
+            // builders can read MainWindow without re-entrancy panics.
+            let shell = cx.new(|cx| AppShell::new(main.clone(), cx));
+            // gpui-component Root hosts Sheet / Dialog / Notification bookkeeping.
+            cx.new(|cx| Root::new(shell, window, cx))
         },
     )
     .expect("open main window")
@@ -99,8 +107,8 @@ fn window_needs_reopen(is_active: Option<bool>) -> bool {
 /// Bring the main window forward, recreating it if the user closed it to the tray.
 fn show_main_window(
     cx: &mut App,
-    window_slot: &Rc<RefCell<Option<WindowHandle<MainWindow>>>>,
-    root: &Entity<MainWindow>,
+    window_slot: &Rc<RefCell<Option<WindowHandle<Root>>>>,
+    main: &Entity<MainWindow>,
 ) {
     cx.activate(true);
 
@@ -110,7 +118,7 @@ fn show_main_window(
         .and_then(|handle| handle.is_active(cx));
 
     if window_needs_reopen(is_active) {
-        *window_slot.borrow_mut() = Some(open_main_window(cx, root.clone()));
+        *window_slot.borrow_mut() = Some(open_main_window(cx, main.clone()));
         return;
     }
 
@@ -125,44 +133,44 @@ fn show_main_window(
 fn dispatch_tray_command(
     command: tray::TrayCommand,
     cx: &mut App,
-    window_slot: &Rc<RefCell<Option<WindowHandle<MainWindow>>>>,
-    root: &Entity<MainWindow>,
+    window_slot: &Rc<RefCell<Option<WindowHandle<Root>>>>,
+    main: &Entity<MainWindow>,
 ) {
     match command {
         tray::TrayCommand::ShowWindow | tray::TrayCommand::SelectServer => {
-            show_main_window(cx, window_slot, root);
+            show_main_window(cx, window_slot, main);
             if matches!(command, tray::TrayCommand::SelectServer) {
-                root.update(cx, |view, cx| {
+                main.update(cx, |view, cx| {
                     view.tray_select_server(cx);
                 });
             }
         }
         tray::TrayCommand::SelectRouting => {
-            show_main_window(cx, window_slot, root);
-            root.update(cx, |view, cx| {
+            show_main_window(cx, window_slot, main);
+            main.update(cx, |view, cx| {
                 view.tray_select_routing(cx);
             });
         }
         tray::TrayCommand::ToggleStartWithSystem => {
-            root.update(cx, |view, cx| view.tray_toggle_start_with_system(cx));
+            main.update(cx, |view, cx| view.tray_toggle_start_with_system(cx));
         }
         tray::TrayCommand::ToggleRememberLast => {
-            root.update(cx, |view, cx| view.tray_toggle_remember_last(cx));
+            main.update(cx, |view, cx| view.tray_toggle_remember_last(cx));
         }
         tray::TrayCommand::ToggleAllowLan => {
-            root.update(cx, |view, cx| view.tray_toggle_allow_lan(cx));
+            main.update(cx, |view, cx| view.tray_toggle_allow_lan(cx));
         }
         tray::TrayCommand::EnableSystemProxy => {
-            root.update(cx, |view, cx| view.tray_set_system_proxy(true, cx));
+            main.update(cx, |view, cx| view.tray_set_system_proxy(true, cx));
         }
         tray::TrayCommand::EnableTun => {
-            root.update(cx, |view, cx| view.tray_set_tun(true, cx));
+            main.update(cx, |view, cx| view.tray_set_tun(true, cx));
         }
         tray::TrayCommand::DisableSpMode => {
-            root.update(cx, |view, cx| view.tray_disable_spmode(cx));
+            main.update(cx, |view, cx| view.tray_disable_spmode(cx));
         }
         tray::TrayCommand::RestartCore => {
-            root.update(cx, |view, cx| view.tray_restart_core(cx));
+            main.update(cx, |view, cx| view.tray_restart_core(cx));
         }
         tray::TrayCommand::RestartProgram => {
             restart_program(cx);
@@ -210,8 +218,9 @@ mod tests {
     fn main_window_omits_non_original_dns_and_runtime_summary_regions() {
         let source = include_str!("ui/main_window.rs");
 
-        assert!(source.contains("mode_checkbox(\"tun\", \"Tun Mode\""));
-        assert!(source.contains("mode_checkbox(\"proxy\", \"System Proxy\""));
+        assert!(source.contains("mode_switch(\"tun\", \"Tun Mode\""));
+        assert!(source.contains("mode_switch(\"proxy\", \"System Proxy\""));
+        assert!(!source.contains("mode_switch(\"dns\", \"System DNS\""));
         assert!(!source.contains("mode_checkbox(\"dns\", \"System DNS\""));
         assert!(!source.contains("fn render_data_view(&self)"));
         assert!(!source.contains(".child(self.render_data_view())"));

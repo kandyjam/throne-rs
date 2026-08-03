@@ -27,6 +27,9 @@ throne-import = { workspace = true }
 throne-storage = { workspace = true }
 # runtime_shaders: avoid requiring `xcrun metal` (full Xcode) at build time.
 gpui = { workspace = true, features = ["runtime_shaders"] }
+gpui-component = { workspace = true }
+gpui-component-assets = { workspace = true }
+lsp-types = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }

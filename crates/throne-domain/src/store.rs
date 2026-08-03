@@ -399,6 +399,67 @@ impl AppState {
         Ok(())
     }
 
+    /// Apply full group edit fields (upstream DialogEditGroup::accept).
+    pub fn apply_group_edit(
+        &mut self,
+        id: GroupId,
+        name: impl Into<String>,
+        url: impl Into<String>,
+        skip_auto_update: bool,
+        auto_clear_unavailable: bool,
+        front_proxy_id: i64,
+        landing_proxy_id: i64,
+    ) -> Result<(), StoreError> {
+        let name = name.into();
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(StoreError::Msg("group name cannot be empty".into()));
+        }
+        let url = url.into();
+        let g = self
+            .groups
+            .get_mut(&id)
+            .ok_or(StoreError::GroupNotFound(id))?;
+        // Existing subscription groups must keep a non-empty URL (upstream warning).
+        if !g.url.is_empty() && url.trim().is_empty() {
+            return Err(StoreError::Msg("Please input URL".into()));
+        }
+        g.name = trimmed.to_string();
+        g.url = url.trim().to_string();
+        g.skip_auto_update = skip_auto_update;
+        g.auto_clear_unavailable = auto_clear_unavailable;
+        g.front_proxy_id = front_proxy_id;
+        g.landing_proxy_id = landing_proxy_id;
+        Ok(())
+    }
+
+    /// Create a group from full edit fields (upstream New group → DialogEditGroup).
+    pub fn create_group_from_edit(
+        &mut self,
+        name: impl Into<String>,
+        url: impl Into<String>,
+        skip_auto_update: bool,
+        auto_clear_unavailable: bool,
+        front_proxy_id: i64,
+        landing_proxy_id: i64,
+    ) -> Result<GroupId, StoreError> {
+        let name = name.into();
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(StoreError::Msg("group name cannot be empty".into()));
+        }
+        let id = self.add_group(trimmed.to_string());
+        let url = url.into().trim().to_string();
+        if let Some(g) = self.groups.get_mut(&id) {
+            g.url = url;
+            g.skip_auto_update = skip_auto_update;
+            g.auto_clear_unavailable = auto_clear_unavailable;
+            g.front_proxy_id = front_proxy_id;
+            g.landing_proxy_id = landing_proxy_id;
+        }
+        Ok(id)
+    }
+
     pub fn delete_group(&mut self, id: GroupId) -> Result<(), StoreError> {
         if self.groups.len() <= 1 {
             return Err(StoreError::Msg("cannot delete the last group".into()));
@@ -664,13 +725,31 @@ impl AppState {
     ) {
         self.groups = groups.into_iter().map(|g| (g.id, g)).collect();
         self.profiles = profiles.into_iter().map(|p| (p.id, p)).collect();
-        self.group_order = group_order;
+        // Prefer persisted tab order, then append any groups missing from it so
+        // save never writes profiles whose gid is absent from the groups table.
+        let mut order = group_order
+            .into_iter()
+            .filter(|id| self.groups.contains_key(id))
+            .collect::<Vec<_>>();
+        for id in self.groups.keys().copied() {
+            if !order.contains(&id) {
+                order.push(id);
+            }
+        }
+        self.group_order = order;
         self.settings = settings;
         self.route_order = routes.iter().map(|r| r.id).collect();
         self.routes = routes.into_iter().map(|r| (r.id, r)).collect();
         self.next_group_id = self.groups.keys().copied().max().unwrap_or(0) + 1;
         self.next_profile_id = self.profiles.keys().copied().max().unwrap_or(0) + 1;
         self.next_route_id = self.routes.keys().copied().max().unwrap_or(0) + 1;
+        // Drop profiles that reference a missing group (corrupt / partial DB).
+        self.profiles
+            .retain(|_, p| self.groups.contains_key(&p.group_id));
+        for g in self.groups.values_mut() {
+            g.profile_ids
+                .retain(|id| self.profiles.contains_key(id));
+        }
         self.active_group_id = self.group_order.first().copied().unwrap_or(0);
         self.selected_profile_id = self
             .groups
@@ -697,6 +776,51 @@ impl AppState {
             self.profiles.len(),
             self.routes.len()
         ));
+    }
+
+    /// Ensure every group is listed in `group_order` and every profile's `group_id`
+    /// exists — required for SQLite `profiles.gid → groups.id` on full rewrite save.
+    pub fn sanitize_group_profile_refs(&mut self) {
+        for id in self.groups.keys().copied().collect::<Vec<_>>() {
+            if !self.group_order.contains(&id) {
+                self.group_order.push(id);
+            }
+        }
+        self.group_order.retain(|id| self.groups.contains_key(id));
+        // Re-home or drop orphan profiles.
+        let fallback = self.group_order.first().copied();
+        let orphan_ids: Vec<ProfileId> = self
+            .profiles
+            .iter()
+            .filter(|(_, p)| !self.groups.contains_key(&p.group_id))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in orphan_ids {
+            if let Some(gid) = fallback {
+                if let Some(p) = self.profiles.get_mut(&id) {
+                    p.group_id = gid;
+                }
+                if let Some(g) = self.groups.get_mut(&gid) {
+                    if !g.profile_ids.contains(&id) {
+                        g.profile_ids.push(id);
+                    }
+                }
+            } else {
+                self.profiles.remove(&id);
+            }
+        }
+        // Keep each group's profile_ids list aligned with live profiles.
+        for g in self.groups.values_mut() {
+            g.profile_ids
+                .retain(|id| self.profiles.contains_key(id));
+        }
+        for (id, p) in &self.profiles {
+            if let Some(g) = self.groups.get_mut(&p.group_id) {
+                if !g.profile_ids.contains(id) {
+                    g.profile_ids.push(*id);
+                }
+            }
+        }
     }
 
     pub fn add_route(&mut self, mut route: RouteProfile) -> i64 {
@@ -1031,6 +1155,11 @@ impl AppState {
             .iter()
             .filter_map(|id| self.groups.get(id))
             .collect()
+    }
+
+    /// All groups by id (including any not currently in tab order).
+    pub fn groups_map(&self) -> &HashMap<GroupId, Group> {
+        &self.groups
     }
 
     pub fn all_profiles(&self) -> Vec<&Profile> {
@@ -1389,6 +1518,8 @@ impl AppState {
                     .profiles
                     .get_mut(&id)
                     .ok_or(StoreError::ProfileNotFound(id))?;
+                // Keep gid aligned with the subscription group (save FK safety).
+                profile.group_id = group_id;
                 let changed = profile.name != name
                     || profile.profile_type != profile_type
                     || profile.outbound != outbound

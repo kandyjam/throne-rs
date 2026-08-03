@@ -136,13 +136,6 @@ impl Theme {
         }
     }
 
-    pub fn border() -> Hsla {
-        match active_scheme() {
-            ColorScheme::Light => rgb(0x777777).into(),
-            ColorScheme::Dark => rgb(0x455364).into(),
-        }
-    }
-
     pub fn border_light() -> Hsla {
         match active_scheme() {
             ColorScheme::Light => rgb(0xb0b0b0).into(),
@@ -208,26 +201,6 @@ impl Theme {
         }
     }
 
-    pub fn start_green() -> Hsla {
-        match active_scheme() {
-            ColorScheme::Light => rgb(0x27ae60).into(),
-            ColorScheme::Dark => rgb(0x2ecc71).into(),
-        }
-    }
-
-    pub fn stop_red() -> Hsla {
-        match active_scheme() {
-            ColorScheme::Light => rgb(0xe74c3c).into(),
-            ColorScheme::Dark => rgb(0xe74c3c).into(),
-        }
-    }
-
-    pub fn tab_selected_border() -> Hsla {
-        match active_scheme() {
-            ColorScheme::Light => rgb(0x3d7eff).into(),
-            ColorScheme::Dark => rgb(0x5ab0ff).into(),
-        }
-    }
 }
 
 pub fn latency_color(ms: i32) -> Hsla {

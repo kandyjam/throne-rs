@@ -1,4 +1,21 @@
-use gpui::{App, ClickEvent, SharedString, Window, div, prelude::*, px, svg};
+//! Shared UI primitives backed by [gpui-component](https://longbridge.github.io/gpui-component).
+//!
+//! Keep thin wrappers so call sites stay stable while chrome comes from the component library.
+
+use std::rc::Rc;
+
+use gpui::{
+    App, ClickEvent, Entity, KeyDownEvent, SharedString, Window, div, prelude::*, px,
+};
+use gpui_component::{
+    Icon, Sizable as _, Size, h_flex, v_flex,
+    alert::Alert,
+    button::{Button, ButtonVariants as _},
+    divider::Divider,
+    input::{Input, InputState},
+    switch::Switch,
+    tab::{Tab, TabBar},
+};
 
 use crate::theme::Theme;
 
@@ -63,7 +80,6 @@ mod tests {
         assert_eq!(toolbar_icon_path(ToolbarIcon::Tools), "icons/wrench.svg");
     }
 
-
     #[test]
     fn transitional_start_stop_states_show_loading_feedback() {
         assert_eq!(
@@ -89,9 +105,16 @@ mod tests {
     }
 }
 
+fn icon_from_path(path: impl Into<SharedString>) -> Icon {
+    Icon::default().path(path)
+}
+
 /// Toolbar button. Dropdown content is rendered as a **root-level overlay**
 /// (see `MainWindow::render_toolbar_menu_overlay`) so it is not clipped or
 /// painted under the profile table / group tabs.
+///
+/// Layout stays vertical (icon over label) to match upstream Throne chrome;
+/// icon glyph comes from gpui-component [`Icon`].
 pub fn toolbar_btn(
     id: impl Into<SharedString>,
     icon: ToolbarIcon,
@@ -100,6 +123,11 @@ pub fn toolbar_btn(
     on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let id: SharedString = id.into();
+    let icon_color = if open {
+        Theme::accent()
+    } else {
+        Theme::icon()
+    };
     div()
         .id(id)
         .flex()
@@ -124,15 +152,9 @@ pub fn toolbar_btn(
         .hover(|e| e.bg(Theme::bg_hover()))
         .cursor_pointer()
         .child(
-            svg()
-                .path(toolbar_icon_path(icon))
-                .size(px(18.))
-                // GPUI paints SVG as an alpha mask tinted by text_color — follows light/dark tokens.
-                .text_color(if open {
-                    Theme::accent()
-                } else {
-                    Theme::icon()
-                }),
+            icon_from_path(toolbar_icon_path(icon))
+                .with_size(Size::Small)
+                .text_color(icon_color),
         )
         .child(div().text_xs().text_color(Theme::text()).child(label))
         .on_click(on_toggle)
@@ -165,122 +187,534 @@ pub fn toolbar_menu_panel(
         .child(menu)
 }
 
+/// Square Start / Stop control — compact icon-only gpui-component [`Button`].
+///
+/// Smaller than the 52px toolbar buttons so it sits lighter in the top bar.
 pub fn start_stop_btn(
     state: StartStopState,
-    loading_glyph: &'static str,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let (label, loading) = start_stop_presentation(state);
-    let color = match state {
-        StartStopState::Stop | StartStopState::Stopping => Theme::stop_red(),
-        StartStopState::Start | StartStopState::Starting => Theme::start_green(),
-    };
-    let glyph = if loading {
-        loading_glyph
-    } else if matches!(state, StartStopState::Stop) {
-        "■"
+    let is_stop = matches!(state, StartStopState::Stop | StartStopState::Stopping);
+    let icon_path = if matches!(state, StartStopState::Stop | StartStopState::Stopping) {
+        "icons/square.svg"
     } else {
-        "▶"
+        "icons/play.svg"
     };
-    div()
-        .id("startstop")
-        .flex()
-        .flex_col()
-        .items_center()
-        .justify_center()
-        .w(px(72.))
-        .h(px(52.))
-        .rounded_md()
-        .border_1()
-        .border_color(color)
-        .bg(Theme::bg_elevated())
-        .hover(|e| e.bg(Theme::bg_hover()))
-        .cursor_pointer()
-        .child(if loading {
-            div().text_xl().text_color(color).child(glyph).into_any_element()
-        } else {
-            svg()
-                .path(if matches!(state, StartStopState::Stop) {
-                    "icons/square.svg"
-                } else {
-                    "icons/play.svg"
-                })
-                .size(px(18.))
-                .text_color(color)
-                .into_any_element()
-        })
-        .child(
-            div()
-                .text_xs()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(color)
-                .child(label),
-        )
-        .on_click(on_click)
+
+    // No `.label(...)` → square icon button; tooltip carries Start / Stop.
+    let btn = Button::new("startstop")
+        .icon(icon_from_path(icon_path).with_size(Size::Small))
+        .loading(loading)
+        .tooltip(label)
+        .with_size(Size::Size(px(40.)))
+        .on_click(on_click);
+
+    if is_stop {
+        btn.danger().outline()
+    } else {
+        btn.success().outline()
+    }
 }
 
-pub fn mode_checkbox(
+/// Mode toggle (Tun / System Proxy / settings flags) — gpui-component [`Switch`].
+pub fn mode_switch(
     id: impl Into<SharedString>,
     label: &'static str,
     checked: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    div()
-        .id(id.into())
-        .flex()
-        .items_center()
-        .gap_1p5()
-        .h(px(18.))
-        .cursor_pointer()
-        .on_click(on_click)
-        .child(
-            div()
-                .size(px(14.))
-                .rounded_sm()
-                .border_1()
-                .border_color(Theme::border())
-                .bg(if checked {
-                    Theme::accent()
-                } else {
-                    Theme::bg_elevated()
-                })
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_xs()
-                .text_color(Theme::text_on_selected())
-                .child(if checked { "✓" } else { "" }),
-        )
-        .child(div().text_xs().text_color(Theme::text()).child(label))
+    Switch::new(id.into())
+        .label(label)
+        .checked(checked)
+        .with_size(Size::XSmall)
+        .on_click(move |_checked, window, cx| {
+            on_click(&ClickEvent::default(), window, cx);
+        })
 }
 
+/// Muted helper text above dialog forms.
+pub fn section_hint(text: impl Into<SharedString>) -> impl IntoElement {
+    div()
+        .text_xs()
+        .text_color(Theme::text_muted())
+        .mb_1()
+        .child(text.into())
+}
+
+/// Titled group panel — mirrors upstream `QGroupBox` (Routes / Route Profile).
+pub fn group_panel(
+    title: impl Into<SharedString>,
+    body: impl IntoElement,
+) -> impl IntoElement {
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .mb_2()
+        .border_1()
+        .border_color(Theme::border_light())
+        .rounded_md()
+        .bg(Theme::bg_elevated())
+        .child(
+            div()
+                .px_3()
+                .py_1p5()
+                .border_b_1()
+                .border_color(Theme::border_light())
+                .text_xs()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(Theme::text())
+                .child(title.into()),
+        )
+        .child(div().p_3().child(body))
+}
+
+/// Fallback line-edit chrome (routing fields without NestedInputs).
+///
+/// Prefer real [`Input`] / [`input_field_row`] for new forms.
+pub fn focus_field(
+    id: impl Into<SharedString>,
+    value: impl Into<SharedString>,
+    focused: bool,
+    placeholder: Option<&str>,
+    on_focus: impl Fn(&mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let id: SharedString = id.into();
+    let value = value.into();
+    let ph = placeholder.unwrap_or("").to_string();
+    let empty = value.is_empty();
+    let showing_placeholder = !focused && empty && !ph.is_empty();
+    let display: SharedString = if focused {
+        if empty {
+            "▌".into()
+        } else {
+            format!("{value}▌").into()
+        }
+    } else if empty {
+        ph.into()
+    } else {
+        value
+    };
+    let on_focus = std::rc::Rc::new(on_focus);
+    let on_focus_md = on_focus.clone();
+    let on_focus_click = on_focus;
+
+    div()
+        .id(id)
+        .flex_1()
+        .min_w(px(120.))
+        .h(px(30.))
+        .px_2()
+        .flex()
+        .items_center()
+        .rounded_sm()
+        .border_1()
+        .border_color(if focused {
+            Theme::accent()
+        } else {
+            Theme::border_light()
+        })
+        .bg(Theme::bg_elevated())
+        .text_sm()
+        .text_color(if showing_placeholder {
+            Theme::text_muted()
+        } else {
+            Theme::text()
+        })
+        .cursor_text()
+        .on_mouse_down(gpui::MouseButton::Left, move |_, w, cx| {
+            cx.stop_propagation();
+            on_focus_md(w, cx);
+        })
+        .on_click(move |_, w, cx| {
+            cx.stop_propagation();
+            on_focus_click(w, cx);
+        })
+        .child(display)
+}
+
+/// Label + real gpui-component [`Input`] row.
+pub fn input_field_row(
+    label: &'static str,
+    state: &Entity<InputState>,
+    label_width: f32,
+) -> impl IntoElement {
+    h_flex()
+        .items_center()
+        .gap_3()
+        .mb_2()
+        .w_full()
+        .child(
+            div()
+                .w(px(label_width))
+                .text_xs()
+                .text_color(Theme::text_muted())
+                .child(label),
+        )
+        .child(div().flex_1().min_w(px(120.)).child(Input::new(state).cleanable(true)))
+}
+
+/// Format a GPUI keystroke as a Throne hotkey label (`Cmd/Ctrl+Shift+C`).
+///
+/// Returns `None` for pure modifier presses (user is still holding the chord).
+pub fn format_hotkey_chord(keystroke: &gpui::Keystroke) -> Option<String> {
+    let key = keystroke.key.as_str();
+    // Modifier-only keydowns — wait for a real key.
+    if matches!(
+        key,
+        "control" | "ctrl" | "shift" | "alt" | "option" | "meta" | "cmd" | "command" | "win"
+            | "windows" | "super" | "fn" | "function"
+    ) {
+        return None;
+    }
+    // Escape is reserved for clear / dialog dismiss — not a bindable chord here.
+    if key == "escape" {
+        return None;
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    // Match stored defaults: Cmd/Ctrl for either platform (⌘) or control.
+    if keystroke.modifiers.platform || keystroke.modifiers.control {
+        parts.push("Cmd/Ctrl".into());
+    }
+    if keystroke.modifiers.alt {
+        parts.push("Alt".into());
+    }
+    if keystroke.modifiers.shift {
+        parts.push("Shift".into());
+    }
+
+    let key_label = match key {
+        "enter" | "return" => "Enter".to_string(),
+        "space" => "Space".to_string(),
+        "tab" => "Tab".to_string(),
+        "backspace" => "Backspace".to_string(),
+        "delete" => "Delete".to_string(),
+        "up" => "Up".to_string(),
+        "down" => "Down".to_string(),
+        "left" => "Left".to_string(),
+        "right" => "Right".to_string(),
+        "pageup" => "PageUp".to_string(),
+        "pagedown" => "PageDown".to_string(),
+        "home" => "Home".to_string(),
+        "end" => "End".to_string(),
+        "insert" => "Insert".to_string(),
+        other => {
+            // Single letters / digits → uppercase; f-keys keep common casing.
+            if other.len() == 1 {
+                other.to_uppercase()
+            } else if let Some(rest) = other.strip_prefix('f').filter(|r| r.chars().all(|c| c.is_ascii_digit())) {
+                format!("F{rest}")
+            } else {
+                let mut chars = other.chars();
+                match chars.next() {
+                    Some(c) => format!("{}{}", c.to_uppercase(), chars.as_str()),
+                    None => return None,
+                }
+            }
+        }
+    };
+    parts.push(key_label);
+    Some(parts.join("+"))
+}
+
+/// Label + key-capture field (upstream `QKeySequenceEdit` / `QtExtKeySequenceEdit`).
+///
+/// Click the field, then press a chord — `on_set` receives a label like
+/// `Cmd/Ctrl+R`. Backspace/Delete/Escape clear (empty string).
+pub fn hotkey_capture_row(
+    id: impl Into<SharedString>,
+    label: &'static str,
+    value: &str,
+    label_width: f32,
+    on_set: impl Fn(String, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let id: SharedString = id.into();
+    let clear_id = SharedString::from(format!("{id}-clear"));
+    let empty = value.trim().is_empty();
+    let display: SharedString = if empty {
+        "Press shortcut…".into()
+    } else {
+        value.to_string().into()
+    };
+
+    let on_set = Rc::new(on_set);
+    let on_key = on_set.clone();
+    let on_clear = on_set;
+
+    h_flex()
+        .items_center()
+        .gap_3()
+        .mb_2()
+        .w_full()
+        .child(
+            div()
+                .w(px(label_width))
+                .text_xs()
+                .text_color(Theme::text_muted())
+                .child(label),
+        )
+        .child(
+            div()
+                .id(id)
+                .flex_1()
+                .min_w(px(120.))
+                .flex()
+                .items_center()
+                .h(px(32.))
+                .px_3()
+                .rounded_md()
+                .border_1()
+                .border_color(Theme::border_light())
+                .bg(Theme::bg_elevated())
+                .cursor_text()
+                .tab_index(0)
+                .focus(|s| s.border_color(Theme::accent()))
+                .child(
+                    div()
+                        .flex_1()
+                        .text_sm()
+                        .text_color(if empty {
+                            Theme::text_muted()
+                        } else {
+                            Theme::text()
+                        })
+                        .child(display),
+                )
+                .child(
+                    div()
+                        .id(clear_id)
+                        .px_1()
+                        .text_xs()
+                        .text_color(Theme::text_muted())
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(Theme::text()))
+                        .child("✕")
+                        .on_click(move |_, window, cx| {
+                            on_clear(String::new(), window, cx);
+                        }),
+                )
+                .on_key_down(move |event: &KeyDownEvent, window, cx| {
+                    let key = event.keystroke.key.as_str();
+                    // Clear without binding Escape / lone Backspace / Delete.
+                    if key == "escape"
+                        || ((key == "backspace" || key == "delete")
+                            && !event.keystroke.modifiers.modified())
+                    {
+                        on_key(String::new(), window, cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if let Some(chord) = format_hotkey_chord(&event.keystroke) {
+                        on_key(chord, window, cx);
+                        cx.stop_propagation();
+                    }
+                }),
+        )
+}
+
+#[cfg(test)]
+mod hotkey_format_tests {
+    use super::format_hotkey_chord;
+    use gpui::{Keystroke, Modifiers};
+
+    fn ks(key: &str, modifiers: Modifiers) -> Keystroke {
+        Keystroke {
+            modifiers,
+            key: key.into(),
+            key_char: None,
+        }
+    }
+
+    #[test]
+    fn formats_cmd_ctrl_letter() {
+        let mut m = Modifiers::default();
+        m.platform = true;
+        assert_eq!(
+            format_hotkey_chord(&ks("r", m)).as_deref(),
+            Some("Cmd/Ctrl+R")
+        );
+    }
+
+    #[test]
+    fn formats_shift_combo() {
+        let mut m = Modifiers::default();
+        m.control = true;
+        m.shift = true;
+        assert_eq!(
+            format_hotkey_chord(&ks("c", m)).as_deref(),
+            Some("Cmd/Ctrl+Shift+C")
+        );
+    }
+
+    #[test]
+    fn ignores_modifier_only() {
+        let mut m = Modifiers::default();
+        m.shift = true;
+        assert_eq!(format_hotkey_chord(&ks("shift", m)), None);
+    }
+}
+
+/// Full-width real multi-line [`Input`].
+pub fn input_area(state: &Entity<InputState>) -> impl IntoElement {
+    div().w_full().child(Input::new(state).cleanable(true))
+}
+
+/// Multi-line [`Input`] with a **definite** pixel height (route simple-rules grids).
+///
+/// gpui-component multi-line Inputs collapse to ~one line under `h_auto` unless
+/// given an explicit `.h(...)`. Percentage/`h_full` only works when every ancestor
+/// already has a definite height — so we pin the height in pixels here.
+pub fn input_area_tall(state: &Entity<InputState>, height: f32) -> impl IntoElement {
+    div()
+        .w_full()
+        .h(px(height))
+        .child(Input::new(state).cleanable(true).h(px(height)))
+}
+
+/// Compact Input (flex-1) for inline rows; optional trailing control (e.g. preset ▼).
+pub fn input_inline(state: &Entity<InputState>) -> impl IntoElement {
+    div()
+        .flex_1()
+        .min_w(px(120.))
+        .child(Input::new(state).cleanable(true).with_size(Size::Small))
+}
+
+/// Multiline focus box (Add from input / multi-line routing fields).
+pub fn focus_text_area(
+    id: impl Into<SharedString>,
+    value: &str,
+    focused: bool,
+    min_height: f32,
+    on_focus: impl Fn(&mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let display = if focused {
+        if value.is_empty() {
+            "▌".to_string()
+        } else {
+            format!("{value}▌")
+        }
+    } else if value.is_empty() {
+        "…".into()
+    } else {
+        value.to_string()
+    };
+
+    div()
+        .id(id.into())
+        .w_full()
+        .min_h(px(min_height))
+        .overflow_y_scroll()
+        .p_2()
+        .rounded_sm()
+        .border_1()
+        .border_color(if focused {
+            Theme::accent()
+        } else {
+            Theme::border_light()
+        })
+        .bg(Theme::bg_elevated())
+        .text_sm()
+        .text_color(Theme::text())
+        .cursor_text()
+        .on_click(|_, _, cx| cx.stop_propagation())
+        .on_mouse_down(gpui::MouseButton::Left, {
+            move |_, w, cx| {
+                cx.stop_propagation();
+                on_focus(w, cx);
+            }
+        })
+        .child(display)
+}
+
+/// Dialog footer with Cancel + primary action.
+pub fn dialog_actions(
+    cancel_id: impl Into<SharedString>,
+    cancel_label: impl Into<SharedString>,
+    ok_id: impl Into<SharedString>,
+    ok_label: impl Into<SharedString>,
+    on_cancel: impl Fn(&mut Window, &mut App) + 'static,
+    on_ok: impl Fn(&mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    h_flex()
+        .justify_end()
+        .gap_2()
+        .mt_3()
+        .child(secondary_btn(cancel_id, cancel_label, move |_, w, cx| {
+            on_cancel(w, cx)
+        }))
+        .child(primary_btn(ok_id, ok_label, move |_, w, cx| on_ok(w, cx)))
+}
+
+/// Confirm / alert panel body using gpui-component [`Alert`] + action buttons.
+pub fn confirm_panel(
+    alert_id: impl Into<SharedString>,
+    message: impl Into<SharedString>,
+    danger: bool,
+    cancel_id: impl Into<SharedString>,
+    cancel_label: impl Into<SharedString>,
+    ok_id: impl Into<SharedString>,
+    ok_label: impl Into<SharedString>,
+    on_cancel: impl Fn(&mut Window, &mut App) + 'static,
+    on_ok: impl Fn(&mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let message = message.into();
+    let alert = if danger {
+        Alert::warning(alert_id.into(), message)
+    } else {
+        Alert::info(alert_id.into(), message)
+    };
+
+    v_flex()
+        .gap_3()
+        .child(alert)
+        .child(dialog_actions(
+            cancel_id,
+            cancel_label,
+            ok_id,
+            ok_label,
+            on_cancel,
+            on_ok,
+        ))
+}
+
+/// Status-bar profile label — plain tinted text (no outline chip).
+pub fn status_tag(running: bool, label: impl Into<SharedString>) -> impl IntoElement {
+    div()
+        .text_xs()
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(if running {
+            Theme::accent()
+        } else {
+            Theme::text_muted()
+        })
+        .child(label.into())
+}
+
+/// Inline notice banner (routing save hints, etc.).
+pub fn notice_banner(id: impl Into<SharedString>, text: impl Into<SharedString>) -> impl IntoElement {
+    Alert::info(id.into(), text.into()).banner().with_size(Size::XSmall)
+}
+
+/// Dropdown / context menu row — ghost [`Button`].
 pub fn menu_item(
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    div()
-        .id(id.into())
+    Button::new(id.into())
+        .ghost()
+        .label(label)
+        .with_size(Size::Small)
         .w_full()
-        .px_3()
-        .py_1p5()
-        .rounded_sm()
-        .text_sm()
-        .text_color(Theme::text())
-        .cursor_pointer()
-        // Soft highlight (matches toolbar buttons) instead of solid accent bar.
-        .hover(|e| e.bg(Theme::bg_hover()).text_color(Theme::accent()))
-        .active(|e| e.bg(Theme::accent_soft()).text_color(Theme::accent()))
-        .child(label.into())
+        .justify_start()
         .on_click(on_click)
 }
 
+/// Horizontal rule — gpui-component [`Divider`].
 pub fn menu_separator() -> impl IntoElement {
-    div()
-        .h(px(1.))
-        .w_full()
-        .my_1()
-        .bg(Theme::border_light())
+    Divider::horizontal().my_1()
 }
 
 pub fn menu_label(text: impl Into<SharedString>) -> impl IntoElement {
@@ -292,205 +726,62 @@ pub fn menu_label(text: impl Into<SharedString>) -> impl IntoElement {
         .child(text.into())
 }
 
-/// Modal dialog chrome (secondary features).
-///
-/// GPUI hit-testing is multi-hit by default: without [`.occlude()`], a click on
-/// the panel still marks the backdrop as hovered and fires its close handler.
-/// That is why "click field to type" used to dismiss the dialog immediately.
-pub fn modal_shell(
-    title: impl Into<SharedString>,
-    body: impl IntoElement,
-    on_close: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    modal_shell_sized(title, body, px(520.), px(480.), on_close)
-}
-
-/// Sized modal chrome — used by larger dialogs (Routes ≈ 800×600 upstream).
-pub fn modal_shell_sized(
-    title: impl Into<SharedString>,
-    body: impl IntoElement,
-    width: gpui::Pixels,
-    max_height: gpui::Pixels,
-    on_close: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    let on_close = std::rc::Rc::new(on_close);
-    let on_close_bg = on_close.clone();
-    let on_close_x = on_close;
-    div()
-        .id("modal-root")
-        .absolute()
-        .top_0()
-        .left_0()
-        .size_full()
-        .flex()
-        .items_center()
-        .justify_center()
-        // Block interaction with the main window under the modal.
-        .occlude()
-        .child(
-            // dim backdrop — click outside the panel closes
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .bg(gpui::rgba(0x00000080))
-                .id("modal-backdrop")
-                .on_click(move |ev, w, cx| on_close_bg(ev, w, cx)),
-        )
-        .child(
-            div()
-                .id("modal-panel")
-                .relative()
-                .w(width)
-                .max_h(max_height)
-                .flex()
-                .flex_col()
-                .bg(Theme::bg_elevated())
-                .border_1()
-                .border_color(Theme::border())
-                .rounded_md()
-                .shadow_lg()
-                // Critical: absorb hits so the backdrop under the panel does not close us.
-                .occlude()
-                // Swallow clicks on empty panel chrome (title bar padding, gaps).
-                .on_click(|_, _, cx| cx.stop_propagation())
-                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .px_4()
-                        .py_2()
-                        .border_b_1()
-                        .border_color(Theme::border_light())
-                        .bg(Theme::bg_panel())
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(Theme::text())
-                                .child(title.into()),
-                        )
-                        .child(
-                            div()
-                                .id("modal-x")
-                                .px_2()
-                                .cursor_pointer()
-                                .text_color(Theme::text_muted())
-                                .child("✕")
-                                .on_click(move |ev, w, cx| {
-                                    on_close_x(ev, w, cx);
-                                }),
-                        ),
-                )
-                .child(
-                    div()
-                        .id("modal-body")
-                        .flex_1()
-                        .overflow_y_scroll()
-                        .p_4()
-                        .child(body),
-                ),
-        )
-}
-
-pub fn form_row(label: &'static str, value: impl Into<SharedString>) -> impl IntoElement {
-    div()
-        .flex()
-        .items_center()
-        .gap_3()
-        .mb_2()
-        .child(
-            div()
-                .w(px(160.))
-                .text_xs()
-                .text_color(Theme::text_muted())
-                .child(label),
-        )
-        .child(
-            div()
-                .flex_1()
-                .px_2()
-                .py_1()
-                .rounded_sm()
-                .border_1()
-                .border_color(Theme::border_light())
-                .bg(Theme::bg_app())
-                .text_sm()
-                .text_color(Theme::text())
-                .child(value.into()),
-        )
-}
-
+/// Primary action — gpui-component primary [`Button`].
 pub fn primary_btn(
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    div()
-        .id(id.into())
-        .px_3()
-        .py_1p5()
-        .rounded_sm()
-        .bg(Theme::accent())
-        .text_sm()
-        .text_color(Theme::text_on_selected())
-        .cursor_pointer()
-        .hover(|e| e.opacity(0.9))
-        .child(label.into())
+    Button::new(id.into())
+        .primary()
+        .label(label)
+        .with_size(Size::Small)
         .on_click(on_click)
 }
 
+/// Secondary / outline action — gpui-component outline [`Button`].
 pub fn secondary_btn(
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    div()
-        .id(id.into())
-        .px_3()
-        .py_1p5()
-        .rounded_sm()
-        .border_1()
-        .border_color(Theme::border_light())
-        .bg(Theme::bg_toolbar_btn())
-        .text_sm()
-        .text_color(Theme::text())
-        .cursor_pointer()
-        .hover(|e| e.bg(Theme::bg_hover()))
-        .child(label.into())
+    Button::new(id.into())
+        .outline()
+        .label(label)
+        .with_size(Size::Small)
         .on_click(on_click)
 }
 
 /// Compact square icon button (toolbar / log panel actions).
 ///
-/// `icon_path` is an asset path such as `"icons/copy.svg"`. The glyph is tinted
-/// with [`Theme::icon`] so it follows light/dark.
+/// `icon_path` is an asset path such as `"icons/copy.svg"`.
 pub fn icon_btn(
     id: impl Into<SharedString>,
     icon_path: &'static str,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    div()
-        .id(id.into())
-        .flex()
-        .items_center()
-        .justify_center()
-        .w(px(30.))
-        .h(px(28.))
-        .rounded_sm()
-        .border_1()
-        .border_color(Theme::border_light())
-        .bg(Theme::bg_toolbar_btn())
-        .cursor_pointer()
-        .hover(|e| e.bg(Theme::bg_hover()))
-        .child(
-            svg()
-                .path(icon_path)
-                .size(px(15.))
-                .text_color(Theme::icon()),
-        )
+    Button::new(id.into())
+        .ghost()
+        .outline()
+        .icon(icon_from_path(icon_path))
+        .with_size(Size::Small)
         .on_click(on_click)
+}
+
+/// gpui-component [`TabBar`] — preferred for multi-tab rows (assigns stable tab ids).
+pub fn tab_bar(
+    id: impl Into<SharedString>,
+    selected_index: usize,
+    labels: impl IntoIterator<Item = SharedString>,
+    on_click: impl Fn(&usize, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let mut bar = TabBar::new(id.into())
+        .outline()
+        .with_size(Size::Small)
+        .selected_index(selected_index)
+        .on_click(on_click);
+    for label in labels {
+        bar = bar.child(Tab::new().label(label));
+    }
+    bar
 }

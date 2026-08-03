@@ -19,9 +19,9 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use gpui::{
-    AnyElement, App, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler,
-    FocusHandle, Focusable, KeyDownEvent, Pixels, ScrollHandle, SharedString, Subscription,
-    UTF16Selection, Window, actions, canvas, div, prelude::*, px, uniform_list,
+    App, Bounds, ClipboardItem, Context, EntityInputHandler, FocusHandle, Focusable, KeyDownEvent,
+    Pixels, ScrollHandle, SharedString, Subscription, UTF16Selection, Window, actions, div,
+    prelude::*, px, uniform_list,
 };
 
 use throne_core_client::{
@@ -34,18 +34,24 @@ use throne_domain::{
 use throne_import::{FetchOptions, fetch_url_with_options, import_subscription_response};
 
 use crate::theme::{self, Theme, latency_color};
+use crate::ui::dialog_inputs::{DialogInputs, NestedInputs};
 use crate::ui::dialogs::{
-    Dialog, add_input_body, basic_settings_body, confirm_delete_unavailable_body,
-    confirm_update_all_body, edit_profile_body, hotkey_settings_body, manage_groups_body,
-    subscription_diff_body, tun_settings_body,
+    Dialog, EditGroupView, HotkeyField, add_input_body, basic_settings_body,
+    confirm_delete_unavailable_body, confirm_update_all_body, edit_group_body, edit_profile_body,
+    hotkey_settings_body, manage_groups_body, subscription_diff_body, tun_settings_body,
 };
 use crate::ui::routing::{
-    RoutingEvent, RoutingNested, RoutingSideEffect, routing_settings_view,
+    RouteEditorTab, RoutingEvent, RoutingNested, RoutingSideEffect, routing_nested_title_owned,
+    routing_nested_view, routing_nested_width, routing_settings_view,
 };
 use crate::ui::widgets::{
-    TOOLBAR_BTN_GAP, TOOLBAR_BTN_W, TOOLBAR_MENU_TOP, TOOLBAR_PAD_X, icon_btn, menu_item, menu_label,
-    menu_separator, modal_shell, mode_checkbox, start_stop_btn, toolbar_btn,
-    toolbar_menu_panel, StartStopState, ToolbarIcon,
+    TOOLBAR_BTN_GAP, TOOLBAR_BTN_W, TOOLBAR_MENU_TOP, TOOLBAR_PAD_X, confirm_panel, icon_btn,
+    menu_item, menu_label, menu_separator, mode_switch, start_stop_btn, status_tag, tab_bar,
+    toolbar_btn, toolbar_menu_panel, StartStopState, ToolbarIcon,
+};
+use gpui_component::{
+    WindowExt as _,
+    dialog::Dialog as GpuiDialog,
 };
 
 actions!(
@@ -75,15 +81,8 @@ enum OpenMenu {
     Routing,
     Tools,
     ProfileCtx,
-}
-
-/// Which draft field receives typed characters inside Manage Groups.
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
-enum MgFocus {
-    #[default]
-    NewName,
-    EditName,
-    EditUrl,
+    /// Right-click on a group tab (or empty tab bar area).
+    GroupTabCtx,
 }
 
 /// Profile table sort column (click header to toggle).
@@ -211,7 +210,16 @@ struct TestProgressPanel {
     total: usize,
 }
 
-/// Upstream `DataViewHtmlGenerator::getProgressBar` — 10-char `#`/`-` bar.
+fn test_progress_percent(done: usize, total: usize) -> usize {
+    if total == 0 {
+        0
+    } else {
+        100 * done / total
+    }
+}
+
+/// Upstream `DataViewHtmlGenerator::getProgressBar` — 10-char `#`/`-` bar (tests only).
+#[cfg(test)]
 fn test_progress_bar(done: usize, total: usize) -> String {
     let filled = if total > 0 { 10 * done / total } else { 0 };
     let mut out = String::with_capacity(10);
@@ -221,15 +229,8 @@ fn test_progress_bar(done: usize, total: usize) -> String {
     out
 }
 
-fn test_progress_percent(done: usize, total: usize) -> usize {
-    if total == 0 {
-        0
-    } else {
-        100 * done / total
-    }
-}
-
 /// Labels for the top-right test panel (mirrors upstream HTML center text).
+#[cfg(test)]
 fn test_progress_lines(panel: &TestProgressPanel) -> (Option<String>, String) {
     let verb = match panel.kind {
         TestProgressKind::Url => "Running URL test",
@@ -242,6 +243,20 @@ fn test_progress_lines(panel: &TestProgressPanel) -> (Option<String>, String) {
         );
         let content = format!("{verb} ({} / {})", panel.done, panel.total);
         (Some(bar), content)
+    } else {
+        (None, verb.to_string())
+    }
+}
+
+/// UI view model for the top-right test panel — percent drives gpui-component Progress.
+fn test_progress_view(panel: &TestProgressPanel) -> (Option<f32>, String) {
+    let verb = match panel.kind {
+        TestProgressKind::Url => "Running URL test",
+    };
+    if panel.total > 1 {
+        let pct = test_progress_percent(panel.done, panel.total) as f32;
+        let content = format!("{verb} ({} / {})", panel.done, panel.total);
+        (Some(pct), content)
     } else {
         (None, verb.to_string())
     }
@@ -395,8 +410,17 @@ pub struct MainWindow {
     log_scroll_handle: ScrollHandle,
     rendered_log_text: String,
     ctx_menu_at: Option<(f32, f32)>,
+    /// Target group for [`OpenMenu::GroupTabCtx`] (`None` = empty tab-bar area).
+    ctx_group_id: Option<GroupId>,
     dialog: Dialog,
-    mg_focus: MgFocus,
+    /// Real InputState entities for the open dialog (text source of truth while open).
+    dialog_inputs: Option<DialogInputs>,
+    /// After async remote-fetch, push reloaded simple rules into NestedInputs on next paint.
+    pending_nested_simple_sync: bool,
+    /// Present / re-present gpui-component `open_dialog` on next paint (no Window at set time).
+    pending_gpui_dialog: bool,
+    /// Last presented dialog stack: (main kind id, nested kind). Avoids focus-resetting re-open.
+    presented_dialog_stack: (u8, NestedKind),
     /// Go `ThroneCore` process + IPC (real Start/Stop).
     /// Behind a mutex so Start/Stop can run off the UI thread.
     core: Arc<Mutex<CoreSession>>,
@@ -412,8 +436,6 @@ pub struct MainWindow {
     running_profile_display: Option<String>,
     /// Target profile to start once the current core has fully stopped.
     pending_profile_switch: PendingProfileSwitch,
-    /// Frame index for the Start/Stop transition indicator.
-    loading_frame: usize,
     /// True while a URL-test / sub-update job is in flight.
     background_busy: bool,
     /// Top-right progress while group URL/IP test runs (upstream `data_view`).
@@ -493,8 +515,12 @@ impl MainWindow {
             log_scroll_handle: ScrollHandle::new(),
             rendered_log_text: String::new(),
             ctx_menu_at: None,
+            ctx_group_id: None,
             dialog: Dialog::None,
-            mg_focus: MgFocus::NewName,
+            dialog_inputs: None,
+            pending_nested_simple_sync: false,
+            pending_gpui_dialog: false,
+            presented_dialog_stack: (0, NestedKind::None),
             core: Arc::new(Mutex::new(CoreSession::new(core_cfg))),
             core_op_busy: false,
             network_recovery_busy: false,
@@ -502,7 +528,6 @@ impl MainWindow {
             pending_stop: false,
             running_profile_display: None,
             pending_profile_switch: PendingProfileSwitch::default(),
-            loading_frame: 0,
             background_busy: false,
             test_progress: None,
             subscription_queue: None,
@@ -516,7 +541,6 @@ impl MainWindow {
             _appearance_sub: None,
         };
         window.spawn_runtime_poller(cx);
-        window.spawn_loading_indicator(cx);
         window
     }
 
@@ -553,33 +577,6 @@ impl MainWindow {
             }
         })
         .detach();
-    }
-
-    fn spawn_loading_indicator(&self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            loop {
-                smol::Timer::after(std::time::Duration::from_millis(120)).await;
-                if this
-                    .update(cx, |this, cx| {
-                        if matches!(
-                            this.state.core_status(),
-                            CoreStatus::Starting | CoreStatus::Stopping
-                        ) {
-                            this.loading_frame = (this.loading_frame + 1) % 4;
-                            cx.notify();
-                        }
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-        .detach();
-    }
-
-    fn loading_glyph(&self) -> &'static str {
-        ["|", "/", "-", "\\"][self.loading_frame]
     }
 
     fn toggle_sort(&mut self, col: SortColumn, cx: &mut Context<Self>) {
@@ -623,10 +620,80 @@ impl MainWindow {
     fn close_menus(&mut self) {
         self.open_menu = OpenMenu::None;
         self.ctx_menu_at = None;
+        self.ctx_group_id = None;
     }
 
     fn close_dialog(&mut self) {
         self.dialog = Dialog::None;
+        self.dialog_inputs = None;
+        self.pending_nested_simple_sync = false;
+        self.pending_gpui_dialog = false;
+        self.presented_dialog_stack = (0, NestedKind::None);
+    }
+
+    /// Close app dialog state and any gpui-component Dialog layer.
+    fn close_dialog_with_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_dialog();
+        window.close_all_dialogs(cx);
+    }
+
+    /// Whether this dialog kind is hosted by gpui-component `open_dialog`.
+    fn uses_gpui_dialog(dialog: &Dialog) -> bool {
+        !matches!(dialog, Dialog::None)
+    }
+
+    fn dialog_stack_key(&self) -> (u8, NestedKind) {
+        let main = match &self.dialog {
+            Dialog::None => 0,
+            Dialog::BasicSettings { .. } => 1,
+            Dialog::ManageGroups => 2,
+            Dialog::EditGroup { .. } => 12,
+            Dialog::ConfirmRemoveGroup { .. } => 13,
+            Dialog::AddFromInput { .. } => 3,
+            Dialog::TunSettings { .. } => 4,
+            Dialog::HotkeySettings { .. } => 5,
+            Dialog::EditProfile { .. } => 6,
+            Dialog::ConfirmDeleteUnavailable { .. } => 7,
+            Dialog::ConfirmUpdateAllSubscriptions => 8,
+            Dialog::SubscriptionDiff { .. } => 9,
+            Dialog::RoutingSettings(d) => {
+                return (10, nested_kind(&d.nested));
+            }
+        };
+        (main, NestedKind::None)
+    }
+
+    /// Open (or re-stack) gpui-component Dialogs: main layer + optional nested layer.
+    /// Nested route editors are **independent** open_dialog layers (not painted inside Routes).
+    fn present_gpui_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pending_gpui_dialog = false;
+        let key = self.dialog_stack_key();
+        if key == self.presented_dialog_stack && window.has_active_dialog(cx) {
+            return;
+        }
+        window.close_all_dialogs(cx);
+        self.presented_dialog_stack = key;
+        if key.0 == 0 {
+            return;
+        }
+        let entity = cx.entity().clone();
+        window.open_dialog(cx, move |dialog, window, cx| {
+            build_gpui_dialog(dialog, entity.clone(), window, cx)
+        });
+        if key.0 == 10 && key.1 != NestedKind::None {
+            let entity = cx.entity().clone();
+            window.open_dialog(cx, move |dialog, window, cx| {
+                build_nested_routing_dialog(dialog, entity.clone(), window, cx)
+            });
+        }
+    }
+
+    /// Schedule `present_gpui_dialog` for the next paint (async / no Window paths).
+    fn request_gpui_dialog(&mut self) {
+        if Self::uses_gpui_dialog(&self.dialog) {
+            self.presented_dialog_stack = (0, NestedKind::None);
+            self.pending_gpui_dialog = true;
+        }
     }
 
     fn toggle_menu(&mut self, menu: OpenMenu, cx: &mut Context<Self>) {
@@ -639,51 +706,180 @@ impl MainWindow {
             menu
         };
         self.ctx_menu_at = None;
+        self.ctx_group_id = None;
         cx.notify();
     }
 
-    fn open_basic_settings(&mut self, cx: &mut Context<Self>) {
+    fn open_basic_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_menus();
         self.dialog = Dialog::basic_from_state(&self.state);
+        self.dialog_inputs = Some(DialogInputs::basic(window, cx, &self.state));
+        self.present_gpui_dialog(window, cx);
         cx.notify();
     }
 
-    fn open_manage_groups(&mut self, cx: &mut Context<Self>) {
+    fn open_manage_groups(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_menus();
-        self.mg_focus = MgFocus::NewName;
         self.dialog = Dialog::manage_groups_from_state(&self.state);
+        self.dialog_inputs = None;
+        self.present_gpui_dialog(window, cx);
         cx.notify();
     }
 
-    fn open_add_from_input(&mut self, cx: &mut Context<Self>) {
+    fn open_edit_group_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dialog = Dialog::edit_group_new();
+        self.dialog_inputs = Some(DialogInputs::edit_group(window, cx, "", ""));
+        self.present_gpui_dialog(window, cx);
+        cx.notify();
+    }
+
+    fn open_edit_group(&mut self, id: GroupId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(d) = Dialog::edit_group_from_state(&self.state, id) else {
+            self.state.set_status_message("Group not found");
+            cx.notify();
+            return;
+        };
+        let (name, url) = self
+            .state
+            .group(id)
+            .map(|g| (g.name.clone(), g.url.clone()))
+            .unwrap_or_default();
+        self.dialog = d;
+        self.dialog_inputs = Some(DialogInputs::edit_group(window, cx, &name, &url));
+        self.present_gpui_dialog(window, cx);
+        cx.notify();
+    }
+
+    fn return_to_manage_groups(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dialog = Dialog::manage_groups_from_state(&self.state);
+        self.dialog_inputs = None;
+        self.present_gpui_dialog(window, cx);
+        cx.notify();
+    }
+
+    fn proxy_display_label(&self, proxy_id: i64) -> String {
+        if proxy_id < 0 {
+            return "None".into();
+        }
+        let Some(p) = self.state.profile(proxy_id as ProfileId) else {
+            return "INVALID".into();
+        };
+        let gname = self
+            .state
+            .group(p.group_id)
+            .map(|g| g.name.as_str())
+            .unwrap_or("?");
+        format!("[{gname}] {}", p.name)
+    }
+
+    /// Ordered proxy ids for front/landing cycle (None + all profiles).
+    fn group_proxy_cycle_ids(&self) -> Vec<i64> {
+        let mut ids = vec![-1_i64];
+        for g in self.state.all_groups() {
+            for &pid in &g.profile_ids {
+                ids.push(pid as i64);
+            }
+        }
+        ids
+    }
+
+    fn cycle_group_proxy(ids: &[i64], current: i64) -> i64 {
+        if ids.is_empty() {
+            return -1;
+        }
+        let Some(ix) = ids.iter().position(|&x| x == current) else {
+            return ids[0];
+        };
+        ids[(ix + 1) % ids.len()]
+    }
+
+    fn open_add_from_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_menus();
         self.dialog = Dialog::add_from_input();
+        self.dialog_inputs = Some(DialogInputs::add_from_input(window, cx));
+        self.present_gpui_dialog(window, cx);
         cx.notify();
     }
 
-    fn open_routing_settings(&mut self, cx: &mut Context<Self>) {
+    fn open_routing_settings(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
         self.close_menus();
         self.dialog = Dialog::routing_from_state(&self.state);
+        // Main DNS/Warp/Hijack fields → real Input (created now or lazily in render).
+        if let Some(window) = window {
+            let settings = match &self.dialog {
+                Dialog::RoutingSettings(d) => d.settings.clone(),
+                _ => self.state.settings().clone(),
+            };
+            self.dialog_inputs = Some(DialogInputs::routing(window, cx, &settings));
+            self.present_gpui_dialog(window, cx);
+        } else {
+            self.dialog_inputs = None;
+            self.request_gpui_dialog();
+        }
         cx.notify();
     }
 
-    fn open_tun_settings(&mut self, cx: &mut Context<Self>) {
+    /// Ensure RoutingInputs exist (tray open has no Window until next paint).
+    fn ensure_routing_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.dialog, Dialog::RoutingSettings(_)) {
+            return;
+        }
+        if matches!(self.dialog_inputs, Some(DialogInputs::Routing(_))) {
+            return;
+        }
+        let settings = match &self.dialog {
+            Dialog::RoutingSettings(d) => d.settings.clone(),
+            _ => return,
+        };
+        self.dialog_inputs = Some(DialogInputs::routing(window, cx, &settings));
+    }
+
+    /// Called by [`AppShell`] **before** painting the dialog layer (not from
+    /// MainWindow::render) so `open_dialog` builders never re-enter this entity.
+    pub fn prepare_dialog_layer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_routing_inputs(window, cx);
+        if self.pending_nested_simple_sync {
+            self.push_simple_to_nested_inputs(window, cx);
+            self.push_rule_to_nested_inputs(window, cx);
+            self.pending_nested_simple_sync = false;
+        }
+        if self.pending_gpui_dialog {
+            self.present_gpui_dialog(window, cx);
+        }
+    }
+
+    fn open_tun_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_menus();
         self.dialog = Dialog::tun_from_state(&self.state);
+        let mtu = match &self.dialog {
+            Dialog::TunSettings { vpn_mtu, .. } => vpn_mtu.clone(),
+            _ => "9000".into(),
+        };
+        self.dialog_inputs = Some(DialogInputs::tun(window, cx, &mtu));
+        self.present_gpui_dialog(window, cx);
         cx.notify();
     }
 
-    fn open_hotkey_settings(&mut self, cx: &mut Context<Self>) {
+    fn open_hotkey_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_menus();
         self.dialog = Dialog::hotkey_from_state(&self.state);
+        // Capture fields write into `Dialog::HotkeySettings` strings (no InputState).
+        self.dialog_inputs = None;
+        self.present_gpui_dialog(window, cx);
         cx.notify();
     }
 
-    fn open_edit_profile(&mut self, cx: &mut Context<Self>) {
+    fn open_edit_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_menus();
         match Dialog::edit_profile_from_state(&self.state) {
             Some(d) => {
+                let name = match &d {
+                    Dialog::EditProfile { name, .. } => name.clone(),
+                    _ => String::new(),
+                };
                 self.dialog = d;
+                self.dialog_inputs = Some(DialogInputs::edit_profile(window, cx, &name));
+                self.present_gpui_dialog(window, cx);
                 cx.notify();
             }
             None => {
@@ -695,8 +891,14 @@ impl MainWindow {
     }
 
     fn save_edit_profile(&mut self, cx: &mut Context<Self>) {
-        let (id, name) = match &self.dialog {
-            Dialog::EditProfile { id, name, .. } => (*id, name.clone()),
+        let id = match &self.dialog {
+            Dialog::EditProfile { id, .. } => *id,
+            _ => return,
+        };
+        let name = match &self.dialog_inputs {
+            Some(DialogInputs::EditProfile { name }) => {
+                DialogInputs::read_string(name, cx)
+            }
             _ => return,
         };
         match self.state.rename_profile(id, name) {
@@ -719,26 +921,274 @@ impl MainWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let sync_dns_presets = matches!(
+            &ev,
+            RoutingEvent::Cycle("remote_dns_preset") | RoutingEvent::Cycle("direct_dns_preset")
+        );
+        // Pull NestedInputs into draft before actions that read name/url/simple/rules/import.
+        let needs_sync = matches!(
+            &ev,
+            RoutingEvent::NestedAction(
+                "editor-ok"
+                    | "raw-ok"
+                    | "import-ok"
+                    | "remote-preview"
+                    | "remote-fetch"
+                    | "rule-new"
+                    | "rule-del"
+                    | "rule-up"
+                    | "rule-down"
+            ) | RoutingEvent::ReTab(_)
+                | RoutingEvent::ReSelectRule(_)
+        );
+        if needs_sync {
+            self.sync_nested_inputs_into_draft(cx);
+        }
+        let switching_to_basic = matches!(&ev, RoutingEvent::ReTab(RouteEditorTab::Basic));
+        let push_rule_after = matches!(
+            &ev,
+            RoutingEvent::ReSelectRule(_)
+                | RoutingEvent::NestedAction("rule-new" | "rule-del" | "rule-up" | "rule-down")
+                | RoutingEvent::ReTab(RouteEditorTab::Advanced)
+        );
+
         let Dialog::RoutingSettings(draft) = &mut self.dialog else {
             return;
         };
+        let before_nested = nested_kind(&draft.nested);
         let effect = draft.apply_event(ev);
-        // Keep window keyboard focus so IME + on_key_down keep delivering.
-        self.focus_handle.focus(window);
-        self.dispatch_routing_effect(effect, cx);
+        let after_nested = if let Dialog::RoutingSettings(d) = &self.dialog {
+            nested_kind(&d.nested)
+        } else {
+            NestedKind::None
+        };
+
+        // ▼ DNS presets update draft.settings — push into Input widgets.
+        if sync_dns_presets {
+            if let (Dialog::RoutingSettings(d), Some(DialogInputs::Routing(inputs))) =
+                (&self.dialog, &self.dialog_inputs)
+            {
+                DialogInputs::set_string(
+                    &inputs.remote_dns,
+                    d.settings.remote_dns.clone(),
+                    window,
+                    cx,
+                );
+                DialogInputs::set_string(
+                    &inputs.direct_dns,
+                    d.settings.direct_dns.clone(),
+                    window,
+                    cx,
+                );
+            }
+        }
+
+        // Create / clear NestedInputs when the nested form kind changes.
+        if before_nested != after_nested {
+            self.rebuild_nested_inputs(window, cx);
+            // Independent open_dialog layer for nested — re-stack main ± nested.
+            self.presented_dialog_stack = (0, NestedKind::None);
+            self.present_gpui_dialog(window, cx);
+        } else if switching_to_basic {
+            // Advanced → Basic reloads simple_* strings; push into NestedInputs.
+            self.push_simple_to_nested_inputs(window, cx);
+        } else if push_rule_after {
+            // Selected rule changed — load its attrs into NestedInputs.
+            self.push_rule_to_nested_inputs(window, cx);
+        }
+
+        self.dispatch_routing_effect(effect, window, cx);
     }
 
-    fn dispatch_routing_effect(&mut self, effect: RoutingSideEffect, cx: &mut Context<Self>) {
+    /// Write NestedInputs values into the open nested draft (before OK / fetch / tab switch).
+    fn sync_nested_inputs_into_draft(&mut self, cx: &App) {
+        let Some(DialogInputs::Routing(inputs)) = &self.dialog_inputs else {
+            return;
+        };
+        let Some(nested) = &inputs.nested else {
+            return;
+        };
+        let Dialog::RoutingSettings(draft) = &mut self.dialog else {
+            return;
+        };
+        match (&mut draft.nested, nested) {
+            (RoutingNested::RouteEditor(ed), NestedInputs::RouteEditor(re)) => {
+                ed.profile.name = DialogInputs::read_string(&re.name, cx);
+                ed.profile.remote_url = DialogInputs::read_string(&re.url, cx);
+                ed.simple_direct = DialogInputs::read_string(&re.simple_direct, cx);
+                ed.simple_proxy = DialogInputs::read_string(&re.simple_proxy, cx);
+                ed.simple_block = DialogInputs::read_string(&re.simple_block, cx);
+                ed.simple_warp = DialogInputs::read_string(&re.simple_warp, cx);
+                // Advanced rule fields → currently selected rule.
+                if let Some(i) = ed.selected_rule {
+                    if let Some(r) = ed.profile.rules.get_mut(i) {
+                        r.name = DialogInputs::read_string(&re.rule_name, cx);
+                        r.protocol = DialogInputs::read_string(&re.rule_protocol, cx);
+                        r.domain = lines_to_vec(&DialogInputs::read_string(&re.rule_domain, cx));
+                        r.domain_suffix =
+                            lines_to_vec(&DialogInputs::read_string(&re.rule_suffix, cx));
+                        r.ip_cidr = lines_to_vec(&DialogInputs::read_string(&re.rule_ip, cx));
+                    }
+                }
+            }
+            (RoutingNested::RawEditor(ed), NestedInputs::RawEditor(raw)) => {
+                ed.name = DialogInputs::read_string(&raw.name, cx);
+                ed.raw_route = DialogInputs::read_string(&raw.json, cx);
+            }
+            (RoutingNested::ImportPaste { text }, NestedInputs::ImportPaste { text: inp }) => {
+                *text = DialogInputs::read_string(inp, cx);
+            }
+            _ => {}
+        }
+    }
+
+    /// Push draft simple_* strings into NestedInputs (after Advanced→Basic or remote fetch).
+    fn push_simple_to_nested_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let simple = match &self.dialog {
+            Dialog::RoutingSettings(d) => match &d.nested {
+                RoutingNested::RouteEditor(ed) => Some((
+                    ed.simple_direct.clone(),
+                    ed.simple_proxy.clone(),
+                    ed.simple_block.clone(),
+                    ed.simple_warp.clone(),
+                )),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some((direct, proxy, block, warp)) = simple else {
+            return;
+        };
+        let Some(DialogInputs::Routing(inputs)) = &self.dialog_inputs else {
+            return;
+        };
+        let Some(NestedInputs::RouteEditor(re)) = &inputs.nested else {
+            return;
+        };
+        DialogInputs::set_string(&re.simple_direct, direct, window, cx);
+        DialogInputs::set_string(&re.simple_proxy, proxy, window, cx);
+        DialogInputs::set_string(&re.simple_block, block, window, cx);
+        DialogInputs::set_string(&re.simple_warp, warp, window, cx);
+    }
+
+    /// Push the currently selected rule's attrs into NestedInputs (or clear if none).
+    fn push_rule_to_nested_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rule = match &self.dialog {
+            Dialog::RoutingSettings(d) => match &d.nested {
+                RoutingNested::RouteEditor(ed) => ed
+                    .selected_rule
+                    .and_then(|i| ed.profile.rules.get(i))
+                    .map(|r| {
+                        (
+                            r.name.clone(),
+                            r.protocol.clone(),
+                            r.domain.join("\n"),
+                            r.domain_suffix.join("\n"),
+                            r.ip_cidr.join("\n"),
+                        )
+                    }),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(DialogInputs::Routing(inputs)) = &self.dialog_inputs else {
+            return;
+        };
+        let Some(NestedInputs::RouteEditor(re)) = &inputs.nested else {
+            return;
+        };
+        let (name, protocol, domain, suffix, ip) =
+            rule.unwrap_or_else(|| (String::new(), String::new(), String::new(), String::new(), String::new()));
+        DialogInputs::set_string(&re.rule_name, name, window, cx);
+        DialogInputs::set_string(&re.rule_protocol, protocol, window, cx);
+        DialogInputs::set_string(&re.rule_domain, domain, window, cx);
+        DialogInputs::set_string(&re.rule_suffix, suffix, window, cx);
+        DialogInputs::set_string(&re.rule_ip, ip, window, cx);
+    }
+
+    /// Allocate NestedInputs for the current nested form, or clear them.
+    fn rebuild_nested_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(DialogInputs::Routing(inputs)) = self.dialog_inputs.as_mut() else {
+            return;
+        };
+        let Dialog::RoutingSettings(draft) = &self.dialog else {
+            inputs.clear_nested();
+            return;
+        };
+        match &draft.nested {
+            RoutingNested::RouteEditor(ed) => {
+                inputs.set_nested(NestedInputs::route_editor(
+                    window,
+                    cx,
+                    &ed.profile.name,
+                    &ed.profile.remote_url,
+                    &ed.simple_direct,
+                    &ed.simple_proxy,
+                    &ed.simple_block,
+                    &ed.simple_warp,
+                ));
+            }
+            RoutingNested::RawEditor(ed) => {
+                inputs.set_nested(NestedInputs::raw_editor(
+                    window,
+                    cx,
+                    &ed.name,
+                    &ed.raw_route,
+                ));
+            }
+            RoutingNested::ImportPaste { text } => {
+                inputs.set_nested(NestedInputs::import_paste(window, cx, text));
+            }
+            RoutingNested::None
+            | RoutingNested::NewMenu
+            | RoutingNested::UpdateMenu { .. }
+            | RoutingNested::Notice { .. } => {
+                inputs.clear_nested();
+            }
+        }
+        self.pending_nested_simple_sync = false;
+    }
+
+    /// Whether NestedInputs currently owns keyboard input (skip fake-caret).
+    fn nested_inputs_own_typing(&self) -> bool {
+        let Some(DialogInputs::Routing(inputs)) = &self.dialog_inputs else {
+            return false;
+        };
+        let Some(nested) = &inputs.nested else {
+            return false;
+        };
+        let Dialog::RoutingSettings(draft) = &self.dialog else {
+            return false;
+        };
+        match (&draft.nested, nested) {
+            (RoutingNested::ImportPaste { .. }, NestedInputs::ImportPaste { .. }) => true,
+            // Structured + raw route editors are fully Input-backed.
+            (RoutingNested::RouteEditor(_), NestedInputs::RouteEditor(_)) => true,
+            (RoutingNested::RawEditor(_), NestedInputs::RawEditor(_)) => true,
+            _ => false,
+        }
+    }
+
+    fn dispatch_routing_effect(
+        &mut self,
+        effect: RoutingSideEffect,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match effect {
             RoutingSideEffect::None => {
                 cx.notify();
             }
             RoutingSideEffect::Close => {
-                self.close_dialog();
+                self.close_dialog_with_window(window, cx);
                 cx.notify();
             }
             RoutingSideEffect::Commit => {
                 self.commit_routing_settings(cx);
+                // Only dismiss the gpui layer when commit closed the app dialog.
+                if matches!(self.dialog, Dialog::None) {
+                    window.close_all_dialogs(cx);
+                }
             }
             RoutingSideEffect::CopyClipboard(text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -756,7 +1206,7 @@ impl MainWindow {
                     .unwrap_or_default();
                 let clip = clip.trim().to_string();
                 if !clip.is_empty() {
-                    if self.try_import_route_text(&clip, true, cx) {
+                    if self.try_import_route_text(&clip, true, window, cx) {
                         return;
                     }
                 }
@@ -765,10 +1215,11 @@ impl MainWindow {
                         text: String::new(),
                     };
                 }
+                self.rebuild_nested_inputs(window, cx);
                 cx.notify();
             }
             RoutingSideEffect::ImportText(text) => {
-                let _ = self.try_import_route_text(&text, false, cx);
+                let _ = self.try_import_route_text(&text, false, window, cx);
                 cx.notify();
             }
             RoutingSideEffect::UpdateRemotes(profiles) => {
@@ -786,17 +1237,32 @@ impl MainWindow {
                             .into(),
                     };
                 }
+                // Notice has no NestedInputs
+                if let Some(DialogInputs::Routing(inputs)) = self.dialog_inputs.as_mut() {
+                    inputs.clear_nested();
+                }
                 cx.notify();
             }
         }
     }
 
     fn commit_routing_settings(&mut self, cx: &mut Context<Self>) {
+        // Pull live Input values into the draft before validate/commit.
+        if let (Dialog::RoutingSettings(draft), Some(DialogInputs::Routing(inputs))) =
+            (&mut self.dialog, &self.dialog_inputs)
+        {
+            inputs.apply_to_settings(&mut draft.settings, cx);
+        }
+
         let Dialog::RoutingSettings(draft) = &self.dialog else {
             return;
         };
-        // Validate DNS hijack rules
-        let rules_text = draft.dns_rules_text();
+        // Validate DNS hijack rules (prefer Input text when present).
+        let rules_text = if let Some(DialogInputs::Routing(inputs)) = &self.dialog_inputs {
+            DialogInputs::read_string(&inputs.dns_rules, cx)
+        } else {
+            draft.dns_rules_text()
+        };
         if !crate::ui::routing::RoutingDraft::validate_dns_rules(&rules_text) {
             if let Dialog::RoutingSettings(d) = &mut self.dialog {
                 d.nested = RoutingNested::Notice {
@@ -821,8 +1287,7 @@ impl MainWindow {
         let active_id = draft.active_id;
         let mut settings = draft.settings.clone();
         settings.current_route_id = active_id;
-        // Keep dns rules from text
-        settings.dns_server_rules = draft.settings.dns_server_rules.clone();
+        // DNS rules already applied via RoutingInputs::apply_to_settings when present.
 
         match self.state.commit_routes(routes, active_id) {
             Ok(()) => {
@@ -849,6 +1314,7 @@ impl MainWindow {
         &mut self,
         text: &str,
         from_clipboard: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
         let report = match throne_import::try_import_routes(text) {
@@ -865,6 +1331,9 @@ impl MainWindow {
                                     r.errors.join("; ")
                                 ),
                             };
+                        }
+                        if let Some(DialogInputs::Routing(inputs)) = self.dialog_inputs.as_mut() {
+                            inputs.clear_nested();
                         }
                         cx.notify();
                     }
@@ -884,6 +1353,9 @@ impl MainWindow {
                         ),
                     };
                 }
+                if let Some(DialogInputs::Routing(inputs)) = self.dialog_inputs.as_mut() {
+                    inputs.clear_nested();
+                }
                 cx.notify();
             }
             return false;
@@ -902,6 +1374,9 @@ impl MainWindow {
                 d.selected_idx = d.routes.len().saturating_sub(1);
                 d.nested = RoutingNested::None;
                 d.notice = format!("Added {} remote profile(s)", to_update.len());
+            }
+            if let Some(DialogInputs::Routing(inputs)) = self.dialog_inputs.as_mut() {
+                inputs.clear_nested();
             }
             cx.notify();
             self.update_remote_routes(to_update, cx);
@@ -923,6 +1398,8 @@ impl MainWindow {
                 d.notice = report.warnings.join("; ");
             }
         }
+        // Legacy array opens RouteEditor — allocate NestedInputs for Name/URL.
+        self.rebuild_nested_inputs(window, cx);
         cx.notify();
         true
     }
@@ -1037,6 +1514,10 @@ impl MainWindow {
                         if let Dialog::RoutingSettings(d) = &mut this.dialog {
                             d.apply_remote_fetch_to_editor(r, apply);
                         }
+                        if apply {
+                            // Simple rules reloaded into draft; push into NestedInputs on next paint.
+                            this.pending_nested_simple_sync = true;
+                        }
                     }
                     Err(e) => {
                         if let Dialog::RoutingSettings(d) = &mut this.dialog {
@@ -1052,28 +1533,32 @@ impl MainWindow {
     }
 
     fn save_tun_settings(&mut self, cx: &mut Context<Self>) {
-        if let Dialog::TunSettings {
-            vpn_mtu,
+        let (vpn_strict_route, disable_private_range_bypass) = match &self.dialog {
+            Dialog::TunSettings {
+                vpn_strict_route,
+                disable_private_range_bypass,
+                ..
+            } => (*vpn_strict_route, *disable_private_range_bypass),
+            _ => return,
+        };
+        let mtu_str = match &self.dialog_inputs {
+            Some(DialogInputs::Tun { mtu }) => DialogInputs::read_string(mtu, cx),
+            _ => return,
+        };
+        let mtu = mtu_str.parse::<i32>().unwrap_or(1500);
+        self.state.apply_tun_settings(
+            mtu,
             vpn_strict_route,
             disable_private_range_bypass,
-            ..
-        } = &self.dialog
-        {
-            let mtu = vpn_mtu.parse::<i32>().unwrap_or(1500);
-            self.state.apply_tun_settings(
-                mtu,
-                *vpn_strict_route,
-                *disable_private_range_bypass,
-                None,
-            );
-            self.close_dialog();
-            let _ = self.persist_db();
-        }
+            None,
+        );
+        self.close_dialog();
+        let _ = self.persist_db();
         cx.notify();
     }
 
     fn save_hotkey_settings(&mut self, cx: &mut Context<Self>) {
-        if let Dialog::HotkeySettings {
+        let Dialog::HotkeySettings {
             start_stop,
             import,
             save,
@@ -1081,16 +1566,54 @@ impl MainWindow {
             copy_logs,
             ..
         } = &self.dialog
-        {
-            self.state.apply_hotkey_settings(
-                start_stop.clone(),
-                import.clone(),
-                save.clone(),
-                url_test.clone(),
-                copy_logs.clone(),
-            );
-            self.close_dialog();
-            let _ = self.persist_db();
+        else {
+            return;
+        };
+        self.state.apply_hotkey_settings(
+            start_stop.clone(),
+            import.clone(),
+            save.clone(),
+            url_test.clone(),
+            copy_logs.clone(),
+        );
+        self.close_dialog();
+        let _ = self.persist_db();
+        cx.notify();
+    }
+
+    fn set_hotkey_field(&mut self, field: HotkeyField, chord: String, cx: &mut Context<Self>) {
+        let Dialog::HotkeySettings {
+            start_stop,
+            import,
+            save,
+            url_test,
+            copy_logs,
+            focus,
+        } = &mut self.dialog
+        else {
+            return;
+        };
+        match field {
+            HotkeyField::StartStop => {
+                *start_stop = chord;
+                *focus = 0;
+            }
+            HotkeyField::Import => {
+                *import = chord;
+                *focus = 1;
+            }
+            HotkeyField::Save => {
+                *save = chord;
+                *focus = 2;
+            }
+            HotkeyField::UrlTest => {
+                *url_test = chord;
+                *focus = 3;
+            }
+            HotkeyField::CopyLogs => {
+                *copy_logs = chord;
+                *focus = 4;
+            }
         }
         cx.notify();
     }
@@ -1266,7 +1789,7 @@ impl MainWindow {
 
     /// Upstream tray "Select Routing" — open Routes dialog.
     pub(crate) fn tray_select_routing(&mut self, cx: &mut Context<Self>) {
-        self.open_routing_settings(cx);
+        self.open_routing_settings(None, cx);
     }
 
     pub(crate) fn tray_toggle_start_with_system(&mut self, cx: &mut Context<Self>) {
@@ -1771,6 +2294,8 @@ impl MainWindow {
     }
 
     fn persist_db(&mut self) -> Result<(), String> {
+        // Full rewrite save requires every profile.gid to exist in groups.
+        self.state.sanitize_group_profile_refs();
         let path = if self.db_path_label.is_empty() {
             throne_storage::default_db_path()
         } else {
@@ -2026,7 +2551,7 @@ impl MainWindow {
         .detach();
     }
 
-    fn delete_unavailable(&mut self, cx: &mut Context<Self>) {
+    fn delete_unavailable(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
         self.close_menus();
         let group_id = self.state.active_group_id();
         let count = self.state.unavailable_profile_ids_in_group(group_id).len();
@@ -2035,16 +2560,22 @@ impl MainWindow {
                 .set_status_message("No unavailable profiles to delete");
         } else {
             self.dialog = Dialog::ConfirmDeleteUnavailable { group_id, count };
+            self.dialog_inputs = None;
+            if let Some(window) = window {
+                self.present_gpui_dialog(window, cx);
+            } else {
+                self.request_gpui_dialog();
+            }
         }
         cx.notify();
     }
 
-    fn confirm_delete_unavailable(&mut self, cx: &mut Context<Self>) {
+    fn confirm_delete_unavailable(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Dialog::ConfirmDeleteUnavailable { group_id, .. } = &self.dialog else {
             return;
         };
         let removed = self.state.remove_unavailable_in_group(*group_id);
-        self.close_dialog();
+        self.close_dialog_with_window(window, cx);
         self.state
             .set_status_message(format!("Deleted {removed} unavailable profile(s)"));
         if removed > 0 {
@@ -2053,7 +2584,12 @@ impl MainWindow {
         cx.notify();
     }
 
-    fn update_subscription(&mut self, all: bool, cx: &mut Context<Self>) {
+    fn update_subscription(
+        &mut self,
+        all: bool,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
         self.close_menus();
         if all {
             if self.subscription_queue.is_some() || self.background_busy {
@@ -2061,6 +2597,12 @@ impl MainWindow {
                     .push_log("The last subscription update has not exited.");
             } else {
                 self.dialog = Dialog::ConfirmUpdateAllSubscriptions;
+                self.dialog_inputs = None;
+                if let Some(window) = window {
+                    self.present_gpui_dialog(window, cx);
+                } else {
+                    self.request_gpui_dialog();
+                }
             }
             cx.notify();
             return;
@@ -2068,9 +2610,16 @@ impl MainWindow {
         self.start_subscription_group(self.state.active_group_id(), UpdateOrigin::Manual, cx);
     }
 
-    fn confirm_update_all_subscriptions(&mut self, cx: &mut Context<Self>) {
+    fn confirm_update_all_subscriptions(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let ids = eligible_subscription_ids(self.state.all_groups());
+        // Restore Manage Groups under a fresh gpui dialog.
         self.dialog = Dialog::manage_groups_from_state(&self.state);
+        self.dialog_inputs = None;
+        self.present_gpui_dialog(window, cx);
         if ids.is_empty() {
             self.state.set_status_message("No subscriptions to update");
             cx.notify();
@@ -2216,6 +2765,8 @@ impl MainWindow {
                                                 title: format!("Change of {name}"),
                                                 body,
                                             };
+                                            this.dialog_inputs = None;
+                                            this.request_gpui_dialog();
                                         }
                                     }
                                     Err(error) => {
@@ -2504,144 +3055,179 @@ impl MainWindow {
     }
 
     fn save_basic_settings(&mut self, cx: &mut Context<Self>) {
-        if let Dialog::BasicSettings {
+        let (ruleset_mirror, adblock_enable) = match &self.dialog {
+            Dialog::BasicSettings {
+                ruleset_mirror,
+                adblock_enable,
+                ..
+            } => (*ruleset_mirror, *adblock_enable),
+            _ => return,
+        };
+        let Some(DialogInputs::Basic {
             inbound_address,
             inbound_port,
             test_url,
             remote_dns,
             direct_dns,
             log_level,
+        }) = &self.dialog_inputs
+        else {
+            return;
+        };
+        let inbound_address = DialogInputs::read_string(inbound_address, cx);
+        let inbound_port = DialogInputs::read_string(inbound_port, cx);
+        let test_url = DialogInputs::read_string(test_url, cx);
+        let remote_dns = DialogInputs::read_string(remote_dns, cx);
+        let direct_dns = DialogInputs::read_string(direct_dns, cx);
+        let log_level = DialogInputs::read_string(log_level, cx);
+        let port = inbound_port.parse::<i32>().unwrap_or(2080);
+        self.state.apply_basic_settings(
+            inbound_address,
+            port,
+            test_url,
+            remote_dns,
+            direct_dns,
+            log_level,
             ruleset_mirror,
             adblock_enable,
-            ..
-        } = &self.dialog
-        {
-            let port = inbound_port.parse::<i32>().unwrap_or(2080);
-            self.state.apply_basic_settings(
-                inbound_address.clone(),
-                port,
-                test_url.clone(),
-                remote_dns.clone(),
-                direct_dns.clone(),
-                log_level.clone(),
-                *ruleset_mirror,
-                *adblock_enable,
-            );
-            let _ = self.persist_db();
-            self.close_dialog();
-            cx.notify();
-        }
+        );
+        let _ = self.persist_db();
+        self.close_dialog();
+        cx.notify();
     }
 
-    fn manage_add_group(&mut self, cx: &mut Context<Self>) {
-        if let Dialog::ManageGroups { new_name, .. } = &self.dialog {
-            let name = new_name.trim().to_string();
-            if name.is_empty() {
-                self.state
-                    .set_status_message("Group name cannot be empty");
-                cx.notify();
-                return;
-            }
-            let id = self.state.add_group(name);
-            let _ = self.persist_db();
-            // refresh dialog state
-            self.dialog = Dialog::manage_groups_from_state(&self.state);
-            if let Dialog::ManageGroups {
-                selected,
-                edit_name,
-                edit_url,
-                ..
-            } = &mut self.dialog
-            {
-                *selected = Some(id);
-                if let Some(g) = self.state.group(id) {
-                    *edit_name = g.name.clone();
-                    *edit_url = g.url.clone();
-                }
-            }
-            self.mg_focus = MgFocus::EditName;
-            self.state.set_status_message(format!("Group {id} added"));
-            cx.notify();
-        }
-    }
-
-    fn manage_apply(&mut self, cx: &mut Context<Self>) {
-        if let Dialog::ManageGroups {
-            selected,
-            edit_name,
-            edit_url,
-            ..
+    fn edit_group_ok(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Dialog::EditGroup {
+            group_id,
+            is_subscription,
+            skip_auto_update,
+            auto_clear_unavailable,
+            front_proxy_id,
+            landing_proxy_id,
         } = &self.dialog
-        {
-            let Some(id) = *selected else {
-                self.state.set_status_message("No group selected");
-                cx.notify();
-                return;
-            };
-            let name = edit_name.clone();
-            let url = edit_url.clone();
-            if let Err(e) = self.state.rename_group(id, name) {
-                self.state.set_status_message(e.to_string());
-                cx.notify();
-                return;
-            }
-            if let Err(e) = self.state.set_group_url(id, url) {
-                self.state.set_status_message(e.to_string());
-                cx.notify();
-                return;
-            }
-            let _ = self.persist_db();
+        else {
+            return;
+        };
+        let group_id = *group_id;
+        let is_subscription = *is_subscription;
+        let skip_auto_update = *skip_auto_update;
+        let auto_clear_unavailable = *auto_clear_unavailable;
+        let front_proxy_id = *front_proxy_id;
+        let landing_proxy_id = *landing_proxy_id;
+
+        let (name, url_raw) = match &self.dialog_inputs {
+            Some(DialogInputs::EditGroup { name, url }) => (
+                DialogInputs::read_string(name, cx),
+                DialogInputs::read_string(url, cx),
+            ),
+            _ => return,
+        };
+        let url = if is_subscription {
+            url_raw
+        } else {
+            String::new()
+        };
+
+        let result = if let Some(id) = group_id {
             self.state
-                .set_status_message(format!("Group {id} updated"));
-            // keep dialog open with refreshed list
-            let sel = id;
-            self.dialog = Dialog::manage_groups_from_state(&self.state);
-            if let Dialog::ManageGroups {
-                selected,
-                edit_name,
-                edit_url,
-                ..
-            } = &mut self.dialog
-            {
-                *selected = Some(sel);
-                if let Some(g) = self.state.group(sel) {
-                    *edit_name = g.name.clone();
-                    *edit_url = g.url.clone();
-                }
+                .apply_group_edit(
+                    id,
+                    name,
+                    url,
+                    skip_auto_update,
+                    auto_clear_unavailable,
+                    front_proxy_id,
+                    landing_proxy_id,
+                )
+                .map(|_| id)
+        } else {
+            self.state.create_group_from_edit(
+                name,
+                url,
+                skip_auto_update,
+                auto_clear_unavailable,
+                front_proxy_id,
+                landing_proxy_id,
+            )
+        };
+
+        match result {
+            Ok(id) => {
+                let _ = self.persist_db();
+                self.state
+                    .set_status_message(format!("Group {id} saved"));
+                self.return_to_manage_groups(window, cx);
             }
-            cx.notify();
+            Err(e) => {
+                self.state.set_status_message(e.to_string());
+                cx.notify();
+            }
         }
     }
 
-    fn manage_delete(&mut self, cx: &mut Context<Self>) {
-        if let Dialog::ManageGroups { selected, .. } = &self.dialog {
-            let Some(id) = *selected else {
-                self.state.set_status_message("No group selected");
-                cx.notify();
-                return;
-            };
-            match self.state.delete_group(id) {
-                Ok(()) => {
-                    let _ = self.persist_db();
-                    self.dialog = Dialog::manage_groups_from_state(&self.state);
-                    self.state
-                        .set_status_message(format!("Group {id} deleted"));
-                    cx.notify();
-                }
-                Err(e) => {
-                    self.state.set_status_message(e.to_string());
-                    cx.notify();
+    fn confirm_remove_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Dialog::ConfirmRemoveGroup { group_id, .. } = &self.dialog else {
+            return;
+        };
+        let id = *group_id;
+        match self.state.delete_group(id) {
+            Ok(()) => {
+                let _ = self.persist_db();
+                self.state
+                    .set_status_message(format!("Group {id} removed"));
+                self.return_to_manage_groups(window, cx);
+            }
+            Err(e) => {
+                self.state.set_status_message(e.to_string());
+                self.return_to_manage_groups(window, cx);
+            }
+        }
+    }
+
+    fn copy_group_share_links(&mut self, deep: bool, cx: &mut Context<Self>) {
+        let Dialog::EditGroup {
+            group_id: Some(gid),
+            ..
+        } = &self.dialog
+        else {
+            return;
+        };
+        let Some(g) = self.state.group(*gid) else {
+            return;
+        };
+        let mut links = Vec::new();
+        for &pid in &g.profile_ids {
+            if let Some(p) = self.state.profile(pid) {
+                if !p.outbound_json.trim().is_empty() {
+                    if deep {
+                        // Deep link: keep JSON outbound blob (best-effort without full exporter).
+                        links.push(p.outbound_json.clone());
+                    } else if let Some(line) = p.outbound_json.lines().next() {
+                        links.push(line.trim().to_string());
+                    }
+                } else {
+                    links.push(format!("# {} ({})", p.name, p.profile_type.display_name()));
                 }
             }
         }
+        let text = links.join("\n");
+        if text.is_empty() {
+            self.state
+                .set_status_message("No shareable links in this group");
+        } else {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            self.state.set_status_message("Copied");
+        }
+        cx.notify();
     }
 
     fn add_input_ok(&mut self, cx: &mut Context<Self>) {
-        if let Dialog::AddFromInput { text } = &self.dialog {
-            let t = text.clone();
-            self.close_dialog();
-            self.import_text(&t, cx);
-        }
+        let t = match &self.dialog_inputs {
+            Some(DialogInputs::AddFromInput { text }) => DialogInputs::read_string(text, cx),
+            _ => return,
+        };
+        self.close_dialog();
+        self.import_text(&t, cx);
     }
 
     fn dialog_is_open(&self) -> bool {
@@ -2672,19 +3258,11 @@ impl MainWindow {
                 };
                 Some((field, false))
             }
-            Dialog::ManageGroups {
-                new_name,
-                edit_name,
-                edit_url,
-                ..
-            } => {
-                let field = match self.mg_focus {
-                    MgFocus::NewName => new_name,
-                    MgFocus::EditName => edit_name,
-                    MgFocus::EditUrl => edit_url,
-                };
-                Some((field, false))
-            }
+            Dialog::ManageGroups
+            | Dialog::ConfirmRemoveGroup { .. }
+            | Dialog::ConfirmUpdateAllSubscriptions
+            | Dialog::SubscriptionDiff { .. } => None,
+            Dialog::EditGroup { .. } => None,
             Dialog::AddFromInput { text } => Some((text, true)),
             Dialog::RoutingSettings(draft) => {
                 // Ensure a field is focused so IME/typing always has a target.
@@ -2760,19 +3338,35 @@ impl MainWindow {
                 Some((field, false))
             }
             Dialog::EditProfile { name, .. } => Some((name, false)),
-            Dialog::ConfirmDeleteUnavailable { .. }
-            | Dialog::ConfirmUpdateAllSubscriptions
-            | Dialog::SubscriptionDiff { .. }
-            | Dialog::None => None,
+            Dialog::ConfirmDeleteUnavailable { .. } | Dialog::None => None,
         }
     }
 
     /// Insert/delete text into the focused dialog field (end-cursor model).
     fn apply_dialog_text_edit(&mut self, text: &str, is_backspace: bool, cx: &mut Context<Self>) {
-        // Prefer RoutingDraft::handle_key for complex routing fields (lists, i32).
-        if let Dialog::RoutingSettings(draft) = &mut self.dialog {
-            draft.handle_key(if is_backspace { None } else { Some(text) }, is_backspace);
-            cx.notify();
+        // Routing: main DNS/Warp/Hijack + nested editors use Input when NestedInputs present;
+        // fallback fake-caret only when NestedInputs is missing.
+        if matches!(self.dialog, Dialog::RoutingSettings(_)) {
+            let nested_active = matches!(
+                &self.dialog,
+                Dialog::RoutingSettings(d) if !matches!(d.nested, RoutingNested::None)
+            );
+            let has_routing_inputs = matches!(self.dialog_inputs, Some(DialogInputs::Routing(_)));
+            let nested_owns = self.nested_inputs_own_typing();
+            if nested_active {
+                if nested_owns {
+                    return;
+                }
+                if let Dialog::RoutingSettings(draft) = &mut self.dialog {
+                    draft.handle_key(if is_backspace { None } else { Some(text) }, is_backspace);
+                }
+                cx.notify();
+            } else if !has_routing_inputs {
+                if let Dialog::RoutingSettings(draft) = &mut self.dialog {
+                    draft.handle_key(if is_backspace { None } else { Some(text) }, is_backspace);
+                }
+                cx.notify();
+            }
             return;
         }
 
@@ -2817,6 +3411,10 @@ impl MainWindow {
         }
         let key = event.keystroke.key.as_str();
         if key == "escape" {
+            // gpui-component Dialog owns Esc when a layer is open.
+            if Self::uses_gpui_dialog(&self.dialog) {
+                return false;
+            }
             self.close_dialog();
             cx.notify();
             return true;
@@ -2825,6 +3423,30 @@ impl MainWindow {
         if key == "enter" && matches!(self.dialog, Dialog::EditProfile { .. }) {
             self.save_edit_profile(cx);
             return true;
+        }
+
+        // Hotkey capture rows own keystrokes (QKeySequenceEdit-style).
+        if matches!(self.dialog, Dialog::HotkeySettings { .. }) {
+            return false;
+        }
+
+        // Real InputState owns typing for non-routing dialogs, routing main tabs
+        // (when nested is closed), and NestedInputs-backed nested fields.
+        if let Some(inputs) = &self.dialog_inputs {
+            match inputs {
+                DialogInputs::Routing(_) => {
+                    if let Dialog::RoutingSettings(d) = &self.dialog {
+                        if matches!(d.nested, RoutingNested::None) {
+                            return false;
+                        }
+                        if self.nested_inputs_own_typing() {
+                            return false;
+                        }
+                        // NestedInputs missing or non-text nested (menus) — fake-caret path.
+                    }
+                }
+                _ => return false,
+            }
         }
 
         // Prefer GPUI key_char (IME / layout-correct typed text).
@@ -2889,7 +3511,7 @@ impl MainWindow {
             .child(self.render_tool_cluster(cx))
             .child({
                 let e = entity.clone();
-                start_stop_btn(start_stop_state, self.loading_glyph(), move |_, _, cx| {
+                start_stop_btn(start_stop_state, move |_, _, cx| {
                     e.update(cx, |this, cx| this.toggle_proxy(cx));
                 })
             })
@@ -2904,7 +3526,7 @@ impl MainWindow {
                     .child({
                         let e = entity.clone();
                         let on = self.state.settings().tun_mode_enabled;
-                        mode_checkbox("tun", "Tun Mode", on, move |_, _, cx| {
+                        mode_switch("tun", "Tun Mode", on, move |_, _, cx| {
                             e.update(cx, |this, cx| {
                                 let next = !this.state.settings().tun_mode_enabled;
                                 this.set_vpn(next, cx);
@@ -2914,7 +3536,7 @@ impl MainWindow {
                     .child({
                         let e = entity.clone();
                         let on = self.state.settings().system_proxy_enabled;
-                        mode_checkbox("proxy", "System Proxy", on, move |_, _, cx| {
+                        mode_switch("proxy", "System Proxy", on, move |_, _, cx| {
                             e.update(cx, |this, cx| {
                                 let next = !this.state.settings().system_proxy_enabled;
                                 this.set_sys_proxy(next, cx);
@@ -2941,14 +3563,13 @@ impl MainWindow {
             .gap_0p5();
 
         if let Some(progress) = self.test_progress.as_ref() {
-            let (bar, content) = test_progress_lines(progress);
-            if let Some(bar) = bar {
+            let (pct, content) = test_progress_view(progress);
+            if let Some(pct) = pct {
                 panel = panel.child(
                     div()
-                        .text_xs()
-                        .font_family("Menlo")
-                        .text_color(Theme::text())
-                        .child(bar),
+                        .w_full()
+                        .max_w(px(220.))
+                        .child(gpui_component::progress::Progress::new().value(pct)),
                 );
             }
             panel = panel.child(
@@ -2967,10 +3588,15 @@ impl MainWindow {
         let mut panel = div().flex().flex_col().py_0p5();
 
         macro_rules! item {
-            ($id:expr, $label:expr, $body:expr) => {{
+            ($id:expr, $label:expr, |$t:ident, $w:ident, $cx:ident| $($body:tt)*) => {{
                 let e = entity.clone();
-                panel = panel.child(menu_item($id, $label, move |_, _, cx| {
-                    e.update(cx, $body);
+                panel = panel.child(menu_item($id, $label, move |_, window, cx| {
+                    e.update(cx, |this, cx| {
+                        let $t = this;
+                        let $w = window;
+                        let $cx = cx;
+                        $($body)*;
+                    });
                 }));
             }};
         }
@@ -2978,14 +3604,14 @@ impl MainWindow {
         match menu {
             OpenMenu::Program => {
                 panel = panel.child(menu_label("Program"));
-                item!("prog-input", "Add profile from input", |t, cx| {
-                    t.open_add_from_input(cx)
+                item!("prog-input", "Add profile from input", |t, w, cx| {
+                    t.open_add_from_input(w, cx)
                 });
-                item!("prog-clip", "Add profile from clipboard", |t, cx| {
+                item!("prog-clip", "Add profile from clipboard", |t, _w, cx| {
                     t.import_clipboard(cx)
                 });
-                item!("prog-start", "Start", |t, cx| t.toggle_proxy(cx));
-                item!("prog-stop", "Stop", |t, cx| {
+                item!("prog-start", "Start", |t, _w, cx| t.toggle_proxy(cx));
+                item!("prog-stop", "Stop", |t, _w, cx| {
                     if t.state.core_status().is_running() {
                         t.toggle_proxy(cx);
                     } else {
@@ -2994,36 +3620,36 @@ impl MainWindow {
                     }
                 });
                 panel = panel.child(menu_separator());
-                item!("prog-proxy", "Enable System Proxy", |t, cx| {
+                item!("prog-proxy", "Enable System Proxy", |t, _w, cx| {
                     t.set_sys_proxy(true, cx);
                     t.close_menus();
                 });
-                item!("prog-tun", "Enable Tun", |t, cx| {
+                item!("prog-tun", "Enable Tun", |t, _w, cx| {
                     t.set_vpn(true, cx);
                     t.close_menus();
                 });
-                item!("prog-off", "Disable", |t, cx| {
+                item!("prog-off", "Disable", |t, _w, cx| {
                     t.set_sys_proxy(false, cx);
                     t.set_vpn(false, cx);
                     t.set_sys_dns(false, cx);
                     t.close_menus();
                 });
                 panel = panel.child(menu_separator());
-                item!("prog-exit", "Exit", |_t, cx| cx.quit());
+                item!("prog-exit", "Exit", |_t, _w, cx| cx.quit());
             }
             OpenMenu::Settings => {
                 panel = panel.child(menu_label("Preferences"));
-                item!("set-basic", "Basic Settings", |t, cx| {
-                    t.open_basic_settings(cx)
+                item!("set-basic", "Basic Settings", |t, w, cx| {
+                    t.open_basic_settings(w, cx)
                 });
-                item!("set-route", "Routing Settings", |t, cx| {
-                    t.open_routing_settings(cx)
+                item!("set-route", "Routing Settings", |t, w, cx| {
+                    t.open_routing_settings(Some(w), cx)
                 });
-                item!("set-tun", "Tun Settings", |t, cx| t.open_tun_settings(cx));
-                item!("set-hotkey", "Hotkey Settings", |t, cx| {
-                    t.open_hotkey_settings(cx)
+                item!("set-tun", "Tun Settings", |t, w, cx| t.open_tun_settings(w, cx));
+                item!("set-hotkey", "Hotkey Settings", |t, w, cx| {
+                    t.open_hotkey_settings(w, cx)
                 });
-                item!("set-clear-proxy", "Clear system proxy now", |t, cx| {
+                item!("set-clear-proxy", "Clear system proxy now", |t, _w, cx| {
                     force_clear_system_proxy();
                     t.state
                         .set_status_message("System proxy force-cleared on all interfaces");
@@ -3031,7 +3657,7 @@ impl MainWindow {
                     cx.notify();
                 });
                 panel = panel.child(menu_separator());
-                item!("set-folder", "Open Config Folder", |t, cx| {
+                item!("set-folder", "Open Config Folder", |t, _w, cx| {
                     let path = if t.db_path_label.is_empty() {
                         throne_storage::default_db_path()
                     } else {
@@ -3045,42 +3671,44 @@ impl MainWindow {
                     t.close_menus();
                     cx.notify();
                 });
-                item!("set-save", "Save database", |t, cx| t.save_db(cx));
+                item!("set-save", "Save database", |t, _w, cx| t.save_db(cx));
             }
             OpenMenu::Groups => {
                 panel = panel.child(menu_label("Groups"));
-                item!("g-manage", "Manage Groups", |t, cx| t.open_manage_groups(cx));
-                item!("g-update", "Update subscription", |t, cx| {
-                    t.update_subscription(false, cx)
+                item!("g-manage", "Manage Groups", |t, w, cx| t.open_manage_groups(w, cx));
+                item!("g-update", "Update subscription", |t, w, cx| {
+                    t.update_subscription(false, Some(w), cx)
                 });
-                item!("g-update-all", "Update all subscriptions", |t, cx| {
-                    t.update_subscription(true, cx)
+                item!("g-update-all", "Update all subscriptions", |t, w, cx| {
+                    t.update_subscription(true, Some(w), cx)
                 });
                 panel = panel.child(menu_separator());
-                item!("g-urltest", "Url Test Group", |t, cx| t.url_test_group(cx));
-                item!("g-clear", "Clear Group test result", |t, cx| {
+                item!("g-urltest", "Url Test Group", |t, _w, cx| t.url_test_group(cx));
+                item!("g-clear", "Clear Group test result", |t, _w, cx| {
                     let gid = t.state.active_group_id();
                     t.state.clear_test_results_in_group(gid);
                     t.close_menus();
                     let _ = t.persist_db();
                     cx.notify();
                 });
-                item!("g-dup", "Remove Duplicates", |t, cx| {
+                item!("g-dup", "Remove Duplicates", |t, _w, cx| {
                     let gid = t.state.active_group_id();
                     t.state.remove_duplicates_in_group(gid);
                     t.close_menus();
                     let _ = t.persist_db();
                     cx.notify();
                 });
-                item!("g-unavail", "Remove Unavailable", |t, cx| t.delete_unavailable(cx));
-                item!("g-invalid", "Remove Invalid Configs", |t, cx| {
+                item!("g-unavail", "Remove Unavailable", |t, w, cx| {
+                    t.delete_unavailable(Some(w), cx)
+                });
+                item!("g-invalid", "Remove Invalid Configs", |t, _w, cx| {
                     let gid = t.state.active_group_id();
                     t.state.remove_invalid_in_group(gid);
                     t.close_menus();
                     let _ = t.persist_db();
                     cx.notify();
                 });
-                item!("g-insecure", "Remove Insecure Configs", |t, cx| {
+                item!("g-insecure", "Remove Insecure Configs", |t, _w, cx| {
                     let gid = t.state.active_group_id();
                     t.state.remove_insecure_in_group(gid);
                     t.close_menus();
@@ -3090,10 +3718,10 @@ impl MainWindow {
             }
             OpenMenu::Routing => {
                 panel = panel.child(menu_label("Routing"));
-                item!("r-settings", "Routing Settings", |t, cx| {
-                    t.open_routing_settings(cx)
+                item!("r-settings", "Routing Settings", |t, w, cx| {
+                    t.open_routing_settings(Some(w), cx)
                 });
-                item!("r-cycle", "Next route profile", |t, cx| t.cycle_route(cx));
+                item!("r-cycle", "Next route profile", |t, _w, cx| t.cycle_route(cx));
                 panel = panel.child(menu_separator());
                 for r in self.state.all_routes() {
                     let id = r.id;
@@ -3121,17 +3749,17 @@ impl MainWindow {
             }
             OpenMenu::Tools => {
                 panel = panel.child(menu_label("Tools"));
-                item!("t-url", "Url Test Selected", |t, cx| t.url_test_selected(cx));
-                item!("t-url-group", "Url Test Group (⌘⇧G)", |t, cx| t.url_test_group(cx));
-                item!("t-delete-unavailable", "Delete Unavailable (⌘⇧R)", |t, cx| {
-                    t.delete_unavailable(cx)
+                item!("t-url", "Url Test Selected", |t, _w, cx| t.url_test_selected(cx));
+                item!("t-url-group", "Url Test Group (⌘⇧G)", |t, _w, cx| t.url_test_group(cx));
+                item!("t-delete-unavailable", "Delete Unavailable (⌘⇧R)", |t, w, cx| {
+                    t.delete_unavailable(Some(w), cx)
                 });
-                item!("t-speed", "Speedtest Selected", |t, cx| {
+                item!("t-speed", "Speedtest Selected", |t, _w, cx| {
                     t.speed_test_selected(cx)
                 });
-                item!("t-ip", "IP Test Selected", |t, cx| t.ip_test_selected(cx));
+                item!("t-ip", "IP Test Selected", |t, _w, cx| t.ip_test_selected(cx));
                 panel = panel.child(menu_separator());
-                item!("t-runtime", "Runtime Stats", |t, cx| {
+                item!("t-runtime", "Runtime Stats", |t, _w, cx| {
                     t.bottom_tab = 1;
                     t.state.set_status_message(
                         "Connections tab shows live sessions while core is running",
@@ -3139,7 +3767,7 @@ impl MainWindow {
                     t.close_menus();
                     cx.notify();
                 });
-                item!("t-traffic", "Traffic Stats", |t, cx| {
+                item!("t-traffic", "Traffic Stats", |t, _w, cx| {
                     let label = t.state.speed_label();
                     t.state.set_status_message(if label.is_empty() {
                         "Traffic Stats — start a profile to see live rates".into()
@@ -3149,7 +3777,7 @@ impl MainWindow {
                     t.close_menus();
                     cx.notify();
                 });
-                item!("t-update", "Check For Update", |t, cx| {
+                item!("t-update", "Check For Update", |t, _w, cx| {
                     t.state.set_status_message(format!(
                         "Current version {} · throne-rs rewrite (no auto-update yet)",
                         throne_domain::NKR_VERSION
@@ -3163,7 +3791,7 @@ impl MainWindow {
                     throne_domain::NKR_VERSION
                 )));
             }
-            OpenMenu::ProfileCtx | OpenMenu::None => {}
+            OpenMenu::ProfileCtx | OpenMenu::GroupTabCtx | OpenMenu::None => {}
         }
 
         panel
@@ -3181,15 +3809,8 @@ impl MainWindow {
             (OpenMenu::Tools, "tb-tools", ToolbarIcon::Tools, "Tools"),
         ];
 
-        let mut row = div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .p_1()
-            .rounded_sm()
-            .border_1()
-            .border_color(Theme::border_light())
-            .bg(Theme::bg_elevated());
+        // No outer chrome — individual `toolbar_btn` borders are enough.
+        let mut row = div().flex().items_center().gap_1();
         for (menu, id, icon, label) in menus {
             let e = entity.clone();
             let open = self.open_menu == menu;
@@ -3208,7 +3829,7 @@ impl MainWindow {
             OpenMenu::Groups => Some(2),
             OpenMenu::Routing => Some(3),
             OpenMenu::Tools => Some(4),
-            OpenMenu::ProfileCtx | OpenMenu::None => None,
+            OpenMenu::ProfileCtx | OpenMenu::GroupTabCtx | OpenMenu::None => None,
         }
     }
 
@@ -3246,17 +3867,22 @@ impl MainWindow {
             .shadow_md();
 
         macro_rules! item {
-            ($id:expr, $label:expr, $body:expr) => {{
+            ($id:expr, $label:expr, |$t:ident, $w:ident, $cx:ident| $($body:tt)*) => {{
                 let e = entity.clone();
-                panel = panel.child(menu_item($id, $label, move |_, _, cx| {
-                    e.update(cx, $body);
+                panel = panel.child(menu_item($id, $label, move |_, window, cx| {
+                    e.update(cx, |this, cx| {
+                        let $t = this;
+                        let $w = window;
+                        let $cx = cx;
+                        $($body)*;
+                    });
                 }));
             }};
         }
 
         panel = panel.child(menu_label("Server"));
-        item!("c-start", "Start", |t, cx| t.toggle_proxy(cx));
-        item!("c-stop", "Stop", |t, cx| {
+        item!("c-start", "Start", |t, _w, cx| t.toggle_proxy(cx));
+        item!("c-stop", "Stop", |t, _w, cx| {
             if t.state.core_status().is_running() {
                 t.toggle_proxy(cx);
             } else {
@@ -3264,520 +3890,189 @@ impl MainWindow {
                 cx.notify();
             }
         });
-        item!("c-input", "Add profile from input", |t, cx| {
-            t.open_add_from_input(cx)
+        item!("c-input", "Add profile from input", |t, w, cx| {
+            t.open_add_from_input(w, cx)
         });
-        item!("c-clip", "Add profile from clipboard", |t, cx| {
+        item!("c-clip", "Add profile from clipboard", |t, _w, cx| {
             t.import_clipboard(cx)
         });
-        item!("c-edit", "Edit profile…", |t, cx| t.open_edit_profile(cx));
-        item!("c-del", "Delete", |t, cx| t.delete_selected(cx));
-        item!("c-test", "Url Test Selected", |t, cx| t.url_test_selected(cx));
+        item!("c-edit", "Edit profile…", |t, w, cx| t.open_edit_profile(w, cx));
+        item!("c-del", "Delete", |t, _w, cx| t.delete_selected(cx));
+        item!("c-test", "Url Test Selected", |t, _w, cx| t.url_test_selected(cx));
         panel
     }
 
-    fn render_dialog_overlay(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// Upstream `on_tabWidget_customContextMenuRequested` — Add / Edit / Delete / Update sub.
+    fn render_group_tab_ctx_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity().clone();
-        match &self.dialog {
-            Dialog::None => div().into_any_element(),
-            Dialog::BasicSettings {
-                inbound_address,
-                inbound_port,
-                test_url,
-                remote_dns,
-                direct_dns,
-                log_level,
-                ruleset_mirror,
-                adblock_enable,
-                focus,
-            } => {
-                let e_close = entity.clone();
-                let e_focus = entity.clone();
-                let e_mirror = entity.clone();
-                let e_adblock = entity.clone();
-                let e_save = entity.clone();
-                let e_cancel = entity.clone();
-                modal_shell(
-                    "Basic Settings",
-                    basic_settings_body(
-                        inbound_address,
-                        inbound_port,
-                        test_url,
-                        remote_dns,
-                        direct_dns,
-                        log_level,
-                        *ruleset_mirror,
-                        *adblock_enable,
-                        *focus,
-                        move |idx, _, cx| {
-                            e_focus.update(cx, |t, cx| {
-                                if let Dialog::BasicSettings { focus, .. } = &mut t.dialog {
-                                    *focus = idx;
-                                }
-                                cx.notify();
-                            });
-                        },
-                        move |_, cx| {
-                            e_mirror.update(cx, |t, cx| {
-                                if let Dialog::BasicSettings {
-                                    ruleset_mirror, ..
-                                } = &mut t.dialog
-                                {
-                                    *ruleset_mirror = ruleset_mirror.cycle();
-                                }
-                                cx.notify();
-                            });
-                        },
-                        move |_, cx| {
-                            e_adblock.update(cx, |t, cx| {
-                                if let Dialog::BasicSettings {
-                                    adblock_enable, ..
-                                } = &mut t.dialog
-                                {
-                                    *adblock_enable = !*adblock_enable;
-                                }
-                                cx.notify();
-                            });
-                        },
-                        move |_, cx| {
-                            e_save.update(cx, |t, cx| t.save_basic_settings(cx));
-                        },
-                        move |_, cx| {
-                            e_cancel.update(cx, |t, cx| {
-                                t.close_dialog();
-                                cx.notify();
-                            });
-                        },
-                    ),
-                    move |_, _, cx| {
-                        e_close.update(cx, |t, cx| {
-                            t.close_dialog();
-                            cx.notify();
-                        });
-                    },
-                )
-                .into_any_element()
-            }
-            Dialog::ManageGroups {
-                new_name,
-                selected,
-                edit_name,
-                edit_url,
-                focus_new,
-            } => {
-                let e_close = entity.clone();
-                let e_sel = entity.clone();
-                let e_fn = entity.clone();
-                let e_fen = entity.clone();
-                let e_feu = entity.clone();
-                let e_add = entity.clone();
-                let e_apply = entity.clone();
-                let e_del = entity.clone();
-                let e_update = entity.clone();
-                let e_update_all = entity.clone();
-                let e_x = entity.clone();
-                modal_shell(
-                    "Manage Groups",
-                    manage_groups_body(
-                        &self.state,
-                        new_name,
-                        *selected,
-                        edit_name,
-                        edit_url,
-                        *focus_new || self.mg_focus == MgFocus::NewName,
-                        move |id, _, cx| {
-                            e_sel.update(cx, |t, cx| {
-                                if let Dialog::ManageGroups {
-                                    selected,
-                                    edit_name,
-                                    edit_url,
-                                    focus_new,
-                                    ..
-                                } = &mut t.dialog
-                                {
-                                    *selected = Some(id);
-                                    *focus_new = false;
-                                    if let Some(g) = t.state.group(id) {
-                                        *edit_name = g.name.clone();
-                                        *edit_url = g.url.clone();
-                                    }
-                                }
-                                t.mg_focus = MgFocus::EditName;
-                                cx.notify();
-                            });
-                        },
-                        move |_, cx| {
-                            e_fn.update(cx, |t, cx| {
-                                if let Dialog::ManageGroups { focus_new, .. } = &mut t.dialog {
-                                    *focus_new = true;
-                                }
-                                t.mg_focus = MgFocus::NewName;
-                                cx.notify();
-                            });
-                        },
-                        move |_, cx| {
-                            e_fen.update(cx, |t, cx| {
-                                if let Dialog::ManageGroups { focus_new, .. } = &mut t.dialog {
-                                    *focus_new = false;
-                                }
-                                t.mg_focus = MgFocus::EditName;
-                                cx.notify();
-                            });
-                        },
-                        move |_, cx| {
-                            e_feu.update(cx, |t, cx| {
-                                if let Dialog::ManageGroups { focus_new, .. } = &mut t.dialog {
-                                    *focus_new = false;
-                                }
-                                t.mg_focus = MgFocus::EditUrl;
-                                cx.notify();
-                            });
-                        },
-                        move |_, cx| {
-                            e_add.update(cx, |t, cx| t.manage_add_group(cx));
-                        },
-                        move |_, cx| {
-                            e_apply.update(cx, |t, cx| t.manage_apply(cx));
-                        },
-                        move |_, cx| {
-                            e_del.update(cx, |t, cx| t.manage_delete(cx));
-                        },
-                        move |id, _, cx| {
-                            e_update.update(cx, |t, cx| {
-                                t.start_subscription_group(id, UpdateOrigin::Manual, cx)
-                            });
-                        },
-                        move |_, cx| {
-                            e_update_all.update(cx, |t, cx| t.update_subscription(true, cx));
-                        },
-                        move |_, cx| {
-                            e_x.update(cx, |t, cx| {
-                                t.close_dialog();
-                                cx.notify();
-                            });
-                        },
-                    ),
-                    move |_, _, cx| {
-                        e_close.update(cx, |t, cx| {
-                            t.close_dialog();
-                            cx.notify();
-                        });
-                    },
-                )
-                .into_any_element()
-            }
-            Dialog::AddFromInput { text } => {
-                let e_close = entity.clone();
-                let e_ok = entity.clone();
-                let e_cancel = entity.clone();
-                modal_shell(
-                    "Add profile from input",
-                    add_input_body(
-                        text,
-                        move |_, cx| {
-                            e_ok.update(cx, |t, cx| t.add_input_ok(cx));
-                        },
-                        move |_, cx| {
-                            e_cancel.update(cx, |t, cx| {
-                                t.close_dialog();
-                                cx.notify();
-                            });
-                        },
-                    ),
-                    move |_, _, cx| {
-                        e_close.update(cx, |t, cx| {
-                            t.close_dialog();
-                            cx.notify();
-                        });
-                    },
-                )
-                .into_any_element()
-            }
-            Dialog::RoutingSettings(draft) => {
+        let (x, y) = self.ctx_menu_at.unwrap_or((120., 100.));
+        let target = self.ctx_group_id;
+        let mut panel = div()
+            .absolute()
+            .top(px(y))
+            .left(px(x))
+            .min_w(px(200.))
+            .py_1()
+            .bg(Theme::bg_elevated())
+            .border_1()
+            .border_color(Theme::border_light())
+            .rounded_sm()
+            .shadow_md();
+
+        macro_rules! item {
+            ($id:expr, $label:expr, |$t:ident, $w:ident, $cx:ident| $($body:tt)*) => {{
                 let e = entity.clone();
-                routing_settings_view(draft, move |ev, window, cx| {
-                    e.update(cx, |t, cx| t.handle_routing_event(ev, window, cx));
-                })
-                .into_any_element()
+                panel = panel.child(menu_item($id, $label, move |_, window, cx| {
+                    e.update(cx, |this, cx| {
+                        let $t = this;
+                        let $w = window;
+                        let $cx = cx;
+                        $($body)*;
+                    });
+                }));
+            }};
+        }
+
+        item!("gt-add", "Add new Group", |t, w, cx| {
+            t.close_menus();
+            t.open_edit_group_new(w, cx);
+        });
+
+        if let Some(gid) = target {
+            item!("gt-edit", "Edit selected Group", |t, w, cx| {
+                t.close_menus();
+                t.open_edit_group(gid, w, cx);
+            });
+            if self.state.group_order().len() > 1 {
+                let name = self
+                    .state
+                    .group(gid)
+                    .map(|g| {
+                        if g.name.is_empty() {
+                            format!("Group {gid}")
+                        } else {
+                            g.name.clone()
+                        }
+                    })
+                    .unwrap_or_else(|| format!("Group {gid}"));
+                item!("gt-del", "Delete selected Group", |t, w, cx| {
+                    t.close_menus();
+                    t.dialog = Dialog::ConfirmRemoveGroup {
+                        group_id: gid,
+                        name: name.clone(),
+                    };
+                    t.dialog_inputs = None;
+                    t.present_gpui_dialog(w, cx);
+                    cx.notify();
+                });
             }
-            Dialog::TunSettings {
-                vpn_mtu,
-                vpn_strict_route,
-                disable_private_range_bypass,
-                focus_mtu,
-            } => {
-                let e_close = entity.clone();
-                let e_focus = entity.clone();
-                let e_strict = entity.clone();
-                let e_bypass = entity.clone();
-                let e_save = entity.clone();
-                let e_cancel = entity.clone();
-                modal_shell(
-                    "Tun Settings",
-                    tun_settings_body(
-                        vpn_mtu,
-                        *vpn_strict_route,
-                        *disable_private_range_bypass,
-                        *focus_mtu,
-                        move |_, cx| {
-                            e_focus.update(cx, |t, cx| {
-                                if let Dialog::TunSettings { focus_mtu, .. } = &mut t.dialog {
-                                    *focus_mtu = true;
-                                }
-                                cx.notify();
-                            });
-                        },
-                        move |_, cx| {
-                            e_strict.update(cx, |t, cx| {
-                                if let Dialog::TunSettings {
-                                    vpn_strict_route, ..
-                                } = &mut t.dialog
-                                {
-                                    *vpn_strict_route = !*vpn_strict_route;
-                                }
-                                cx.notify();
-                            });
-                        },
-                        move |_, cx| {
-                            e_bypass.update(cx, |t, cx| {
-                                if let Dialog::TunSettings {
-                                    disable_private_range_bypass,
-                                    ..
-                                } = &mut t.dialog
-                                {
-                                    // checkbox shows !disable; toggle means flip disable flag
-                                    *disable_private_range_bypass =
-                                        !*disable_private_range_bypass;
-                                }
-                                cx.notify();
-                            });
-                        },
-                        move |_, cx| {
-                            e_save.update(cx, |t, cx| t.save_tun_settings(cx));
-                        },
-                        move |_, cx| {
-                            e_cancel.update(cx, |t, cx| {
-                                t.close_dialog();
-                                cx.notify();
-                            });
-                        },
-                    ),
-                    move |_, _, cx| {
-                        e_close.update(cx, |t, cx| {
-                            t.close_dialog();
-                            cx.notify();
-                        });
-                    },
-                )
-                .into_any_element()
-            }
-            Dialog::HotkeySettings {
-                start_stop,
-                import,
-                save,
-                url_test,
-                copy_logs,
-                focus,
-            } => {
-                let e_close = entity.clone();
-                let e_focus = entity.clone();
-                let e_save = entity.clone();
-                let e_cancel = entity.clone();
-                modal_shell(
-                    "Hotkey Settings",
-                    hotkey_settings_body(
-                        start_stop,
-                        import,
-                        save,
-                        url_test,
-                        copy_logs,
-                        *focus,
-                        move |idx, _, cx| {
-                            e_focus.update(cx, |t, cx| {
-                                if let Dialog::HotkeySettings { focus, .. } = &mut t.dialog {
-                                    *focus = idx;
-                                }
-                                cx.notify();
-                            });
-                        },
-                        move |_, cx| {
-                            e_save.update(cx, |t, cx| t.save_hotkey_settings(cx));
-                        },
-                        move |_, cx| {
-                            e_cancel.update(cx, |t, cx| {
-                                t.close_dialog();
-                                cx.notify();
-                            });
-                        },
-                    ),
-                    move |_, _, cx| {
-                        e_close.update(cx, |t, cx| {
-                            t.close_dialog();
-                            cx.notify();
-                        });
-                    },
-                )
-                .into_any_element()
-            }
-            Dialog::EditProfile {
-                name,
-                type_label,
-                ..
-            } => {
-                let e_close = entity.clone();
-                let e_save = entity.clone();
-                let e_cancel = entity.clone();
-                modal_shell(
-                    "Edit Profile",
-                    edit_profile_body(
-                        name,
-                        type_label,
-                        move |_, cx| {
-                            e_save.update(cx, |t, cx| t.save_edit_profile(cx));
-                        },
-                        move |_, cx| {
-                            e_cancel.update(cx, |t, cx| {
-                                t.close_dialog();
-                                cx.notify();
-                            });
-                        },
-                    ),
-                    move |_, _, cx| {
-                        e_close.update(cx, |t, cx| {
-                            t.close_dialog();
-                            cx.notify();
-                        });
-                    },
-                )
-                .into_any_element()
-            }
-            Dialog::ConfirmDeleteUnavailable { count, .. } => {
-                let e_close = entity.clone();
-                let e_confirm = entity.clone();
-                let e_cancel = entity.clone();
-                modal_shell(
-                    "Confirmation",
-                    confirm_delete_unavailable_body(
-                        *count,
-                        move |_, cx| {
-                            e_confirm.update(cx, |t, cx| t.confirm_delete_unavailable(cx));
-                        },
-                        move |_, cx| {
-                            e_cancel.update(cx, |t, cx| {
-                                t.close_dialog();
-                                cx.notify();
-                            });
-                        },
-                    ),
-                    move |_, _, cx| {
-                        e_close.update(cx, |t, cx| {
-                            t.close_dialog();
-                            cx.notify();
-                        });
-                    },
-                )
-                .into_any_element()
-            }
-            Dialog::ConfirmUpdateAllSubscriptions => {
-                let e_close = entity.clone();
-                let e_confirm = entity.clone();
-                let e_cancel = entity.clone();
-                modal_shell(
-                    "Confirmation",
-                    confirm_update_all_body(
-                        move |_, cx| {
-                            e_confirm.update(cx, |t, cx| {
-                                t.confirm_update_all_subscriptions(cx)
-                            });
-                        },
-                        move |_, cx| {
-                            e_cancel.update(cx, |t, cx| {
-                                t.dialog = Dialog::manage_groups_from_state(&t.state);
-                                cx.notify();
-                            });
-                        },
-                    ),
-                    move |_, _, cx| {
-                        e_close.update(cx, |t, cx| {
-                            t.dialog = Dialog::manage_groups_from_state(&t.state);
-                            cx.notify();
-                        });
-                    },
-                )
-                .into_any_element()
-            }
-            Dialog::SubscriptionDiff { title, body } => {
-                let e_close = entity.clone();
-                let e_button = entity.clone();
-                modal_shell(
-                    title,
-                    subscription_diff_body(body, move |_, cx| {
-                        e_button.update(cx, |t, cx| {
-                            t.dialog = Dialog::manage_groups_from_state(&t.state);
-                            cx.notify();
-                        });
-                    }),
-                    move |_, _, cx| {
-                        e_close.update(cx, |t, cx| {
-                            t.dialog = Dialog::manage_groups_from_state(&t.state);
-                            cx.notify();
-                        });
-                    },
-                )
-                .into_any_element()
+            let has_url = self
+                .state
+                .group(gid)
+                .is_some_and(|g| !g.url.trim().is_empty() && !g.archive);
+            if has_url {
+                item!("gt-upd", "Update subscription", |t, _w, cx| {
+                    t.close_menus();
+                    t.start_subscription_group(gid, UpdateOrigin::Manual, cx);
+                });
             }
         }
+
+        panel
     }
 
     fn render_group_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // Custom tabs (not TabBar) so each chip can take a right-click context menu
+        // matching upstream group tab bar behaviour.
         let active = self.state.active_group_id();
+        let entity = cx.entity().clone();
+        let e_empty = entity.clone();
+
         let mut row = div()
+            .id("group-tabs")
             .flex()
+            .flex_1()
             .items_center()
             .gap_1()
-            .px_2()
-            .pt_2()
-            .pb_1()
-            .bg(Theme::bg_app());
+            .min_h(px(32.))
+            .on_mouse_down(gpui::MouseButton::Right, move |ev: &gpui::MouseDownEvent, _, cx| {
+                // Empty tab-bar area → only "Add new Group" (upstream).
+                let pos = ev.position;
+                e_empty.update(cx, |this, cx| {
+                    this.open_menu = OpenMenu::GroupTabCtx;
+                    this.ctx_group_id = None;
+                    this.ctx_menu_at = Some((pos.x.into(), pos.y.into()));
+                    cx.notify();
+                });
+            });
 
         for &gid in self.state.group_order() {
             let Some(group) = self.state.group(gid) else {
                 continue;
             };
-            let selected = gid == active;
             let name = if group.name.is_empty() {
                 format!("Group {gid}")
             } else {
                 group.name.clone()
             };
-            let entity = cx.entity().clone();
+            let sel = gid == active;
+            let e_left = entity.clone();
+            let e_right = entity.clone();
             row = row.child(
                 div()
-                    .id(SharedString::from(format!("tab-{gid}")))
-                    .px_2()
+                    .id(SharedString::from(format!("gtab-{gid}")))
+                    .px_3()
                     .py_1()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(if selected {
-                        Theme::tab_selected_border()
-                    } else {
-                        Theme::border()
-                    })
-                    .bg(if selected {
-                        Theme::bg_elevated()
-                    } else {
-                        Theme::bg_panel()
-                    })
-                    .text_sm()
-                    .text_color(Theme::text())
+                    .rounded_md()
                     .cursor_pointer()
+                    .text_sm()
+                    .border_1()
+                    .border_color(if sel {
+                        Theme::accent()
+                    } else {
+                        Theme::border_light()
+                    })
+                    .bg(if sel {
+                        Theme::accent_soft()
+                    } else {
+                        Theme::bg_elevated()
+                    })
+                    .text_color(if sel {
+                        Theme::accent()
+                    } else {
+                        Theme::text()
+                    })
+                    .hover(|s| s.bg(Theme::bg_hover()))
                     .child(name)
-                    .on_click(move |_, _, cx| {
-                        entity.update(cx, |this, cx| this.select_group(gid, cx));
-                    }),
+                    .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                        e_left.update(cx, |this, cx| this.select_group(gid, cx));
+                    })
+                    .on_mouse_down(
+                        gpui::MouseButton::Right,
+                        move |ev: &gpui::MouseDownEvent, _, cx| {
+                            cx.stop_propagation(); // don't also fire empty-bar "Add only" menu
+                            let pos = ev.position;
+                            e_right.update(cx, |this, cx| {
+                                // Upstream selects the clicked tab before showing the menu.
+                                let _ = this.state.set_active_group(gid);
+                                this.open_menu = OpenMenu::GroupTabCtx;
+                                this.ctx_group_id = Some(gid);
+                                this.ctx_menu_at = Some((pos.x.into(), pos.y.into()));
+                                cx.notify();
+                            });
+                        },
+                    ),
             );
         }
-        row
+
+        div()
+            .flex()
+            .items_center()
+            .px_2()
+            .pt_2()
+            .pb_1()
+            .bg(Theme::bg_app())
+            .child(row)
     }
 
     fn render_table_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -4062,21 +4357,20 @@ impl MainWindow {
                     .pt_1()
                     .child({
                         let e = entity.clone();
-                        tab_btn("Logs", tab == 0, move |_, _, cx| {
-                            e.update(cx, |t, cx| {
-                                t.bottom_tab = 0;
-                                cx.notify();
-                            });
-                        })
-                    })
-                    .child({
-                        let e = entity.clone();
-                        tab_btn("Connections", tab == 1, move |_, _, cx| {
-                            e.update(cx, |t, cx| {
-                                t.bottom_tab = 1;
-                                cx.notify();
-                            });
-                        })
+                        tab_bar(
+                            "bottom-tabs",
+                            tab,
+                            [
+                                SharedString::from("Logs"),
+                                SharedString::from("Connections"),
+                            ],
+                            move |ix, _, cx| {
+                                e.update(cx, |t, cx| {
+                                    t.bottom_tab = *ix;
+                                    cx.notify();
+                                });
+                            },
+                        )
                     })
                     .child(div().flex_1())
                     .when(tab == 0, |row| {
@@ -4171,6 +4465,7 @@ impl MainWindow {
     }
 
     fn render_status_bar(&self) -> impl IntoElement {
+        let running = self.state.core_status().is_running();
         div()
             .flex()
             .items_center()
@@ -4185,13 +4480,7 @@ impl MainWindow {
             .child(
                 div()
                     .flex_1()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(if self.state.core_status().is_running() {
-                        Theme::success()
-                    } else {
-                        Theme::text()
-                    })
-                    .child(self.state.running_label()),
+                    .child(status_tag(running, self.state.running_label())),
             )
             .child(div().flex_1().text_color(Theme::text_muted()).child(self.state.inbound_label()))
             .child(
@@ -4252,33 +4541,6 @@ fn col_flex(text: impl Into<SharedString>, color: gpui::Hsla) -> impl IntoElemen
         .pr_2()
         .text_color(color)
         .child(text.into())
-}
-
-fn tab_btn(
-    label: &'static str,
-    selected: bool,
-    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
-) -> impl IntoElement {
-    div()
-        .id(SharedString::from(format!("btab-{label}")))
-        .px_2()
-        .py_0p5()
-        .rounded_sm()
-        .border_1()
-        .border_color(if selected {
-            Theme::tab_selected_border()
-        } else {
-            Theme::border()
-        })
-        .bg(if selected {
-            Theme::bg_elevated()
-        } else {
-            Theme::bg_panel()
-        })
-        .text_xs()
-        .cursor_pointer()
-        .child(label)
-        .on_click(on_click)
 }
 
 fn load_initial_state() -> (AppState, String) {
@@ -4465,26 +4727,31 @@ impl Render for MainWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Keep paint tokens aligned with settings + current OS appearance.
         self.sync_theme_from_window(window);
+        // Dialog present / NestedInputs sync runs in AppShell::prepare_dialog_layer
+        // (must not open_dialog builders from inside this render).
 
         if self.state.core_status().is_running() {
             self.poll_core_runtime(cx);
         }
 
         let focus = self.focus_handle.clone();
-        if !focus.is_focused(window) {
+        // Don't steal focus from gpui-component Dialog / Input.
+        let gpui_dialog_active = window.has_active_dialog(cx);
+        if !gpui_dialog_active && !focus.is_focused(window) {
             focus.focus(window);
         }
 
         let dialog_open = !matches!(self.dialog, Dialog::None);
         let ctx_open = self.open_menu == OpenMenu::ProfileCtx;
+        let group_tab_ctx_open = self.open_menu == OpenMenu::GroupTabCtx;
         let toolbar_menu_open = Self::toolbar_menu_index(self.open_menu).is_some();
 
         // Key context: destructive Main shortcuts only when no modal is open.
-        let key_ctx = if dialog_open { "Dialog" } else { "Main" };
-
-        // Entity for IME input handler registration during paint.
-        let entity = cx.entity().clone();
-        let focus_for_input = self.focus_handle.clone();
+        let key_ctx = if dialog_open || gpui_dialog_active {
+            "Dialog"
+        } else {
+            "Main"
+        };
 
         div()
             .track_focus(&self.focus_handle)
@@ -4508,8 +4775,8 @@ impl Render for MainWindow {
                 this.url_test_selected(cx)
             }))
             .on_action(cx.listener(|this, _: &UrlTestGroup, _, cx| this.url_test_group(cx)))
-            .on_action(cx.listener(|this, _: &DeleteUnavailable, _, cx| {
-                this.delete_unavailable(cx)
+            .on_action(cx.listener(|this, _: &DeleteUnavailable, window, cx| {
+                this.delete_unavailable(Some(window), cx)
             }))
             .on_action(cx.listener(|this, _: &CycleRoute, _, cx| this.cycle_route(cx)))
             .on_action(cx.listener(|this, _: &CopyLogs, _, cx| this.copy_logs(cx)))
@@ -4587,26 +4854,756 @@ impl Render for MainWindow {
                 .child(self.render_toolbar_menu_overlay(cx))
             })
             .when(ctx_open, |el| el.child(self.render_ctx_menu(cx)))
-            .when(dialog_open, |el| {
-                el.child(self.render_dialog_overlay(cx))
-                    // Register IME/text input handler while a modal is open so
-                    // macOS delivers typed characters into dialog fields.
-                    .child(
-                        canvas(
-                            move |_, _, _| (),
-                            move |bounds, (), window, cx| {
-                                window.handle_input(
-                                    &focus_for_input,
-                                    ElementInputHandler::new(bounds, entity.clone()),
-                                    cx,
-                                );
-                            },
-                        )
-                        .absolute()
-                        .size_full(),
-                    )
+            .when(group_tab_ctx_open, |el| {
+                el.child(self.render_group_tab_ctx_menu(cx))
             })
+            // Dialog layer is painted by [`AppShell`] (sibling of this view) so
+            // open_dialog builders can safely read MainWindow without re-entrancy.
     }
+}
+
+/// Coarse kind of [`RoutingNested`] — used to detect open/close transitions for NestedInputs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NestedKind {
+    None,
+    NewMenu,
+    UpdateMenu,
+    ImportPaste,
+    RouteEditor,
+    RawEditor,
+    Notice,
+}
+
+fn nested_kind(n: &RoutingNested) -> NestedKind {
+    match n {
+        RoutingNested::None => NestedKind::None,
+        RoutingNested::NewMenu => NestedKind::NewMenu,
+        RoutingNested::UpdateMenu { .. } => NestedKind::UpdateMenu,
+        RoutingNested::ImportPaste { .. } => NestedKind::ImportPaste,
+        RoutingNested::RouteEditor(_) => NestedKind::RouteEditor,
+        RoutingNested::RawEditor(_) => NestedKind::RawEditor,
+        RoutingNested::Notice { .. } => NestedKind::Notice,
+    }
+}
+
+/// Split multi-line Input text into trimmed non-empty rule list entries.
+fn lines_to_vec(s: &str) -> Vec<String> {
+    s.lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// Build a gpui-component Dialog for the current MainWindow dialog state.
+///
+/// Rebuilds every paint via `Root::render_dialog_layer` so toggles / list
+/// selection stay live. Focus is owned by the ActiveDialog in Root.
+fn build_gpui_dialog(
+    dialog: GpuiDialog,
+    entity: gpui::Entity<MainWindow>,
+    window: &mut Window,
+    cx: &mut App,
+) -> GpuiDialog {
+    let this = entity.read(cx);
+    let on_dismiss = {
+        let entity = entity.clone();
+        move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
+            entity.update(cx, |t, cx| {
+                t.close_dialog();
+                cx.notify();
+            });
+            // Framework also pops the layer; clear any stack leftovers.
+            window.close_all_dialogs(cx);
+        }
+    };
+
+    match &this.dialog {
+        Dialog::BasicSettings {
+            ruleset_mirror,
+            adblock_enable,
+            ..
+        } => {
+            let Some(DialogInputs::Basic {
+                inbound_address,
+                inbound_port,
+                test_url,
+                remote_dns,
+                direct_dns,
+                log_level,
+            }) = this.dialog_inputs.as_ref()
+            else {
+                return dialog.title("Basic Settings").child(div().child("…"));
+            };
+            let ruleset_mirror = *ruleset_mirror;
+            let adblock_enable = *adblock_enable;
+            let e_mirror = entity.clone();
+            let e_adblock = entity.clone();
+            let e_save = entity.clone();
+            let e_cancel = entity.clone();
+            dialog
+                .title("Basic Settings")
+                .w(px(520.))
+                .overlay_closable(true)
+                .on_cancel({
+                    let entity = entity.clone();
+                    move |_, _, cx| {
+                        entity.update(cx, |t, cx| {
+                            t.close_dialog();
+                            cx.notify();
+                        });
+                        true
+                    }
+                })
+                .on_close(on_dismiss)
+                .child(basic_settings_body(
+                    inbound_address,
+                    inbound_port,
+                    test_url,
+                    remote_dns,
+                    direct_dns,
+                    log_level,
+                    ruleset_mirror,
+                    adblock_enable,
+                    move |_, cx| {
+                        e_mirror.update(cx, |t, cx| {
+                            if let Dialog::BasicSettings {
+                                ruleset_mirror, ..
+                            } = &mut t.dialog
+                            {
+                                *ruleset_mirror = ruleset_mirror.cycle();
+                            }
+                            cx.notify();
+                        });
+                    },
+                    move |_, cx| {
+                        e_adblock.update(cx, |t, cx| {
+                            if let Dialog::BasicSettings {
+                                adblock_enable, ..
+                            } = &mut t.dialog
+                            {
+                                *adblock_enable = !*adblock_enable;
+                            }
+                            cx.notify();
+                        });
+                    },
+                    move |window, cx| {
+                        e_save.update(cx, |t, cx| t.save_basic_settings(cx));
+                        window.close_all_dialogs(cx);
+                    },
+                    move |window, cx| {
+                        e_cancel.update(cx, |t, cx| {
+                            t.close_dialog();
+                            cx.notify();
+                        });
+                        window.close_all_dialogs(cx);
+                    },
+                ))
+        }
+        Dialog::ManageGroups => {
+            let e_edit = entity.clone();
+            let e_rm = entity.clone();
+            let e_update = entity.clone();
+            let e_new = entity.clone();
+            let e_update_all = entity.clone();
+            dialog
+                .title("Groups")
+                .w(px(640.))
+                .on_cancel({
+                    let entity = entity.clone();
+                    move |_, _, cx| {
+                        entity.update(cx, |t, cx| {
+                            t.close_dialog();
+                            cx.notify();
+                        });
+                        true
+                    }
+                })
+                .on_close(on_dismiss)
+                .child(manage_groups_body(
+                    &this.state,
+                    move |id, window, cx| {
+                        e_edit.update(cx, |t, cx| t.open_edit_group(id, window, cx));
+                    },
+                    move |id, name, window, cx| {
+                        e_rm.update(cx, |t, cx| {
+                            t.dialog = Dialog::ConfirmRemoveGroup {
+                                group_id: id,
+                                name,
+                            };
+                            t.dialog_inputs = None;
+                            t.present_gpui_dialog(window, cx);
+                            cx.notify();
+                        });
+                    },
+                    move |id, _, cx| {
+                        e_update.update(cx, |t, cx| {
+                            t.start_subscription_group(id, UpdateOrigin::Manual, cx)
+                        });
+                    },
+                    move |window, cx| {
+                        e_new.update(cx, |t, cx| t.open_edit_group_new(window, cx));
+                    },
+                    move |window, cx| {
+                        e_update_all
+                            .update(cx, |t, cx| t.update_subscription(true, Some(window), cx));
+                    },
+                ))
+        }
+        Dialog::EditGroup {
+            group_id,
+            is_subscription,
+            skip_auto_update,
+            auto_clear_unavailable,
+            front_proxy_id,
+            landing_proxy_id,
+        } => {
+            let Some(DialogInputs::EditGroup { name, url }) = this.dialog_inputs.as_ref() else {
+                return dialog.title("Edit Group").child(div().child("…"));
+            };
+            let profile_count = group_id
+                .and_then(|id| this.state.group(id))
+                .map(|g| g.profile_ids.len())
+                .unwrap_or(0);
+            let view = EditGroupView {
+                group_id: *group_id,
+                is_subscription: *is_subscription,
+                skip_auto_update: *skip_auto_update,
+                auto_clear_unavailable: *auto_clear_unavailable,
+                front_label: this.proxy_display_label(*front_proxy_id).into(),
+                landing_label: this.proxy_display_label(*landing_proxy_id).into(),
+                profile_count,
+            };
+            let e_type = entity.clone();
+            let e_front = entity.clone();
+            let e_land = entity.clone();
+            let e_clear = entity.clone();
+            let e_skip = entity.clone();
+            let e_copy = entity.clone();
+            let e_deep = entity.clone();
+            let e_ok = entity.clone();
+            let e_cancel = entity.clone();
+            let title = if group_id.is_some() {
+                "Edit Group"
+            } else {
+                "New group"
+            };
+            dialog
+                .title(title)
+                .w(px(420.))
+                .on_cancel({
+                    let entity = entity.clone();
+                    move |_, window, cx| {
+                        entity.update(cx, |t, cx| t.return_to_manage_groups(window, cx));
+                        true
+                    }
+                })
+                .on_close({
+                    let entity = entity.clone();
+                    move |_, window, cx| {
+                        entity.update(cx, |t, cx| {
+                            // Prefer return to list unless fully dismissed.
+                            if matches!(t.dialog, Dialog::EditGroup { .. }) {
+                                t.return_to_manage_groups(window, cx);
+                            }
+                        });
+                    }
+                })
+                .child(edit_group_body(
+                    &view,
+                    name,
+                    url,
+                    move |_, cx| {
+                        e_type.update(cx, |t, cx| {
+                            if let Dialog::EditGroup {
+                                group_id: None,
+                                is_subscription,
+                                ..
+                            } = &mut t.dialog
+                            {
+                                *is_subscription = !*is_subscription;
+                            }
+                            cx.notify();
+                        });
+                    },
+                    move |_, cx| {
+                        e_front.update(cx, |t, cx| {
+                            let ids = t.group_proxy_cycle_ids();
+                            if let Dialog::EditGroup {
+                                front_proxy_id, ..
+                            } = &mut t.dialog
+                            {
+                                *front_proxy_id =
+                                    MainWindow::cycle_group_proxy(&ids, *front_proxy_id);
+                            }
+                            cx.notify();
+                        });
+                    },
+                    move |_, cx| {
+                        e_land.update(cx, |t, cx| {
+                            let ids = t.group_proxy_cycle_ids();
+                            if let Dialog::EditGroup {
+                                landing_proxy_id, ..
+                            } = &mut t.dialog
+                            {
+                                *landing_proxy_id =
+                                    MainWindow::cycle_group_proxy(&ids, *landing_proxy_id);
+                            }
+                            cx.notify();
+                        });
+                    },
+                    move |_, cx| {
+                        e_clear.update(cx, |t, cx| {
+                            if let Dialog::EditGroup {
+                                auto_clear_unavailable,
+                                ..
+                            } = &mut t.dialog
+                            {
+                                *auto_clear_unavailable = !*auto_clear_unavailable;
+                            }
+                            cx.notify();
+                        });
+                    },
+                    move |_, cx| {
+                        e_skip.update(cx, |t, cx| {
+                            if let Dialog::EditGroup {
+                                skip_auto_update, ..
+                            } = &mut t.dialog
+                            {
+                                *skip_auto_update = !*skip_auto_update;
+                            }
+                            cx.notify();
+                        });
+                    },
+                    move |_, cx| {
+                        e_copy.update(cx, |t, cx| t.copy_group_share_links(false, cx));
+                    },
+                    move |_, cx| {
+                        e_deep.update(cx, |t, cx| t.copy_group_share_links(true, cx));
+                    },
+                    move |window, cx| {
+                        e_ok.update(cx, |t, cx| t.edit_group_ok(window, cx));
+                    },
+                    move |window, cx| {
+                        e_cancel.update(cx, |t, cx| t.return_to_manage_groups(window, cx));
+                    },
+                ))
+        }
+        Dialog::ConfirmRemoveGroup { name, .. } => {
+            let e_yes = entity.clone();
+            let e_no = entity.clone();
+            let name = name.clone();
+            dialog
+                .title("Confirmation")
+                .w(px(420.))
+                .on_cancel({
+                    let entity = entity.clone();
+                    move |_, window, cx| {
+                        entity.update(cx, |t, cx| t.return_to_manage_groups(window, cx));
+                        true
+                    }
+                })
+                .on_close({
+                    let entity = entity.clone();
+                    move |_, window, cx| {
+                        entity.update(cx, |t, cx| {
+                            if matches!(t.dialog, Dialog::ConfirmRemoveGroup { .. }) {
+                                t.return_to_manage_groups(window, cx);
+                            }
+                        });
+                    }
+                })
+                .child(confirm_panel(
+                    "mg-rm-alert",
+                    format!("Remove {name}?"),
+                    false,
+                    "mg-rm-no",
+                    "No",
+                    "mg-rm-yes",
+                    "Yes",
+                    move |window, cx| {
+                        e_no.update(cx, |t, cx| t.return_to_manage_groups(window, cx));
+                    },
+                    move |window, cx| {
+                        e_yes.update(cx, |t, cx| t.confirm_remove_group(window, cx));
+                    },
+                ))
+        }
+        Dialog::AddFromInput { .. } => {
+            let Some(DialogInputs::AddFromInput { text }) = this.dialog_inputs.as_ref() else {
+                return dialog.title("Add profile from input").child(div().child("…"));
+            };
+            let hint =
+                crate::ui::dialogs::detect_hint_for_text(&DialogInputs::read_string(text, cx));
+            let e_ok = entity.clone();
+            let e_cancel = entity.clone();
+            dialog
+                .title("Add profile from input")
+                .w(px(520.))
+                .on_cancel({
+                    let entity = entity.clone();
+                    move |_, _, cx| {
+                        entity.update(cx, |t, cx| {
+                            t.close_dialog();
+                            cx.notify();
+                        });
+                        true
+                    }
+                })
+                .on_close(on_dismiss)
+                .child(add_input_body(
+                    text,
+                    hint,
+                    move |window, cx| {
+                        e_ok.update(cx, |t, cx| t.add_input_ok(cx));
+                        window.close_all_dialogs(cx);
+                    },
+                    move |window, cx| {
+                        e_cancel.update(cx, |t, cx| {
+                            t.close_dialog();
+                            cx.notify();
+                        });
+                        window.close_all_dialogs(cx);
+                    },
+                ))
+        }
+        Dialog::TunSettings {
+            vpn_strict_route,
+            disable_private_range_bypass,
+            ..
+        } => {
+            let Some(DialogInputs::Tun { mtu }) = this.dialog_inputs.as_ref() else {
+                return dialog.title("Tun Settings").child(div().child("…"));
+            };
+            let vpn_strict_route = *vpn_strict_route;
+            let disable_private_range_bypass = *disable_private_range_bypass;
+            let e_strict = entity.clone();
+            let e_bypass = entity.clone();
+            let e_save = entity.clone();
+            let e_cancel = entity.clone();
+            dialog
+                .title("Tun Settings")
+                .w(px(480.))
+                .on_cancel({
+                    let entity = entity.clone();
+                    move |_, _, cx| {
+                        entity.update(cx, |t, cx| {
+                            t.close_dialog();
+                            cx.notify();
+                        });
+                        true
+                    }
+                })
+                .on_close(on_dismiss)
+                .child(tun_settings_body(
+                    mtu,
+                    vpn_strict_route,
+                    disable_private_range_bypass,
+                    move |_, cx| {
+                        e_strict.update(cx, |t, cx| {
+                            if let Dialog::TunSettings {
+                                vpn_strict_route, ..
+                            } = &mut t.dialog
+                            {
+                                *vpn_strict_route = !*vpn_strict_route;
+                            }
+                            cx.notify();
+                        });
+                    },
+                    move |_, cx| {
+                        e_bypass.update(cx, |t, cx| {
+                            if let Dialog::TunSettings {
+                                disable_private_range_bypass,
+                                ..
+                            } = &mut t.dialog
+                            {
+                                *disable_private_range_bypass = !*disable_private_range_bypass;
+                            }
+                            cx.notify();
+                        });
+                    },
+                    move |window, cx| {
+                        e_save.update(cx, |t, cx| t.save_tun_settings(cx));
+                        window.close_all_dialogs(cx);
+                    },
+                    move |window, cx| {
+                        e_cancel.update(cx, |t, cx| {
+                            t.close_dialog();
+                            cx.notify();
+                        });
+                        window.close_all_dialogs(cx);
+                    },
+                ))
+        }
+        Dialog::HotkeySettings {
+            start_stop,
+            import,
+            save,
+            url_test,
+            copy_logs,
+            ..
+        } => {
+            let e_save = entity.clone();
+            let e_cancel = entity.clone();
+            let e_capture = entity.clone();
+            dialog
+                .title("Hotkey Settings")
+                .w(px(480.))
+                .on_cancel({
+                    let entity = entity.clone();
+                    move |_, _, cx| {
+                        entity.update(cx, |t, cx| {
+                            t.close_dialog();
+                            cx.notify();
+                        });
+                        true
+                    }
+                })
+                .on_close(on_dismiss)
+                .child(hotkey_settings_body(
+                    start_stop,
+                    import,
+                    save,
+                    url_test,
+                    copy_logs,
+                    move |field, chord, _window, cx| {
+                        e_capture.update(cx, |t, cx| t.set_hotkey_field(field, chord, cx));
+                    },
+                    move |window, cx| {
+                        e_save.update(cx, |t, cx| t.save_hotkey_settings(cx));
+                        window.close_all_dialogs(cx);
+                    },
+                    move |window, cx| {
+                        e_cancel.update(cx, |t, cx| {
+                            t.close_dialog();
+                            cx.notify();
+                        });
+                        window.close_all_dialogs(cx);
+                    },
+                ))
+        }
+        Dialog::EditProfile { type_label, .. } => {
+            let Some(DialogInputs::EditProfile { name }) = this.dialog_inputs.as_ref() else {
+                return dialog.title("Edit Profile").child(div().child("…"));
+            };
+            let type_label = type_label.clone();
+            let e_save = entity.clone();
+            let e_cancel = entity.clone();
+            dialog
+                .title("Edit Profile")
+                .w(px(420.))
+                .on_cancel({
+                    let entity = entity.clone();
+                    move |_, _, cx| {
+                        entity.update(cx, |t, cx| {
+                            t.close_dialog();
+                            cx.notify();
+                        });
+                        true
+                    }
+                })
+                .on_close(on_dismiss)
+                .child(edit_profile_body(
+                    name,
+                    &type_label,
+                    move |window, cx| {
+                        e_save.update(cx, |t, cx| t.save_edit_profile(cx));
+                        window.close_all_dialogs(cx);
+                    },
+                    move |window, cx| {
+                        e_cancel.update(cx, |t, cx| {
+                            t.close_dialog();
+                            cx.notify();
+                        });
+                        window.close_all_dialogs(cx);
+                    },
+                ))
+        }
+        Dialog::ConfirmDeleteUnavailable { count, .. } => {
+            let count = *count;
+            let e_confirm = entity.clone();
+            let e_cancel = entity.clone();
+            dialog
+                .title("Confirmation")
+                .w(px(420.))
+                .on_cancel({
+                    let entity = entity.clone();
+                    move |_, _, cx| {
+                        entity.update(cx, |t, cx| {
+                            t.close_dialog();
+                            cx.notify();
+                        });
+                        true
+                    }
+                })
+                .on_close(on_dismiss)
+                .child(confirm_delete_unavailable_body(
+                    count,
+                    move |window, cx| {
+                        e_confirm
+                            .update(cx, |t, cx| t.confirm_delete_unavailable(window, cx));
+                    },
+                    move |window, cx| {
+                        e_cancel.update(cx, |t, cx| {
+                            t.close_dialog();
+                            cx.notify();
+                        });
+                        window.close_all_dialogs(cx);
+                    },
+                ))
+        }
+        Dialog::ConfirmUpdateAllSubscriptions => {
+            let e_confirm = entity.clone();
+            let e_cancel = entity.clone();
+            // X / Esc / overlay: restore Manage Groups after the confirm layer pops
+            // (present on next paint via pending_gpui_dialog — avoid race with close_dialog).
+            let restore_manage = {
+                let entity = entity.clone();
+                move |_window: &mut Window, cx: &mut App| {
+                    entity.update(cx, |t, cx| {
+                        t.dialog = Dialog::manage_groups_from_state(&t.state);
+                        t.dialog_inputs = None;
+                        t.pending_gpui_dialog = true;
+                        cx.notify();
+                    });
+                }
+            };
+            let restore_manage_cancel = restore_manage.clone();
+            dialog
+                .title("Confirmation")
+                .w(px(420.))
+                .on_cancel(move |_, window, cx| {
+                    restore_manage_cancel(window, cx);
+                    true
+                })
+                .on_close(move |_, _, _| {
+                    // State already set in on_cancel; paint will present.
+                })
+                .child(confirm_update_all_body(
+                    move |window, cx| {
+                        e_confirm
+                            .update(cx, |t, cx| t.confirm_update_all_subscriptions(window, cx));
+                    },
+                    move |window, cx| {
+                        e_cancel.update(cx, |t, cx| {
+                            t.return_to_manage_groups(window, cx);
+                        });
+                    },
+                ))
+        }
+        Dialog::SubscriptionDiff { title, body } => {
+            let title = title.clone();
+            let body = body.clone();
+            let e_button = entity.clone();
+            let restore_manage = {
+                let entity = entity.clone();
+                move |_window: &mut Window, cx: &mut App| {
+                    entity.update(cx, |t, cx| {
+                        t.dialog = Dialog::manage_groups_from_state(&t.state);
+                        t.dialog_inputs = None;
+                        t.pending_gpui_dialog = true;
+                        cx.notify();
+                    });
+                }
+            };
+            let restore_manage_cancel = restore_manage.clone();
+            dialog
+                .title(title)
+                .w(px(560.))
+                .on_cancel(move |_, window, cx| {
+                    restore_manage_cancel(window, cx);
+                    true
+                })
+                .on_close(move |_, _, _| {})
+                .child(subscription_diff_body(&body, move |window, cx| {
+                    e_button.update(cx, |t, cx| {
+                        t.return_to_manage_groups(window, cx);
+                    });
+                }))
+        }
+        Dialog::RoutingSettings(draft) => {
+            let entity_ev = entity.clone();
+            let inputs = this.dialog_inputs.as_ref().and_then(|d| d.as_routing());
+            // Cap height so Dialog's content area scrolls instead of clipping past the viewport.
+            let max_h = (window.viewport_size().height * 0.82).max(px(360.));
+            dialog
+                .title("Routes")
+                // Upstream DialogManageRoutes geometry: 800×600.
+                .w(px(800.))
+                .max_h(max_h)
+                .overlay_closable(true)
+                .on_cancel({
+                    let entity = entity.clone();
+                    move |_, _, cx| {
+                        entity.update(cx, |t, cx| {
+                            t.close_dialog();
+                            cx.notify();
+                        });
+                        true
+                    }
+                })
+                .on_close(on_dismiss)
+                .child(routing_settings_view(draft, inputs, move |ev, window, cx| {
+                    entity_ev.update(cx, |t, cx| t.handle_routing_event(ev, window, cx));
+                }))
+        }
+        Dialog::None => dialog.title("").child(div()),
+    }
+}
+
+/// Independent open_dialog layer for routing nested UIs (Route Profile, menus, …).
+/// Closing only clears `draft.nested` — the main Routes dialog stays open underneath.
+fn build_nested_routing_dialog(
+    dialog: GpuiDialog,
+    entity: gpui::Entity<MainWindow>,
+    window: &mut Window,
+    cx: &mut App,
+) -> GpuiDialog {
+    let this = entity.read(cx);
+    let Dialog::RoutingSettings(draft) = &this.dialog else {
+        return dialog.title("").child(div());
+    };
+    if matches!(draft.nested, RoutingNested::None) {
+        return dialog.title("").child(div());
+    }
+    let title = routing_nested_title_owned(draft).unwrap_or_else(|| "…".into());
+    let width = routing_nested_width(draft);
+    let inputs = this.dialog_inputs.as_ref().and_then(|d| d.as_routing());
+    let entity_ev = entity.clone();
+    let body = routing_nested_view(draft, inputs, move |ev, window, cx| {
+        entity_ev.update(cx, |t, cx| t.handle_routing_event(ev, window, cx));
+    });
+    // Clear nested draft only — the framework pops this layer once after cancel/close.
+    // Do NOT call close_dialog here or Routes underneath will also be dismissed.
+    let clear_nested = {
+        let entity = entity.clone();
+        move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
+            entity.update(cx, |t, cx| {
+                if let Dialog::RoutingSettings(d) = &mut t.dialog {
+                    d.nested = RoutingNested::None;
+                }
+                if let Some(DialogInputs::Routing(inputs)) = t.dialog_inputs.as_mut() {
+                    inputs.clear_nested();
+                }
+                let (main, _) = t.dialog_stack_key();
+                t.presented_dialog_stack = (main, NestedKind::None);
+                cx.notify();
+            });
+        }
+    };
+    let clear_nested_cancel = clear_nested.clone();
+    // Dialog sits at ~10% from top; cap height so content scrolls instead of clipping.
+    let max_h = (window.viewport_size().height * 0.82).max(px(360.));
+    dialog
+        .title(title)
+        .w(px(width))
+        .max_h(max_h)
+        .overlay_closable(true)
+        .on_cancel(move |ev, window, cx| {
+            clear_nested_cancel(ev, window, cx);
+            true
+        })
+        .on_close(clear_nested)
+        .children(body)
 }
 
 #[cfg(test)]

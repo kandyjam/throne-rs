@@ -16,6 +16,7 @@ mod sys_proxy;
 pub use config_build::{
     BuiltConfig, apply_ruleset_mirror, build_load_config, build_url_test_config,
 };
+pub use rule_set_list::{RULE_SET_LIST, lookup_rule_set_url};
 pub use privilege::{
     ElevatedPermissions, PrivilegeOutcome, core_has_setuid, core_is_root_setuid,
     core_path_beside_gui, find_core_real_path, is_setuid_set, path_on_nosuid_volume,
