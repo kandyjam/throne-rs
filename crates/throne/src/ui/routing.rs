@@ -1615,8 +1615,10 @@ fn popup_menu(
                 .py_2()
                 .rounded_sm()
                 .cursor_pointer()
-                .hover(|e| e.bg(Theme::accent()).text_color(Theme::text_on_selected()))
+                .hover(|e| e.bg(Theme::bg_hover()).text_color(Theme::accent()))
+                .active(|e| e.bg(Theme::accent_soft()).text_color(Theme::accent()))
                 .text_sm()
+                .text_color(Theme::text())
                 .child(label)
                 .on_click(move |_, w, cx| on(w, cx)),
         );

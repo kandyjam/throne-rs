@@ -154,10 +154,11 @@ pub fn toolbar_menu_panel(
         .max_h(px(360.))
         .overflow_y_scroll()
         .py_1()
+        .px_1()
         .bg(Theme::bg_elevated())
         .border_1()
         .border_color(Theme::border_light())
-        .rounded_sm()
+        .rounded_md()
         .shadow_lg()
         // Capture clicks so they don't fall through to the table.
         .occlude()
@@ -263,10 +264,13 @@ pub fn menu_item(
         .w_full()
         .px_3()
         .py_1p5()
+        .rounded_sm()
         .text_sm()
         .text_color(Theme::text())
         .cursor_pointer()
-        .hover(|e| e.bg(Theme::accent()).text_color(Theme::text_on_selected()))
+        // Soft highlight (matches toolbar buttons) instead of solid accent bar.
+        .hover(|e| e.bg(Theme::bg_hover()).text_color(Theme::accent()))
+        .active(|e| e.bg(Theme::accent_soft()).text_color(Theme::accent()))
         .child(label.into())
         .on_click(on_click)
 }
