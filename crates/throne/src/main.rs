@@ -215,6 +215,9 @@ mod tests {
         assert!(!source.contains("mode_checkbox(\"dns\", \"System DNS\""));
         assert!(!source.contains("fn render_data_view(&self)"));
         assert!(!source.contains(".child(self.render_data_view())"));
+        // Upstream data_view test progress (group URL test) stays in the top bar.
+        assert!(source.contains("fn render_test_progress_panel"));
+        assert!(source.contains("Running URL test"));
     }
 
     #[test]

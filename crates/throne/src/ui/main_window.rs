@@ -197,6 +197,56 @@ fn next_runtime_generation(current: u64) -> (u64, u8) {
     (current.wrapping_add(1), 0)
 }
 
+/// Upstream `DataViewHtmlGenerator` latency/speedtest progress kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestProgressKind {
+    Url,
+}
+
+/// Top-right panel state while a group URL/IP test runs (upstream `data_view`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TestProgressPanel {
+    kind: TestProgressKind,
+    done: usize,
+    total: usize,
+}
+
+/// Upstream `DataViewHtmlGenerator::getProgressBar` — 10-char `#`/`-` bar.
+fn test_progress_bar(done: usize, total: usize) -> String {
+    let filled = if total > 0 { 10 * done / total } else { 0 };
+    let mut out = String::with_capacity(10);
+    for i in 0..10 {
+        out.push(if i < filled { '#' } else { '-' });
+    }
+    out
+}
+
+fn test_progress_percent(done: usize, total: usize) -> usize {
+    if total == 0 {
+        0
+    } else {
+        100 * done / total
+    }
+}
+
+/// Labels for the top-right test panel (mirrors upstream HTML center text).
+fn test_progress_lines(panel: &TestProgressPanel) -> (Option<String>, String) {
+    let verb = match panel.kind {
+        TestProgressKind::Url => "Running URL test",
+    };
+    if panel.total > 1 {
+        let bar = format!(
+            "{} {}%",
+            test_progress_bar(panel.done, panel.total),
+            test_progress_percent(panel.done, panel.total)
+        );
+        let content = format!("{verb} ({} / {})", panel.done, panel.total);
+        (Some(bar), content)
+    } else {
+        (None, verb.to_string())
+    }
+}
+
 fn runtime_poll_is_current(poll_generation: u64, current_generation: u64) -> bool {
     poll_generation == current_generation
 }
@@ -366,6 +416,8 @@ pub struct MainWindow {
     loading_frame: usize,
     /// True while a URL-test / sub-update job is in flight.
     background_busy: bool,
+    /// Top-right progress while group URL/IP test runs (upstream `data_view`).
+    test_progress: Option<TestProgressPanel>,
     subscription_queue: Option<SubscriptionUpdateQueue>,
     sort_column: SortColumn,
     /// `true` = ascending (A→Z, low latency first).
@@ -452,6 +504,7 @@ impl MainWindow {
             pending_profile_switch: PendingProfileSwitch::default(),
             loading_frame: 0,
             background_busy: false,
+            test_progress: None,
             subscription_queue: None,
             sort_column: SortColumn::None,
             sort_asc: true,
@@ -1883,50 +1936,88 @@ impl MainWindow {
         let n = profiles.len();
         let core = Arc::clone(&self.core);
         self.background_busy = true;
+        // Upstream `dataViewHtmlGenerator_.seedLatencyTest(Url, size)` + data_view.
+        self.test_progress = Some(TestProgressPanel {
+            kind: TestProgressKind::Url,
+            done: 0,
+            total: n,
+        });
         self.state
             .set_status_message(format!("URL Test group · {n} profile(s) …"));
         cx.notify();
+        let chunks: Vec<Vec<Profile>> = profiles.chunks(16).map(|c| c.to_vec()).collect();
         cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    let mut guard = core
-                        .lock()
-                        .map_err(|e| format!("core lock: {e}"))?;
-                    // Chunk to avoid huge configs / timeouts.
-                    let mut all = Vec::new();
-                    for chunk in profiles.chunks(16) {
+            let mut total_ok = 0usize;
+            let mut total_updated = 0usize;
+            let mut done = 0usize;
+            let mut fatal: Option<String> = None;
+
+            for chunk in chunks {
+                let chunk_len = chunk.len();
+                let core = Arc::clone(&core);
+                let settings = settings.clone();
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let mut guard = core
+                            .lock()
+                            .map_err(|e| format!("core lock: {e}"))?;
                         let refs: Vec<&Profile> = chunk.iter().collect();
                         let rows = guard
                             .url_test_profiles(&refs, &settings)
                             .map_err(|e| e.to_string())?;
-                        all.extend(
+                        Ok::<Vec<(i64, i32, String)>, String>(
                             rows.into_iter()
-                                .map(|(pid, r)| (pid, r.latency_ms, r.error)),
-                        );
-                    }
-                    Ok::<Vec<(i64, i32, String)>, String>(all)
-                })
-                .await;
-            this.update(cx, |this, cx| {
-                this.background_busy = false;
+                                .map(|(pid, r)| (pid, r.latency_ms, r.error))
+                                .collect(),
+                        )
+                    })
+                    .await;
+
                 match result {
                     Ok(rows) => {
                         let apply: Vec<(i64, i32, &str)> = rows
                             .iter()
                             .map(|(a, b, c)| (*a, *b, c.as_str()))
                             .collect();
-                        let updated = this.state.apply_url_test_results(&apply);
                         let ok = rows
                             .iter()
                             .filter(|(_, l, e)| e.is_empty() && *l > 0)
                             .count();
-                        this.state.set_status_message(format!(
-                            "URL Test done · {ok}/{updated} ok"
-                        ));
+                        done = (done + chunk_len).min(n);
+                        let _ = this.update(cx, |this, cx| {
+                            total_updated += this.state.apply_url_test_results(&apply);
+                            total_ok += ok;
+                            if let Some(panel) = this.test_progress.as_mut() {
+                                panel.done = done;
+                            }
+                            // Intermediate status stays in the top-right panel;
+                            // avoid flooding logs with per-chunk progress lines.
+                            cx.notify();
+                        });
+                    }
+                    Err(e) => {
+                        fatal = Some(e);
+                        break;
+                    }
+                }
+            }
+
+            this.update(cx, |this, cx| {
+                this.background_busy = false;
+                this.test_progress = None;
+                if let Some(e) = fatal {
+                    this.state
+                        .set_status_message(format!("URL Test failed: {e}"));
+                    // Keep any completed chunk results from earlier batches.
+                    if total_updated > 0 {
                         let _ = this.persist_db();
                     }
-                    Err(e) => this.state.set_status_message(format!("URL Test failed: {e}")),
+                } else {
+                    this.state.set_status_message(format!(
+                        "URL Test done · {total_ok}/{total_updated} ok"
+                    ));
+                    let _ = this.persist_db();
                 }
                 cx.notify();
             })
@@ -2831,6 +2922,44 @@ impl MainWindow {
                         })
                     }),
             )
+            // Upstream `data_view` (top-right): group test progress / download report.
+            .child(self.render_test_progress_panel())
+    }
+
+    /// Top-right test progress (upstream `QTextBrowser data_view` latency section).
+    fn render_test_progress_panel(&self) -> impl IntoElement {
+        let mut panel = div()
+            .id("test-progress-panel")
+            .flex_1()
+            .min_w(px(120.))
+            .h(px(52.))
+            .px_2()
+            .flex()
+            .flex_col()
+            .justify_center()
+            .items_center()
+            .gap_0p5();
+
+        if let Some(progress) = self.test_progress.as_ref() {
+            let (bar, content) = test_progress_lines(progress);
+            if let Some(bar) = bar {
+                panel = panel.child(
+                    div()
+                        .text_xs()
+                        .font_family("Menlo")
+                        .text_color(Theme::text())
+                        .child(bar),
+                );
+            }
+            panel = panel.child(
+                div()
+                    .text_xs()
+                    .text_color(Theme::text_muted())
+                    .child(content),
+            );
+        }
+
+        panel
     }
 
     fn menu_items_for(&self, menu: OpenMenu, cx: &mut Context<Self>) -> impl IntoElement {
@@ -4484,13 +4613,14 @@ impl Render for MainWindow {
 mod tests {
     use super::{
         CoreAction, FAILED_STOP_PROFILE_LOG, PendingProfileSwitch, SortColumn,
-        SubscriptionUpdateQueue, UpdateOrigin, eligible_subscription_ids,
-        failed_start_profile_log, next_core_action, next_runtime_generation, next_sort_state,
-        resolve_stop_profile_display, running_mode_marker, runtime_poll_health,
-        runtime_poll_is_current, runtime_profile_display, should_queue_recovery_restart,
-        should_scroll_logs_to_bottom,
-        should_show_subscription_diff, should_update_rendered_log_text,
-        start_profile_log, stop_profile_log, subscription_fetch_options,
+        SubscriptionUpdateQueue, TestProgressKind, TestProgressPanel, UpdateOrigin,
+        eligible_subscription_ids, failed_start_profile_log, next_core_action,
+        next_runtime_generation, next_sort_state, resolve_stop_profile_display,
+        running_mode_marker, runtime_poll_health, runtime_poll_is_current,
+        runtime_profile_display, should_queue_recovery_restart, should_scroll_logs_to_bottom,
+        should_show_subscription_diff, should_update_rendered_log_text, start_profile_log,
+        stop_profile_log, subscription_fetch_options, test_progress_bar, test_progress_lines,
+        test_progress_percent,
     };
     use throne_domain::{AppSettings, CoreStatus, Group, ProfileType};
 
@@ -4709,6 +4839,36 @@ mod tests {
         assert!(!pending.schedule(3));
         assert_eq!(pending.peek(), Some(3));
         assert_eq!(pending.take(), Some(3));
+    }
+
+    #[test]
+    fn url_test_progress_bar_matches_upstream_hash_dash_meter() {
+        assert_eq!(test_progress_bar(0, 100), "----------");
+        assert_eq!(test_progress_bar(50, 100), "#####-----");
+        assert_eq!(test_progress_bar(100, 100), "##########");
+        assert_eq!(test_progress_percent(1, 3), 33);
+        assert_eq!(test_progress_percent(0, 0), 0);
+    }
+
+    #[test]
+    fn url_test_progress_lines_include_count_when_group_has_multiple_profiles() {
+        let multi = TestProgressPanel {
+            kind: TestProgressKind::Url,
+            done: 16,
+            total: 48,
+        };
+        let (bar, content) = test_progress_lines(&multi);
+        assert_eq!(bar.as_deref(), Some("###------- 33%"));
+        assert_eq!(content, "Running URL test (16 / 48)");
+
+        let single = TestProgressPanel {
+            kind: TestProgressKind::Url,
+            done: 0,
+            total: 1,
+        };
+        let (bar, content) = test_progress_lines(&single);
+        assert!(bar.is_none());
+        assert_eq!(content, "Running URL test");
     }
 
 }
