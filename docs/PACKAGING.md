@@ -18,14 +18,15 @@ Packaging follows the same layout and flow as
 
 | Platform | Command | Output (`dist/`) |
 |----------|---------|------------------|
-| macOS | `./script/bundle-mac` | `Throne-<ver>-<arch>.dmg`, `Throne.app` |
+| macOS | `./script/bundle-mac` | `ThroneRs-<ver>-<arch>.dmg`, `ThroneRs.app` |
 | Linux | `./script/bundle-linux` | `throne-linux-<arch>.tar.gz` |
 | Linux DEB | `./script/bundle-linux --deb` | `throne_<ver>_<arch>.deb` |
 | Linux RPM | `./script/bundle-linux --rpm` | `throne-<ver>-1.<arch>.rpm` |
-| Windows | `.\script\bundle-windows.ps1` | `Throne-<arch>.exe` (Inno), portable `.zip` |
+| Windows | `.\script\bundle-windows.ps1` | `ThroneRs-<arch>.exe` (Inno), portable `.zip` |
 
-Every package places **`Throne`** and **`ThroneCore` in the same directory**
-(upstream Go `parentcheck`).
+Display name is **ThroneRs**; every package still places the **`Throne`** binary and
+**`ThroneCore` in the same directory** (upstream Go `parentcheck`). Shared DB
+paths remain under upstream `Throne` locations.
 
 ## Quick start
 

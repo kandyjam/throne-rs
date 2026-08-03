@@ -139,7 +139,7 @@ if (-not $Iscc) {
 }
 
 $Iss = Join-Path $Root "crates\throne\resources\windows\throne.iss"
-$OutName = "Throne-$Architecture"
+$OutName = "ThroneRs-$Architecture"
 Write-Step "Inno Setup → $Dist\$OutName.exe"
 
 & $Iscc `
@@ -160,4 +160,4 @@ Write-Step "Portable zip → $ZipPath"
 Compress-Archive -Path $guiOut, $coreOut -DestinationPath $ZipPath -Force
 
 Write-Step "Windows bundle complete"
-Get-ChildItem $Dist -Filter "Throne*" | Format-Table Name, Length
+Get-ChildItem $Dist -Filter "ThroneRs*" | Format-Table Name, Length

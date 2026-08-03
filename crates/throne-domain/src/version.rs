@@ -12,9 +12,11 @@ pub fn user_agent() -> String {
     format!("Throne/{base}")
 }
 
-/// Window / tray title fragment used by upstream `refresh_status`.
+/// Window / tray title fragment (product display name).
+///
+/// Shared DB discovery still uses upstream `Throne` paths — only the UI name differs.
 pub fn display_name() -> String {
-    format!("Throne {NKR_VERSION}")
+    format!("ThroneRs {NKR_VERSION}")
 }
 
 #[cfg(test)]

@@ -17,12 +17,13 @@
   #define OutputDir "..\..\..\dist"
 #endif
 #ifndef OutputBaseFilename
-  #define OutputBaseFilename "Throne-" + Arch
+  #define OutputBaseFilename "ThroneRs-" + Arch
 #endif
 
-#define MyAppName "Throne"
+#define MyAppName "ThroneRs"
 #define MyAppPublisher "Throne-rs"
 #define MyAppURL "https://github.com/kandyjam/throne-rs"
+; Exe basename stays Throne.exe (ThroneCore parentcheck).
 #define MyAppExeName "Throne.exe"
 
 [Setup]
@@ -76,7 +77,7 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 
 [Registry]
 ; throne:// deeplink
-Root: HKCU; Subkey: "Software\Classes\throne"; ValueType: string; ValueName: ""; ValueData: "URL:Throne Protocol"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\throne"; ValueType: string; ValueName: ""; ValueData: "URL:ThroneRs Protocol"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\throne"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""
 Root: HKCU; Subkey: "Software\Classes\throne\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" ""%1"""
 

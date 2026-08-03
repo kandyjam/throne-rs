@@ -201,7 +201,7 @@ pub fn install(initial: TrayMenuState) -> Result<(), String> {
         .with_menu(Box::new(menu))
         .with_icon(icon)
         .with_icon_as_template(template)
-        .with_tooltip("Throne")
+        .with_tooltip("ThroneRs")
         .build()
         .map_err(|error| format!("install system tray: {error}"))?;
 

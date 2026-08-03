@@ -19,7 +19,7 @@ Usage: ./script/package [mac|linux|windows|all] [bundle-linux flags...]
 
 Zed-style packaging entrypoint. Artifacts → ./dist/
 
-  mac       Throne.app + DMG          (script/bundle-mac)
+  mac       ThroneRs.app + DMG        (script/bundle-mac)
   linux     tar.gz [--deb] [--rpm]    (script/bundle-linux)
   windows   Inno Setup .exe           (script/bundle-windows.ps1)
   all       host defaults

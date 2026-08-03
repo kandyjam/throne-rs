@@ -1,13 +1,13 @@
 [Desktop Entry]
 Type=Application
-Name=Throne
+Name=ThroneRs
 GenericName=Proxy Client
 Comment=Cross-platform GUI proxy configuration manager (sing-box / Xray)
 Exec=${EXEC_PATH}
 Icon=${ICON_PATH}
 Terminal=false
 Categories=Network;Utility;
-Keywords=proxy;vpn;sing-box;xray;nekoray;throne;
+Keywords=proxy;vpn;sing-box;xray;nekoray;throne;throners;
 StartupNotify=true
 StartupWMClass=Throne
 MimeType=x-scheme-handler/throne;

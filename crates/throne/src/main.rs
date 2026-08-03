@@ -23,7 +23,7 @@ fn main() {
         )
         .init();
 
-    tracing::info!(version = NKR_VERSION, "Throne starting");
+    tracing::info!(version = NKR_VERSION, "ThroneRs starting");
 
     Application::new().with_assets(assets::Assets).run(|cx: &mut App| {
         cx.activate(true);

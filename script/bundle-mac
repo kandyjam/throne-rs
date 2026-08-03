@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # macOS packaging — mirrors zed-industries/zed `script/bundle-mac`.
 #
-# 1. cargo-bundle → Throne.app
+# 1. cargo-bundle → ThroneRs.app (display name; binary inside stays Throne)
 # 2. Copy ThroneCore beside Throne (parentcheck)
 # 3. Optional codesign
 # 4. hdiutil → DMG in dist/
@@ -35,7 +35,7 @@ ensure_cargo_bundle() {
 prepare_binaries
 ensure_cargo_bundle
 
-log "cargo bundle --release (Throne.app)"
+log "cargo bundle --release (ThroneRs.app)"
 # cargo-bundle reads [package.metadata.bundle] from crates/throne.
 # Note: macOS /bin/bash is 3.2 — empty "${arr[@]}" under `set -u` is an error,
 # so avoid empty arrays and branch on TARGET_TRIPLE instead.
@@ -50,24 +50,24 @@ log "cargo bundle --release (Throne.app)"
   fi
 )
 
-# Locate .app produced by cargo-bundle
+# Locate .app produced by cargo-bundle (bundle name = ThroneRs)
 APP=""
 for candidate in \
-  "$RELEASE_DIR/bundle/osx/Throne.app" \
-  "$TARGET_DIR/${TARGET_TRIPLE:-}/$PROFILE/bundle/osx/Throne.app" \
-  "$TARGET_DIR/$PROFILE/bundle/osx/Throne.app" \
-  "$ROOT/target/release/bundle/osx/Throne.app"
+  "$RELEASE_DIR/bundle/osx/ThroneRs.app" \
+  "$TARGET_DIR/${TARGET_TRIPLE:-}/$PROFILE/bundle/osx/ThroneRs.app" \
+  "$TARGET_DIR/$PROFILE/bundle/osx/ThroneRs.app" \
+  "$ROOT/target/release/bundle/osx/ThroneRs.app"
 do
   if [[ -d "$candidate" ]]; then
     APP="$candidate"
     break
   fi
 done
-# Fallback: find newest Throne.app under target/
+# Fallback: find newest ThroneRs.app under target/
 if [[ -z "$APP" ]]; then
-  APP="$(find "$TARGET_DIR" -type d -name 'Throne.app' 2>/dev/null | head -1 || true)"
+  APP="$(find "$TARGET_DIR" -type d -name 'ThroneRs.app' 2>/dev/null | head -1 || true)"
 fi
-[[ -n "$APP" && -d "$APP" ]] || die "Throne.app not found after cargo bundle"
+[[ -n "$APP" && -d "$APP" ]] || die "ThroneRs.app not found after cargo bundle"
 
 MACOS_DIR="$APP/Contents/MacOS"
 mkdir -p "$MACOS_DIR"
@@ -147,9 +147,9 @@ fi
 STAGE="$TARGET_DIR/dmg-stage-$$"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
-cp -R "$APP" "$STAGE/Throne.app"
+cp -R "$APP" "$STAGE/ThroneRs.app"
 
-DMG_NAME="Throne-${VERSION}-${ARCH}"
+DMG_NAME="ThroneRs-${VERSION}-${ARCH}"
 DMG_PATH="$DIST/${DMG_NAME}.dmg"
 rm -f "$DMG_PATH"
 
@@ -158,7 +158,7 @@ log "Creating DMG → $DMG_PATH"
 TMP_DMG="$TARGET_DIR/${DMG_NAME}.tmp.dmg"
 rm -f "$TMP_DMG"
 hdiutil create \
-  -volname "Throne" \
+  -volname "ThroneRs" \
   -srcfolder "$STAGE" \
   -ov -format UDRW \
   "$TMP_DMG"
@@ -175,9 +175,9 @@ rm -f "$TMP_DMG"
 rm -rf "$STAGE"
 
 # Also keep a copy of the .app next to the DMG for CI / local install
-rm -rf "$DIST/Throne.app"
-cp -R "$APP" "$DIST/Throne.app"
+rm -rf "$DIST/ThroneRs.app"
+cp -R "$APP" "$DIST/ThroneRs.app"
 
 log "macOS bundle complete:"
-ls -lh "$DMG_PATH" "$DIST/Throne.app"
+ls -lh "$DMG_PATH" "$DIST/ThroneRs.app"
 echo "$DMG_PATH"

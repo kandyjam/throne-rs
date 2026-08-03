@@ -70,9 +70,9 @@ Same approach as [Zed](https://github.com/zed-industries/zed): `cargo-bundle` + 
 
 | Platform | Command | Artifact |
 |----------|---------|----------|
-| macOS | `./script/bundle-mac` | `dist/Throne-*.dmg` |
+| macOS | `./script/bundle-mac` | `dist/ThroneRs-*.dmg` / `ThroneRs.app` |
 | Linux | `./script/bundle-linux` `[--deb] [--rpm]` | `dist/throne-linux-*.tar.gz` (+ deb/rpm) |
-| Windows | `.\script\bundle-windows.ps1` | Inno Setup `dist/Throne-*.exe` |
+| Windows | `.\script\bundle-windows.ps1` | Inno Setup `dist/ThroneRs-*.exe` |
 
 ```bash
 # one-time (macOS)
