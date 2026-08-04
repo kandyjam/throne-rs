@@ -9,8 +9,8 @@ use throne_domain::{AppState, GroupId, ProfileId, RulesetMirror};
 use crate::theme::Theme;
 use crate::ui::routing::RoutingDraft;
 use crate::ui::widgets::{
-    confirm_panel, dialog_actions, group_panel, hotkey_capture_row, input_area, input_field_row,
-    mode_switch, primary_btn, secondary_btn, section_hint,
+    dialog_actions, group_panel, hotkey_capture_row, input_area, input_field_row, mode_switch,
+    primary_btn, secondary_btn, section_hint,
 };
 
 pub fn format_subscription_info(info: &str) -> Option<String> {
@@ -243,24 +243,6 @@ pub fn edit_profile_body(
             on_cancel,
             on_save,
         ))
-}
-
-pub fn confirm_delete_unavailable_body(
-    count: usize,
-    on_confirm: impl Fn(&mut Window, &mut App) + 'static,
-    on_cancel: impl Fn(&mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    confirm_panel(
-        "du-alert",
-        format!("Remove {count} unavailable item(s)?"),
-        true,
-        "du-cancel",
-        "Cancel",
-        "du-confirm",
-        "Remove",
-        on_cancel,
-        on_confirm,
-    )
 }
 
 /// Build basic settings body with real gpui-component Inputs.
@@ -623,48 +605,21 @@ fn group_subscription_metadata(group: &throne_domain::Group) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" | "))
 }
 
-pub fn confirm_update_all_body(
-    on_confirm: impl Fn(&mut Window, &mut App) + 'static,
-    on_cancel: impl Fn(&mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    confirm_panel(
-        "sub-all-alert",
-        "Update all subscriptions?",
-        false,
-        "sub-all-no",
-        "No",
-        "sub-all-yes",
-        "Yes",
-        on_cancel,
-        on_confirm,
-    )
-}
-
-pub fn subscription_diff_body(
-    body: &str,
-    on_close: impl Fn(&mut Window, &mut App) + 'static,
-) -> impl IntoElement {
+/// Scrollable diff text for the SubscriptionDiff alert dialog.
+/// Footer Close comes from gpui-component [`Dialog::alert`].
+pub fn subscription_diff_body(body: &str) -> impl IntoElement {
     div()
-        .flex()
-        .flex_col()
-        .child(
-            div()
-                .id("sub-diff-scroll")
-                .max_h(px(360.))
-                .overflow_y_scroll()
-                .p_2()
-                .mb_3()
-                .border_1()
-                .border_color(Theme::border_light())
-                .text_sm()
-                .child(body.to_string()),
-        )
-        .child(
-            div()
-                .flex()
-                .justify_end()
-                .child(primary_btn("sub-diff-close", "Close", move |_, w, cx| on_close(w, cx))),
-        )
+        .id("sub-diff-scroll")
+        .w_full()
+        .max_h(px(360.))
+        .overflow_y_scroll()
+        .p_2()
+        .border_1()
+        .border_color(Theme::border_light())
+        .rounded_sm()
+        .text_sm()
+        .text_color(Theme::text())
+        .child(body.to_string())
 }
 
 pub fn add_input_body(

@@ -57,38 +57,50 @@ pub fn fetch_url_with_options(
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err(format!("not an HTTP(S) URL: {url}"));
     }
-    let mut builder = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout_read(timeout);
+
+    // ureq 3: configure via Agent::config_builder (AgentBuilder was removed).
+    let mut config = ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(10)))
+        .timeout_global(Some(timeout));
     if let Some(proxy_url) = options.proxy_url.as_deref() {
         let proxy = ureq::Proxy::new(proxy_url)
             .map_err(|error| format!("invalid HTTP proxy {proxy_url}: {error}"))?;
-        builder = builder.proxy(proxy);
+        config = config.proxy(Some(proxy));
     }
-    let agent = builder.build();
-    let resp = agent
+    let agent: ureq::Agent = config.build().into();
+
+    let mut resp = agent
         .get(url)
-        .set(
+        .header(
             "User-Agent",
             "Throne/1.2.2 (throne-rs; +https://github.com/throneproj/Throne)",
         )
-        .set("Accept", "*/*")
+        .header("Accept", "*/*")
         .call()
-        .map_err(|e| format!("HTTP request failed: {e}"))?;
-    let status = resp.status();
+        .map_err(|e| match e {
+            ureq::Error::StatusCode(code) => format!("HTTP {code} from {url}"),
+            other => format!("HTTP request failed: {other}"),
+        })?;
+
+    let status = resp.status().as_u16();
     if !(200..300).contains(&status) {
         return Err(format!("HTTP {status} from {url}"));
     }
+
     let headers = resp
-        .headers_names()
-        .into_iter()
-        .filter_map(|name| {
-            resp.header(&name)
-                .map(|value| (name, value.to_string()))
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                value.to_str().unwrap_or("").to_string(),
+            )
         })
         .collect();
+
     let body = resp
-        .into_string()
+        .body_mut()
+        .read_to_string()
         .map_err(|e| format!("read body failed: {e}"))?;
     if body.trim().is_empty() {
         return Err("empty subscription body".into());

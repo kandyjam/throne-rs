@@ -37,11 +37,12 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 anyhow = "1"
-ureq = { version = "2", default-features = false, features = ["tls"] }
+# ureq 3.x: TLS is `rustls` (default) or `native-tls` — there is no `tls` feature.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 base64 = "0.22"
 url = "2"
 urlencoding = "2"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde_yaml = "0.9"
 
 [patch.crates-io]

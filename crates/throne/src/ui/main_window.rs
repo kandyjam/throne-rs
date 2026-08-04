@@ -36,22 +36,23 @@ use throne_import::{FetchOptions, fetch_url_with_options, import_subscription_re
 use crate::theme::{self, Theme, latency_color};
 use crate::ui::dialog_inputs::{DialogInputs, NestedInputs};
 use crate::ui::dialogs::{
-    Dialog, EditGroupView, HotkeyField, add_input_body, basic_settings_body,
-    confirm_delete_unavailable_body, confirm_update_all_body, edit_group_body, edit_profile_body,
-    hotkey_settings_body, manage_groups_body, subscription_diff_body, tun_settings_body,
+    Dialog, EditGroupView, HotkeyField, add_input_body, basic_settings_body, edit_group_body,
+    edit_profile_body, hotkey_settings_body, manage_groups_body, subscription_diff_body,
+    tun_settings_body,
 };
 use crate::ui::routing::{
     RouteEditorTab, RoutingEvent, RoutingNested, RoutingSideEffect, routing_nested_title_owned,
     routing_nested_view, routing_nested_width, routing_settings_view,
 };
 use crate::ui::widgets::{
-    TOOLBAR_BTN_GAP, TOOLBAR_BTN_W, TOOLBAR_MENU_TOP, TOOLBAR_PAD_X, confirm_panel, icon_btn,
-    menu_item, menu_label, menu_separator, mode_switch, start_stop_btn, status_tag, tab_bar,
-    toolbar_btn, toolbar_menu_panel, StartStopState, ToolbarIcon,
+    TOOLBAR_BTN_GAP, TOOLBAR_BTN_W, TOOLBAR_MENU_TOP, TOOLBAR_PAD_X, icon_btn, menu_item,
+    menu_item_checked, menu_label, menu_panel, menu_separator, mode_switch, start_stop_btn,
+    status_tag, tab_bar, toolbar_btn, StartStopState, ToolbarIcon,
 };
 use gpui_component::{
-    WindowExt as _,
-    dialog::Dialog as GpuiDialog,
+    ActiveTheme as _, WindowExt as _,
+    button::ButtonVariant,
+    dialog::{Dialog as GpuiDialog, DialogButtonProps},
 };
 
 actions!(
@@ -548,20 +549,44 @@ impl MainWindow {
     ///
     /// Call from `open_window` so theme tokens follow OS light/dark changes live.
     pub fn attach_window_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.sync_theme_from_window(window);
+        self.sync_theme_from_window(window, cx);
         self._appearance_sub = Some(cx.observe_window_appearance(window, |this, window, cx| {
-            this.sync_theme_from_window(window);
+            this.sync_theme_from_window(window, cx);
             cx.notify();
         }));
     }
 
-    fn sync_theme_from_window(&self, window: &Window) {
+    fn sync_theme_from_window(&self, window: &Window, cx: &mut App) {
         let system_dark = theme::system_is_dark(window.appearance());
         let scheme = theme::apply_preference(&self.state.settings().theme, system_dark);
         // Tray glyph follows scheme (template on macOS; light/dark swap on Win/Linux).
         crate::tray::apply_scheme(scheme);
         // Dock icon: white/black line-art masters (macOS runtime switch).
         crate::dock_icon::apply_for_scheme(scheme.is_dark());
+        // Dialog / Button / Switch / TabBar / Alert read gpui-component Theme.
+        Self::sync_gpui_component_theme(scheme, None, cx);
+    }
+
+    /// Keep gpui-component global Theme locked to the resolved app scheme.
+    ///
+    /// Dialog chrome (`cx.theme().background`) and widgets ignore `crate::theme`
+    /// tokens — without this, dark→light leaves Confirmation dialogs pure black.
+    fn sync_gpui_component_theme(
+        scheme: theme::ColorScheme,
+        window: Option<&mut Window>,
+        cx: &mut App,
+    ) {
+        if !cx.has_global::<gpui_component::Theme>() {
+            return;
+        }
+        let mode = if scheme.is_dark() {
+            gpui_component::ThemeMode::Dark
+        } else {
+            gpui_component::ThemeMode::Light
+        };
+        // Always re-apply palette (not only when mode flips). Mode can already be
+        // correct while colors stay on the previous scheme after a half-init path.
+        gpui_component::Theme::change(mode, window, cx);
     }
 
     fn spawn_runtime_poller(&self, cx: &mut Context<Self>) {
@@ -667,6 +692,9 @@ impl MainWindow {
     /// Nested route editors are **independent** open_dialog layers (not painted inside Routes).
     fn present_gpui_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.pending_gpui_dialog = false;
+        // Re-apply component theme *before* Dialog paints so Confirmation chrome
+        // matches the current light/dark scheme (not a stale dark palette).
+        self.sync_theme_from_window(window, cx);
         let key = self.dialog_stack_key();
         if key == self.presented_dialog_stack && window.has_active_dialog(cx) {
             return;
@@ -700,13 +728,19 @@ impl MainWindow {
         if !matches!(self.dialog, Dialog::None) {
             return;
         }
-        self.open_menu = if self.open_menu == menu {
-            OpenMenu::None
-        } else {
-            menu
-        };
-        self.ctx_menu_at = None;
+        if self.open_menu == menu {
+            self.close_menus();
+            cx.notify();
+            return;
+        }
         self.ctx_group_id = None;
+        self.show_menu(menu, None, cx);
+    }
+
+    /// Open a toolbar dropdown or context menu (content built on paint).
+    fn show_menu(&mut self, menu: OpenMenu, at: Option<(f32, f32)>, cx: &mut Context<Self>) {
+        self.open_menu = menu;
+        self.ctx_menu_at = at;
         cx.notify();
     }
 
@@ -3583,9 +3617,10 @@ impl MainWindow {
         panel
     }
 
+    /// Compact dropdown body for the open toolbar / context menu.
     fn menu_items_for(&self, menu: OpenMenu, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity().clone();
-        let mut panel = div().flex().flex_col().py_0p5();
+        let mut panel = div().flex().flex_col();
 
         macro_rules! item {
             ($id:expr, $label:expr, |$t:ident, $w:ident, $cx:ident| $($body:tt)*) => {{
@@ -3595,7 +3630,13 @@ impl MainWindow {
                         let $t = this;
                         let $w = window;
                         let $cx = cx;
-                        $($body)*;
+                        // Block so single-expr bodies don't glue onto close_menus.
+                        {
+                            $($body)*
+                        }
+                        // Always dismiss after an item runs (open_* already closes too).
+                        $t.close_menus();
+                        $cx.notify();
                     });
                 }));
             }};
@@ -3605,56 +3646,44 @@ impl MainWindow {
             OpenMenu::Program => {
                 panel = panel.child(menu_label("Program"));
                 item!("prog-input", "Add profile from input", |t, w, cx| {
-                    t.open_add_from_input(w, cx)
+                    t.open_add_from_input(w, cx);
                 });
                 item!("prog-clip", "Add profile from clipboard", |t, _w, cx| {
-                    t.import_clipboard(cx)
+                    t.import_clipboard(cx);
                 });
                 item!("prog-start", "Start", |t, _w, cx| t.toggle_proxy(cx));
                 item!("prog-stop", "Stop", |t, _w, cx| {
                     if t.state.core_status().is_running() {
                         t.toggle_proxy(cx);
-                    } else {
-                        t.close_menus();
-                        cx.notify();
                     }
                 });
                 panel = panel.child(menu_separator());
                 item!("prog-proxy", "Enable System Proxy", |t, _w, cx| {
                     t.set_sys_proxy(true, cx);
-                    t.close_menus();
                 });
                 item!("prog-tun", "Enable Tun", |t, _w, cx| {
                     t.set_vpn(true, cx);
-                    t.close_menus();
                 });
                 item!("prog-off", "Disable", |t, _w, cx| {
                     t.set_sys_proxy(false, cx);
                     t.set_vpn(false, cx);
                     t.set_sys_dns(false, cx);
-                    t.close_menus();
                 });
                 panel = panel.child(menu_separator());
                 item!("prog-exit", "Exit", |_t, _w, cx| cx.quit());
             }
             OpenMenu::Settings => {
                 panel = panel.child(menu_label("Preferences"));
-                item!("set-basic", "Basic Settings", |t, w, cx| {
-                    t.open_basic_settings(w, cx)
-                });
+                item!("set-basic", "Basic Settings", |t, w, cx| t.open_basic_settings(w, cx));
                 item!("set-route", "Routing Settings", |t, w, cx| {
-                    t.open_routing_settings(Some(w), cx)
+                    t.open_routing_settings(Some(w), cx);
                 });
                 item!("set-tun", "Tun Settings", |t, w, cx| t.open_tun_settings(w, cx));
-                item!("set-hotkey", "Hotkey Settings", |t, w, cx| {
-                    t.open_hotkey_settings(w, cx)
-                });
+                item!("set-hotkey", "Hotkey Settings", |t, w, cx| t.open_hotkey_settings(w, cx));
                 item!("set-clear-proxy", "Clear system proxy now", |t, _w, cx| {
                     force_clear_system_proxy();
                     t.state
                         .set_status_message("System proxy force-cleared on all interfaces");
-                    t.close_menus();
-                    cx.notify();
                 });
                 panel = panel.child(menu_separator());
                 item!("set-folder", "Open Config Folder", |t, _w, cx| {
@@ -3668,8 +3697,6 @@ impl MainWindow {
                         t.state
                             .set_status_message(format!("Opened {}", dir.display()));
                     }
-                    t.close_menus();
-                    cx.notify();
                 });
                 item!("set-save", "Save database", |t, _w, cx| t.save_db(cx));
             }
@@ -3677,85 +3704,83 @@ impl MainWindow {
                 panel = panel.child(menu_label("Groups"));
                 item!("g-manage", "Manage Groups", |t, w, cx| t.open_manage_groups(w, cx));
                 item!("g-update", "Update subscription", |t, w, cx| {
-                    t.update_subscription(false, Some(w), cx)
+                    t.update_subscription(false, Some(w), cx);
                 });
                 item!("g-update-all", "Update all subscriptions", |t, w, cx| {
-                    t.update_subscription(true, Some(w), cx)
+                    t.update_subscription(true, Some(w), cx);
                 });
                 panel = panel.child(menu_separator());
                 item!("g-urltest", "Url Test Group", |t, _w, cx| t.url_test_group(cx));
                 item!("g-clear", "Clear Group test result", |t, _w, cx| {
                     let gid = t.state.active_group_id();
                     t.state.clear_test_results_in_group(gid);
-                    t.close_menus();
                     let _ = t.persist_db();
-                    cx.notify();
                 });
                 item!("g-dup", "Remove Duplicates", |t, _w, cx| {
                     let gid = t.state.active_group_id();
                     t.state.remove_duplicates_in_group(gid);
-                    t.close_menus();
                     let _ = t.persist_db();
-                    cx.notify();
                 });
                 item!("g-unavail", "Remove Unavailable", |t, w, cx| {
-                    t.delete_unavailable(Some(w), cx)
+                    t.delete_unavailable(Some(w), cx);
                 });
                 item!("g-invalid", "Remove Invalid Configs", |t, _w, cx| {
                     let gid = t.state.active_group_id();
                     t.state.remove_invalid_in_group(gid);
-                    t.close_menus();
                     let _ = t.persist_db();
-                    cx.notify();
                 });
                 item!("g-insecure", "Remove Insecure Configs", |t, _w, cx| {
                     let gid = t.state.active_group_id();
                     t.state.remove_insecure_in_group(gid);
-                    t.close_menus();
                     let _ = t.persist_db();
-                    cx.notify();
                 });
             }
             OpenMenu::Routing => {
                 panel = panel.child(menu_label("Routing"));
                 item!("r-settings", "Routing Settings", |t, w, cx| {
-                    t.open_routing_settings(Some(w), cx)
+                    t.open_routing_settings(Some(w), cx);
                 });
                 item!("r-cycle", "Next route profile", |t, _w, cx| t.cycle_route(cx));
-                panel = panel.child(menu_separator());
-                for r in self.state.all_routes() {
-                    let id = r.id;
-                    let name = r.summary();
-                    let e = entity.clone();
-                    let active = self.state.active_route().is_some_and(|a| a.id == id);
-                    let label = if active {
-                        format!("● {name}")
-                    } else {
-                        format!("○ {name}")
-                    };
-                    panel = panel.child(menu_item(
-                        SharedString::from(format!("route-{id}")),
-                        label,
-                        move |_, _, cx| {
-                            e.update(cx, |t, cx| {
-                                let _ = t.state.set_active_route(id);
-                                let _ = t.persist_db();
-                                t.close_menus();
-                                cx.notify();
-                            });
-                        },
-                    ));
+                let routes: Vec<_> = self
+                    .state
+                    .all_routes()
+                    .into_iter()
+                    .map(|r| {
+                        let active = self.state.active_route().is_some_and(|a| a.id == r.id);
+                        (r.id, r.summary(), active)
+                    })
+                    .collect();
+                if !routes.is_empty() {
+                    panel = panel.child(menu_separator());
+                    for (id, name, active) in routes {
+                        let e = entity.clone();
+                        panel = panel.child(menu_item_checked(
+                            SharedString::from(format!("route-{id}")),
+                            name,
+                            active,
+                            move |_, _, cx| {
+                                e.update(cx, |t, cx| {
+                                    let _ = t.state.set_active_route(id);
+                                    let _ = t.persist_db();
+                                    t.close_menus();
+                                    cx.notify();
+                                });
+                            },
+                        ));
+                    }
                 }
             }
             OpenMenu::Tools => {
                 panel = panel.child(menu_label("Tools"));
                 item!("t-url", "Url Test Selected", |t, _w, cx| t.url_test_selected(cx));
-                item!("t-url-group", "Url Test Group (⌘⇧G)", |t, _w, cx| t.url_test_group(cx));
+                item!("t-url-group", "Url Test Group (⌘⇧G)", |t, _w, cx| {
+                    t.url_test_group(cx);
+                });
                 item!("t-delete-unavailable", "Delete Unavailable (⌘⇧R)", |t, w, cx| {
-                    t.delete_unavailable(Some(w), cx)
+                    t.delete_unavailable(Some(w), cx);
                 });
                 item!("t-speed", "Speedtest Selected", |t, _w, cx| {
-                    t.speed_test_selected(cx)
+                    t.speed_test_selected(cx);
                 });
                 item!("t-ip", "IP Test Selected", |t, _w, cx| t.ip_test_selected(cx));
                 panel = panel.child(menu_separator());
@@ -3764,8 +3789,6 @@ impl MainWindow {
                     t.state.set_status_message(
                         "Connections tab shows live sessions while core is running",
                     );
-                    t.close_menus();
-                    cx.notify();
                 });
                 item!("t-traffic", "Traffic Stats", |t, _w, cx| {
                     let label = t.state.speed_label();
@@ -3774,16 +3797,12 @@ impl MainWindow {
                     } else {
                         label.replace('\n', " · ")
                     });
-                    t.close_menus();
-                    cx.notify();
                 });
                 item!("t-update", "Check For Update", |t, _w, cx| {
                     t.state.set_status_message(format!(
                         "Current version {} · throne-rs rewrite (no auto-update yet)",
                         throne_domain::NKR_VERSION
                     ));
-                    t.close_menus();
-                    cx.notify();
                 });
                 panel = panel.child(menu_separator());
                 panel = panel.child(menu_label(format!(
@@ -3791,7 +3810,65 @@ impl MainWindow {
                     throne_domain::NKR_VERSION
                 )));
             }
-            OpenMenu::ProfileCtx | OpenMenu::GroupTabCtx | OpenMenu::None => {}
+            OpenMenu::ProfileCtx => {
+                panel = panel.child(menu_label("Server"));
+                item!("c-start", "Start", |t, _w, cx| t.toggle_proxy(cx));
+                item!("c-stop", "Stop", |t, _w, cx| {
+                    if t.state.core_status().is_running() {
+                        t.toggle_proxy(cx);
+                    }
+                });
+                item!("c-input", "Add profile from input", |t, w, cx| {
+                    t.open_add_from_input(w, cx);
+                });
+                item!("c-clip", "Add profile from clipboard", |t, _w, cx| {
+                    t.import_clipboard(cx);
+                });
+                item!("c-edit", "Edit profile…", |t, w, cx| t.open_edit_profile(w, cx));
+                item!("c-del", "Delete", |t, _w, cx| t.delete_selected(cx));
+                item!("c-test", "Url Test Selected", |t, _w, cx| t.url_test_selected(cx));
+            }
+            OpenMenu::GroupTabCtx => {
+                item!("gt-add", "Add new Group", |t, w, cx| {
+                    t.open_edit_group_new(w, cx);
+                });
+                if let Some(gid) = self.ctx_group_id {
+                    item!("gt-edit", "Edit selected Group", |t, w, cx| {
+                        t.open_edit_group(gid, w, cx);
+                    });
+                    if self.state.group_order().len() > 1 {
+                        let name = self
+                            .state
+                            .group(gid)
+                            .map(|g| {
+                                if g.name.is_empty() {
+                                    format!("Group {gid}")
+                                } else {
+                                    g.name.clone()
+                                }
+                            })
+                            .unwrap_or_else(|| format!("Group {gid}"));
+                        item!("gt-del", "Delete selected Group", |t, w, cx| {
+                            t.dialog = Dialog::ConfirmRemoveGroup {
+                                group_id: gid,
+                                name: name.clone(),
+                            };
+                            t.dialog_inputs = None;
+                            t.present_gpui_dialog(w, cx);
+                        });
+                    }
+                    let has_url = self
+                        .state
+                        .group(gid)
+                        .is_some_and(|g| !g.url.trim().is_empty() && !g.archive);
+                    if has_url {
+                        item!("gt-upd", "Update subscription", |t, _w, cx| {
+                            t.start_subscription_group(gid, UpdateOrigin::Manual, cx);
+                        });
+                    }
+                }
+            }
+            OpenMenu::None => {}
         }
 
         panel
@@ -3833,152 +3910,40 @@ impl MainWindow {
         }
     }
 
-    /// Root-level dropdown so menus are not covered by group tabs / table.
+    /// Root-level dropdown — paints after group tabs so it is never covered.
     fn render_toolbar_menu_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let menu = self.open_menu;
-        let Some(idx) = Self::toolbar_menu_index(menu) else {
+        let Some(idx) = Self::toolbar_menu_index(self.open_menu) else {
             return div().into_any_element();
         };
-        let left = TOOLBAR_PAD_X + 4. + idx as f32 * (TOOLBAR_BTN_W + TOOLBAR_BTN_GAP);
-        let items = self.menu_items_for(menu, cx);
-        // Dim strip is optional; panel alone is enough. Click-away closes via Esc.
-        toolbar_menu_panel(
-            SharedString::from(format!("tb-overlay-{idx}")),
-            TOOLBAR_MENU_TOP,
-            left,
-            items,
-        )
-        .into_any_element()
+        // Align with tool-cluster: pad_x + n × (btn + gap). No extra offset.
+        let left = TOOLBAR_PAD_X + idx as f32 * (TOOLBAR_BTN_W + TOOLBAR_BTN_GAP);
+        let items = self.menu_items_for(self.open_menu, cx);
+        div()
+            .id(SharedString::from(format!("tb-overlay-{idx}")))
+            .absolute()
+            .top(px(TOOLBAR_MENU_TOP))
+            .left(px(left))
+            .occlude()
+            .child(menu_panel(
+                SharedString::from(format!("tb-menu-{idx}")),
+                200.,
+                items,
+            ))
+            .into_any_element()
     }
 
-    fn render_ctx_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let entity = cx.entity().clone();
+    /// Profile / group-tab context menu at the click position.
+    fn render_ctx_popup(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (x, y) = self.ctx_menu_at.unwrap_or((200., 200.));
-        let mut panel = div()
+        let items = self.menu_items_for(self.open_menu, cx);
+        div()
+            .id("ctx-popup")
             .absolute()
             .top(px(y))
             .left(px(x))
-            .min_w(px(220.))
-            .py_1()
-            .bg(Theme::bg_elevated())
-            .border_1()
-            .border_color(Theme::border_light())
-            .rounded_sm()
-            .shadow_md();
-
-        macro_rules! item {
-            ($id:expr, $label:expr, |$t:ident, $w:ident, $cx:ident| $($body:tt)*) => {{
-                let e = entity.clone();
-                panel = panel.child(menu_item($id, $label, move |_, window, cx| {
-                    e.update(cx, |this, cx| {
-                        let $t = this;
-                        let $w = window;
-                        let $cx = cx;
-                        $($body)*;
-                    });
-                }));
-            }};
-        }
-
-        panel = panel.child(menu_label("Server"));
-        item!("c-start", "Start", |t, _w, cx| t.toggle_proxy(cx));
-        item!("c-stop", "Stop", |t, _w, cx| {
-            if t.state.core_status().is_running() {
-                t.toggle_proxy(cx);
-            } else {
-                t.close_menus();
-                cx.notify();
-            }
-        });
-        item!("c-input", "Add profile from input", |t, w, cx| {
-            t.open_add_from_input(w, cx)
-        });
-        item!("c-clip", "Add profile from clipboard", |t, _w, cx| {
-            t.import_clipboard(cx)
-        });
-        item!("c-edit", "Edit profile…", |t, w, cx| t.open_edit_profile(w, cx));
-        item!("c-del", "Delete", |t, _w, cx| t.delete_selected(cx));
-        item!("c-test", "Url Test Selected", |t, _w, cx| t.url_test_selected(cx));
-        panel
-    }
-
-    /// Upstream `on_tabWidget_customContextMenuRequested` — Add / Edit / Delete / Update sub.
-    fn render_group_tab_ctx_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let entity = cx.entity().clone();
-        let (x, y) = self.ctx_menu_at.unwrap_or((120., 100.));
-        let target = self.ctx_group_id;
-        let mut panel = div()
-            .absolute()
-            .top(px(y))
-            .left(px(x))
-            .min_w(px(200.))
-            .py_1()
-            .bg(Theme::bg_elevated())
-            .border_1()
-            .border_color(Theme::border_light())
-            .rounded_sm()
-            .shadow_md();
-
-        macro_rules! item {
-            ($id:expr, $label:expr, |$t:ident, $w:ident, $cx:ident| $($body:tt)*) => {{
-                let e = entity.clone();
-                panel = panel.child(menu_item($id, $label, move |_, window, cx| {
-                    e.update(cx, |this, cx| {
-                        let $t = this;
-                        let $w = window;
-                        let $cx = cx;
-                        $($body)*;
-                    });
-                }));
-            }};
-        }
-
-        item!("gt-add", "Add new Group", |t, w, cx| {
-            t.close_menus();
-            t.open_edit_group_new(w, cx);
-        });
-
-        if let Some(gid) = target {
-            item!("gt-edit", "Edit selected Group", |t, w, cx| {
-                t.close_menus();
-                t.open_edit_group(gid, w, cx);
-            });
-            if self.state.group_order().len() > 1 {
-                let name = self
-                    .state
-                    .group(gid)
-                    .map(|g| {
-                        if g.name.is_empty() {
-                            format!("Group {gid}")
-                        } else {
-                            g.name.clone()
-                        }
-                    })
-                    .unwrap_or_else(|| format!("Group {gid}"));
-                item!("gt-del", "Delete selected Group", |t, w, cx| {
-                    t.close_menus();
-                    t.dialog = Dialog::ConfirmRemoveGroup {
-                        group_id: gid,
-                        name: name.clone(),
-                    };
-                    t.dialog_inputs = None;
-                    t.present_gpui_dialog(w, cx);
-                    cx.notify();
-                });
-            }
-            let has_url = self
-                .state
-                .group(gid)
-                .is_some_and(|g| !g.url.trim().is_empty() && !g.archive);
-            if has_url {
-                item!("gt-upd", "Update subscription", |t, _w, cx| {
-                    t.close_menus();
-                    t.start_subscription_group(gid, UpdateOrigin::Manual, cx);
-                });
-            }
-        }
-
-        panel
+            .occlude()
+            .child(menu_panel("ctx-menu", 200., items))
+            .into_any_element()
     }
 
     fn render_group_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3999,10 +3964,12 @@ impl MainWindow {
                 // Empty tab-bar area → only "Add new Group" (upstream).
                 let pos = ev.position;
                 e_empty.update(cx, |this, cx| {
-                    this.open_menu = OpenMenu::GroupTabCtx;
                     this.ctx_group_id = None;
-                    this.ctx_menu_at = Some((pos.x.into(), pos.y.into()));
-                    cx.notify();
+                    this.show_menu(
+                        OpenMenu::GroupTabCtx,
+                        Some((pos.x.into(), pos.y.into())),
+                        cx,
+                    );
                 });
             });
 
@@ -4055,10 +4022,12 @@ impl MainWindow {
                             e_right.update(cx, |this, cx| {
                                 // Upstream selects the clicked tab before showing the menu.
                                 let _ = this.state.set_active_group(gid);
-                                this.open_menu = OpenMenu::GroupTabCtx;
                                 this.ctx_group_id = Some(gid);
-                                this.ctx_menu_at = Some((pos.x.into(), pos.y.into()));
-                                cx.notify();
+                                this.show_menu(
+                                    OpenMenu::GroupTabCtx,
+                                    Some((pos.x.into(), pos.y.into())),
+                                    cx,
+                                );
                             });
                         },
                     ),
@@ -4281,15 +4250,16 @@ impl MainWindow {
                                 )
                                 .on_mouse_down(
                                     gpui::MouseButton::Right,
-                                    move |ev: &gpui::MouseDownEvent, window, cx| {
+                                    move |ev: &gpui::MouseDownEvent, _, cx| {
                                         let pos = ev.position;
                                         e_ctx.update(cx, |this, cx| {
                                             let _ = this.state.select_profile(id);
-                                            this.open_menu = OpenMenu::ProfileCtx;
-                                            this.ctx_menu_at =
-                                                Some((pos.x.into(), pos.y.into()));
-                                            let _ = window;
-                                            cx.notify();
+                                            this.ctx_group_id = None;
+                                            this.show_menu(
+                                                OpenMenu::ProfileCtx,
+                                                Some((pos.x.into(), pos.y.into())),
+                                                cx,
+                                            );
                                         });
                                     },
                                 )
@@ -4725,8 +4695,8 @@ impl EntityInputHandler for MainWindow {
 
 impl Render for MainWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Keep paint tokens aligned with settings + current OS appearance.
-        self.sync_theme_from_window(window);
+        // Keep paint tokens + gpui-component chrome aligned with settings / OS appearance.
+        self.sync_theme_from_window(window, cx);
         // Dialog present / NestedInputs sync runs in AppShell::prepare_dialog_layer
         // (must not open_dialog builders from inside this render).
 
@@ -4853,9 +4823,8 @@ impl Render for MainWindow {
                 )
                 .child(self.render_toolbar_menu_overlay(cx))
             })
-            .when(ctx_open, |el| el.child(self.render_ctx_menu(cx)))
-            .when(group_tab_ctx_open, |el| {
-                el.child(self.render_group_tab_ctx_menu(cx))
+            .when(ctx_open || group_tab_ctx_open, |el| {
+                el.child(self.render_ctx_popup(cx))
             })
             // Dialog layer is painted by [`AppShell`] (sibling of this view) so
             // open_dialog builders can safely read MainWindow without re-entrancy.
@@ -5190,11 +5159,20 @@ fn build_gpui_dialog(
         }
         Dialog::ConfirmRemoveGroup { name, .. } => {
             let e_yes = entity.clone();
-            let e_no = entity.clone();
             let name = name.clone();
             dialog
                 .title("Confirmation")
+                .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Yes")
+                        .cancel_text("No"),
+                )
                 .w(px(420.))
+                .on_ok(move |_, window, cx| {
+                    e_yes.update(cx, |t, cx| t.confirm_remove_group(window, cx));
+                    true
+                })
                 .on_cancel({
                     let entity = entity.clone();
                     move |_, window, cx| {
@@ -5212,21 +5190,12 @@ fn build_gpui_dialog(
                         });
                     }
                 })
-                .child(confirm_panel(
-                    "mg-rm-alert",
-                    format!("Remove {name}?"),
-                    false,
-                    "mg-rm-no",
-                    "No",
-                    "mg-rm-yes",
-                    "Yes",
-                    move |window, cx| {
-                        e_no.update(cx, |t, cx| t.return_to_manage_groups(window, cx));
-                    },
-                    move |window, cx| {
-                        e_yes.update(cx, |t, cx| t.confirm_remove_group(window, cx));
-                    },
-                ))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().foreground)
+                        .child(format!("Remove {name}?")),
+                )
         }
         Dialog::AddFromInput { .. } => {
             let Some(DialogInputs::AddFromInput { text }) = this.dialog_inputs.as_ref() else {
@@ -5421,10 +5390,20 @@ fn build_gpui_dialog(
         Dialog::ConfirmDeleteUnavailable { count, .. } => {
             let count = *count;
             let e_confirm = entity.clone();
-            let e_cancel = entity.clone();
             dialog
                 .title("Confirmation")
+                .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Remove")
+                        .ok_variant(ButtonVariant::Danger)
+                        .cancel_text("Cancel"),
+                )
                 .w(px(420.))
+                .on_ok(move |_, window, cx| {
+                    e_confirm.update(cx, |t, cx| t.confirm_delete_unavailable(window, cx));
+                    true
+                })
                 .on_cancel({
                     let entity = entity.clone();
                     move |_, _, cx| {
@@ -5436,25 +5415,16 @@ fn build_gpui_dialog(
                     }
                 })
                 .on_close(on_dismiss)
-                .child(confirm_delete_unavailable_body(
-                    count,
-                    move |window, cx| {
-                        e_confirm
-                            .update(cx, |t, cx| t.confirm_delete_unavailable(window, cx));
-                    },
-                    move |window, cx| {
-                        e_cancel.update(cx, |t, cx| {
-                            t.close_dialog();
-                            cx.notify();
-                        });
-                        window.close_all_dialogs(cx);
-                    },
-                ))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().foreground)
+                        .child(format!("Remove {count} unavailable item(s)?")),
+                )
         }
         Dialog::ConfirmUpdateAllSubscriptions => {
             let e_confirm = entity.clone();
-            let e_cancel = entity.clone();
-            // X / Esc / overlay: restore Manage Groups after the confirm layer pops
+            // Esc / Cancel: restore Manage Groups after the confirm layer pops
             // (present on next paint via pending_gpui_dialog — avoid race with close_dialog).
             let restore_manage = {
                 let entity = entity.clone();
@@ -5470,7 +5440,19 @@ fn build_gpui_dialog(
             let restore_manage_cancel = restore_manage.clone();
             dialog
                 .title("Confirmation")
+                .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Yes")
+                        .cancel_text("No"),
+                )
                 .w(px(420.))
+                .on_ok(move |_, window, cx| {
+                    e_confirm.update(cx, |t, cx| {
+                        t.confirm_update_all_subscriptions(window, cx);
+                    });
+                    true
+                })
                 .on_cancel(move |_, window, cx| {
                     restore_manage_cancel(window, cx);
                     true
@@ -5478,22 +5460,16 @@ fn build_gpui_dialog(
                 .on_close(move |_, _, _| {
                     // State already set in on_cancel; paint will present.
                 })
-                .child(confirm_update_all_body(
-                    move |window, cx| {
-                        e_confirm
-                            .update(cx, |t, cx| t.confirm_update_all_subscriptions(window, cx));
-                    },
-                    move |window, cx| {
-                        e_cancel.update(cx, |t, cx| {
-                            t.return_to_manage_groups(window, cx);
-                        });
-                    },
-                ))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().foreground)
+                        .child("Update all subscriptions?"),
+                )
         }
         Dialog::SubscriptionDiff { title, body } => {
             let title = title.clone();
             let body = body.clone();
-            let e_button = entity.clone();
             let restore_manage = {
                 let entity = entity.clone();
                 move |_window: &mut Window, cx: &mut App| {
@@ -5505,20 +5481,23 @@ fn build_gpui_dialog(
                     });
                 }
             };
-            let restore_manage_cancel = restore_manage.clone();
+            let restore_ok = restore_manage.clone();
+            let restore_cancel = restore_manage;
             dialog
                 .title(title)
+                .alert()
+                .button_props(DialogButtonProps::default().ok_text("Close"))
                 .w(px(560.))
+                .on_ok(move |_, window, cx| {
+                    restore_ok(window, cx);
+                    true
+                })
                 .on_cancel(move |_, window, cx| {
-                    restore_manage_cancel(window, cx);
+                    restore_cancel(window, cx);
                     true
                 })
                 .on_close(move |_, _, _| {})
-                .child(subscription_diff_body(&body, move |window, cx| {
-                    e_button.update(cx, |t, cx| {
-                        t.return_to_manage_groups(window, cx);
-                    });
-                }))
+                .child(subscription_diff_body(&body))
         }
         Dialog::RoutingSettings(draft) => {
             let entity_ev = entity.clone();

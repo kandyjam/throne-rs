@@ -8,10 +8,8 @@ use gpui::{
     App, ClickEvent, Entity, KeyDownEvent, SharedString, Window, div, prelude::*, px,
 };
 use gpui_component::{
-    Icon, Sizable as _, Size, h_flex, v_flex,
-    alert::Alert,
+    Icon, Sizable as _, Size, h_flex,
     button::{Button, ButtonVariants as _},
-    divider::Divider,
     input::{Input, InputState},
     switch::Switch,
     tab::{Tab, TabBar},
@@ -23,10 +21,12 @@ use crate::theme::Theme;
 pub const TOOLBAR_BTN_W: f32 = 68.;
 /// Gap between toolbar menu buttons.
 pub const TOOLBAR_BTN_GAP: f32 = 4.;
-/// Top padding of the top bar + button height — menu overlay top edge.
-pub const TOOLBAR_MENU_TOP: f32 = 68.;
-/// Left padding of the top bar.
+/// Top bar: `py_2`(8) + button(52) — dropdown sits flush under the buttons.
+pub const TOOLBAR_MENU_TOP: f32 = 60.;
+/// Left padding of the top bar (`px_3`).
 pub const TOOLBAR_PAD_X: f32 = 12.;
+/// Compact menu row height (tighter than gpui-component PopupMenu's 26px default).
+pub const MENU_ITEM_H: f32 = 22.;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToolbarIcon {
@@ -109,9 +109,9 @@ fn icon_from_path(path: impl Into<SharedString>) -> Icon {
     Icon::default().path(path)
 }
 
-/// Toolbar button. Dropdown content is rendered as a **root-level overlay**
-/// (see `MainWindow::render_toolbar_menu_overlay`) so it is not clipped or
-/// painted under the profile table / group tabs.
+/// Toolbar button. Dropdown content is a compact `menu_panel` rendered as a
+/// root-level overlay (`MainWindow::render_toolbar_menu_overlay`) so it sits
+/// above the profile table / group tabs.
 ///
 /// Layout stays vertical (icon over label) to match upstream Throne chrome;
 /// icon glyph comes from gpui-component [`Icon`].
@@ -158,33 +158,6 @@ pub fn toolbar_btn(
         )
         .child(div().text_xs().text_color(Theme::text()).child(label))
         .on_click(on_toggle)
-}
-
-/// Floating dropdown panel for toolbar menus (absolute, caller sets top/left).
-pub fn toolbar_menu_panel(
-    id: impl Into<SharedString>,
-    top: f32,
-    left: f32,
-    menu: impl IntoElement,
-) -> impl IntoElement {
-    div()
-        .id(id.into())
-        .absolute()
-        .top(px(top))
-        .left(px(left))
-        .min_w(px(230.))
-        .max_h(px(360.))
-        .overflow_y_scroll()
-        .py_1()
-        .px_1()
-        .bg(Theme::bg_elevated())
-        .border_1()
-        .border_color(Theme::border_light())
-        .rounded_md()
-        .shadow_lg()
-        // Capture clicks so they don't fall through to the table.
-        .occlude()
-        .child(menu)
 }
 
 /// Square Start / Stop control — compact icon-only gpui-component [`Button`].
@@ -647,38 +620,6 @@ pub fn dialog_actions(
         .child(primary_btn(ok_id, ok_label, move |_, w, cx| on_ok(w, cx)))
 }
 
-/// Confirm / alert panel body using gpui-component [`Alert`] + action buttons.
-pub fn confirm_panel(
-    alert_id: impl Into<SharedString>,
-    message: impl Into<SharedString>,
-    danger: bool,
-    cancel_id: impl Into<SharedString>,
-    cancel_label: impl Into<SharedString>,
-    ok_id: impl Into<SharedString>,
-    ok_label: impl Into<SharedString>,
-    on_cancel: impl Fn(&mut Window, &mut App) + 'static,
-    on_ok: impl Fn(&mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    let message = message.into();
-    let alert = if danger {
-        Alert::warning(alert_id.into(), message)
-    } else {
-        Alert::info(alert_id.into(), message)
-    };
-
-    v_flex()
-        .gap_3()
-        .child(alert)
-        .child(dialog_actions(
-            cancel_id,
-            cancel_label,
-            ok_id,
-            ok_label,
-            on_cancel,
-            on_ok,
-        ))
-}
-
 /// Status-bar profile label — plain tinted text (no outline chip).
 pub fn status_tag(running: bool, label: impl Into<SharedString>) -> impl IntoElement {
     div()
@@ -692,35 +633,105 @@ pub fn status_tag(running: bool, label: impl Into<SharedString>) -> impl IntoEle
         .child(label.into())
 }
 
-/// Inline notice banner (routing save hints, etc.).
-pub fn notice_banner(id: impl Into<SharedString>, text: impl Into<SharedString>) -> impl IntoElement {
-    Alert::info(id.into(), text.into()).banner().with_size(Size::XSmall)
+/// Inline notice line (routing save hints, etc.) — plain text, not Alert chrome.
+pub fn notice_banner(
+    id: impl Into<SharedString>,
+    text: impl Into<SharedString>,
+) -> impl IntoElement {
+    div()
+        .id(id.into())
+        .w_full()
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .bg(Theme::accent_soft())
+        .text_xs()
+        .text_color(Theme::accent())
+        .child(text.into())
 }
 
-/// Dropdown / context menu row — ghost [`Button`].
+/// Floating dropdown / context panel — solid elevated chrome so it never shows
+/// through to group tabs / table underneath.
+pub fn menu_panel(
+    id: impl Into<SharedString>,
+    min_width: f32,
+    body: impl IntoElement,
+) -> impl IntoElement {
+    div()
+        .id(id.into())
+        .min_w(px(min_width))
+        .py_0p5()
+        .bg(Theme::bg_elevated())
+        .border_1()
+        .border_color(Theme::border_light())
+        .rounded_md()
+        .shadow_lg()
+        .occlude()
+        .child(body)
+}
+
+/// Compact menu row (~22px) — denser than ghost Button / default PopupMenu items.
 pub fn menu_item(
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    Button::new(id.into())
-        .ghost()
-        .label(label)
-        .with_size(Size::Small)
-        .w_full()
-        .justify_start()
+    div()
+        .id(id.into())
+        .h(px(MENU_ITEM_H))
+        .px_2()
+        .flex()
+        .items_center()
+        .text_sm()
+        .text_color(Theme::text())
+        .cursor_pointer()
+        .hover(|s| s.bg(Theme::bg_hover()))
         .on_click(on_click)
+        .child(label.into())
 }
 
-/// Horizontal rule — gpui-component [`Divider`].
+/// Checked-style menu row (active route, etc.).
+pub fn menu_item_checked(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    checked: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let label = label.into();
+    div()
+        .id(id.into())
+        .h(px(MENU_ITEM_H))
+        .px_2()
+        .flex()
+        .items_center()
+        .gap_1()
+        .text_sm()
+        .text_color(if checked {
+            Theme::accent()
+        } else {
+            Theme::text()
+        })
+        .cursor_pointer()
+        .hover(|s| s.bg(Theme::bg_hover()))
+        .on_click(on_click)
+        .child(div().w(px(12.)).child(if checked { "✓" } else { "" }))
+        .child(label)
+}
+
 pub fn menu_separator() -> impl IntoElement {
-    Divider::horizontal().my_1()
+    div()
+        .h(px(1.))
+        .mx_1()
+        .my_0p5()
+        .bg(Theme::border_light())
 }
 
 pub fn menu_label(text: impl Into<SharedString>) -> impl IntoElement {
     div()
-        .px_3()
-        .py_1()
+        .h(px(18.))
+        .px_2()
+        .flex()
+        .items_center()
         .text_xs()
         .text_color(Theme::text_muted())
         .child(text.into())
