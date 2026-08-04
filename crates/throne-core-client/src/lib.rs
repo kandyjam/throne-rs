@@ -28,11 +28,13 @@ pub use sys_proxy::{
     tun_dns_address,
 };
 
-use std::io::{Read, Write};
+use std::collections::VecDeque;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
@@ -206,6 +208,9 @@ fn should_stop_before_start(running_profile: Option<ProfileId>) -> bool {
     running_profile.is_some()
 }
 
+/// Cap for core stdout/stderr lines buffered until the UI drains them.
+const CORE_LOG_BUF_CAP: usize = 2_000;
+
 /// Long-lived core session: IPC server + child process + RPC stream.
 pub struct CoreSession {
     config: CoreConfig,
@@ -218,6 +223,9 @@ pub struct CoreSession {
     next_id: AtomicU32,
     connected: bool,
     running_profile: Option<ProfileId>,
+    /// Lines from ThroneCore stdout/stderr (inbound/outbound connection logs, etc.).
+    /// Reader threads push; UI drains via [`Self::take_core_logs`].
+    core_log_buf: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl CoreSession {
@@ -233,6 +241,7 @@ impl CoreSession {
             next_id: AtomicU32::new(1),
             connected: false,
             running_profile: None,
+            core_log_buf: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -242,6 +251,22 @@ impl CoreSession {
 
     pub fn running_profile_id(&self) -> Option<ProfileId> {
         self.running_profile
+    }
+
+    /// Drain buffered core log lines (sing-box inbound/outbound traffic, errors, …).
+    ///
+    /// Safe to call frequently from the UI poller. Empty when the core is idle
+    /// or no new output arrived since the last drain.
+    pub fn take_core_logs(&self) -> Vec<String> {
+        match self.core_log_buf.lock() {
+            Ok(mut g) => g.drain(..).collect(),
+            Err(poisoned) => poisoned.into_inner().drain(..).collect(),
+        }
+    }
+
+    /// Last `n` core log lines without draining (for error hints).
+    fn core_log_tail(&self, n: usize) -> String {
+        core_log_tail_from(&self.core_log_buf, n)
     }
 
     /// Ensure IPC listener + core process are up and RPC is connected.
@@ -322,23 +347,24 @@ impl CoreSession {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         // Parentcheck expects real parent PID = this process (named Throne).
-        let child = cmd.spawn().map_err(|e| {
+        let mut child = cmd.spawn().map_err(|e| {
             CoreError::Spawn(format!(
                 "{e} — tried {} (ensure GUI binary is named Throne and core sits beside it)",
                 bin.display()
             ))
         })?;
+        // Stream stdout/stderr immediately so (1) UI gets inbound/outbound traffic
+        // logs like upstream Qt Throne and (2) pipe buffers cannot block the core.
+        start_core_log_readers(&mut child, &self.core_log_buf);
         self.child = Some(child);
 
         // Wait for core to connect (up to ~8s, matching core's 10×500ms retries)
         let deadline = Instant::now() + Duration::from_secs(8);
         let stream = loop {
             if Instant::now() > deadline {
-                let hint = self
-                    .child
-                    .as_mut()
-                    .map(read_child_stderr)
-                    .unwrap_or_default();
+                // Brief wait so reader threads can flush final lines.
+                std::thread::sleep(Duration::from_millis(50));
+                let hint = self.core_log_tail(30);
                 self.shutdown_inner();
                 return Err(CoreError::Rpc(format!(
                     "timeout waiting for core IPC. {hint}"
@@ -347,7 +373,8 @@ impl CoreSession {
             // Reap early exit
             if let Some(child) = self.child.as_mut() {
                 if let Ok(Some(status)) = child.try_wait() {
-                    let stderr = read_child_stderr(child);
+                    std::thread::sleep(Duration::from_millis(50));
+                    let stderr = self.core_log_tail(40);
                     self.shutdown_inner();
                     let hint = if stderr.contains("parent check") {
                         "\nHint: GUI binary must be named `Throne` and ThroneCore must be in the same folder (upstream parentcheck)."
@@ -881,17 +908,18 @@ impl CoreSession {
 
         // Read response header 9 bytes
         let mut header = [0u8; 9];
+        // Clone Arc so the error closure does not re-borrow `self` while `stream` is live.
+        let log_buf = Arc::clone(&self.core_log_buf);
         stream.read_exact(&mut header).map_err(|e| {
             self.connected = false;
             // Connection drop mid-call usually means the Go core panicked
             // (historically: nil optional bool on LoadConfigReq).
-            let tail = self
-                .child
-                .as_mut()
-                .map(read_child_stderr)
-                .filter(|s| !s.is_empty())
-                .map(|s| format!(" · core: {s}"))
-                .unwrap_or_default();
+            let t = core_log_tail_from(&log_buf, 20);
+            let tail = if t.is_empty() {
+                String::new()
+            } else {
+                format!(" · core: {t}")
+            };
             CoreError::Rpc(format!("read header: {e}{tail}"))
         })?;
         let resp_id = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
@@ -1072,6 +1100,96 @@ fn clear_quarantine(path: &Path) {
     let _ = path;
 }
 
+/// Spawn background threads that funnel core stdout/stderr into `buf` line-by-line.
+///
+/// Must run immediately after `Command::spawn` while pipes are still attached.
+/// Dropping the child (or process exit) closes the pipes and ends the threads.
+fn start_core_log_readers(child: &mut Child, buf: &Arc<Mutex<VecDeque<String>>>) {
+    if let Some(stdout) = child.stdout.take() {
+        spawn_pipe_reader("throne-core-stdout", stdout, Arc::clone(buf));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        spawn_pipe_reader("throne-core-stderr", stderr, Arc::clone(buf));
+    }
+}
+
+fn spawn_pipe_reader(
+    name: &str,
+    pipe: impl Read + Send + 'static,
+    buf: Arc<Mutex<VecDeque<String>>>,
+) {
+    let _ = std::thread::Builder::new().name(name.into()).spawn(move || {
+        let reader = BufReader::new(pipe);
+        for line in reader.lines() {
+            match line {
+                Ok(raw) => {
+                    if let Some(msg) = normalize_core_log_line(&raw) {
+                        push_core_log_line(&buf, msg);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+/// Trim noise from a core log line. Returns `None` for empty / pure whitespace.
+fn normalize_core_log_line(raw: &str) -> Option<String> {
+    let line = raw.trim_end_matches(['\r', '\n']).trim();
+    if line.is_empty() {
+        return None;
+    }
+    // Go standard logger prefixes `yyyy/mm/dd HH:MM:SS ` — keep the message body
+    // when present so the UI timestamp is the single clock.
+    let body = strip_go_std_log_prefix(line);
+    let body = body.trim();
+    if body.is_empty() {
+        None
+    } else {
+        Some(body.to_string())
+    }
+}
+
+fn strip_go_std_log_prefix(line: &str) -> &str {
+    // "2006/01/02 15:04:05 message"
+    let bytes = line.as_bytes();
+    if bytes.len() > 20
+        && bytes[4] == b'/'
+        && bytes[7] == b'/'
+        && bytes[10] == b' '
+        && bytes[13] == b':'
+        && bytes[16] == b':'
+        && bytes[19] == b' '
+    {
+        return &line[20..];
+    }
+    line
+}
+
+fn push_core_log_line(buf: &Arc<Mutex<VecDeque<String>>>, msg: String) {
+    let Ok(mut g) = buf.lock() else {
+        return;
+    };
+    g.push_back(msg);
+    while g.len() > CORE_LOG_BUF_CAP {
+        g.pop_front();
+    }
+}
+
+fn core_log_tail_from(buf: &Arc<Mutex<VecDeque<String>>>, n: usize) -> String {
+    let g = match buf.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if g.is_empty() || n == 0 {
+        return String::new();
+    }
+    let skip = g.len().saturating_sub(n);
+    g.iter().skip(skip).cloned().collect::<Vec<_>>().join("\n")
+}
+
+/// Read leftover stdout/stderr only after the child has exited (tests / fallback).
+#[cfg(test)]
 fn read_child_stderr(child: &mut Child) -> String {
     // Reading a piped stream to EOF blocks while the core is still alive. RPC
     // timeouts must return promptly, matching the upstream client behavior.
@@ -1177,6 +1295,48 @@ mod tests {
         let short = format_core_error(raw);
         assert!(short.contains("legacy inbound"), "got: {short}");
         assert!(!short.contains("\"sniff\""), "should drop JSON blob: {short}");
+    }
+
+    #[test]
+    fn normalize_core_log_keeps_inbound_outbound_lines() {
+        let line = normalize_core_log_line(
+            "INFO[0001] [1234567890] inbound/mixed[mixed-in]: inbound connection from 127.0.0.1:54321",
+        )
+        .expect("line");
+        assert!(line.contains("inbound/mixed"));
+        assert!(line.contains("inbound connection"));
+
+        let out = normalize_core_log_line(
+            "INFO[0001] [1234567890] outbound/direct[direct]: outbound connection to apple.com:443",
+        )
+        .expect("line");
+        assert!(out.contains("outbound/direct"));
+        assert!(out.contains("apple.com"));
+    }
+
+    #[test]
+    fn normalize_core_log_strips_go_std_prefix() {
+        let line = normalize_core_log_line("2026/08/04 15:30:01 Start: {\"log\":{}}").expect("line");
+        assert_eq!(line, "Start: {\"log\":{}}");
+        assert!(normalize_core_log_line("   \n").is_none());
+    }
+
+    #[test]
+    fn take_core_logs_drains_buffer() {
+        let session = CoreSession::new(CoreConfig::default());
+        push_core_log_line(
+            &session.core_log_buf,
+            "inbound/mixed[mixed-in]: inbound connection from 127.0.0.1:1".into(),
+        );
+        push_core_log_line(
+            &session.core_log_buf,
+            "outbound/proxy[proxy]: outbound connection to example.com:443".into(),
+        );
+        let first = session.take_core_logs();
+        assert_eq!(first.len(), 2);
+        assert!(first[0].contains("inbound"));
+        assert!(first[1].contains("outbound"));
+        assert!(session.take_core_logs().is_empty());
     }
 
     #[test]

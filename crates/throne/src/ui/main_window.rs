@@ -1332,15 +1332,54 @@ impl MainWindow {
                 }
                 self.close_dialog();
                 let _ = self.persist_db();
-                self.state.set_status_message("Routing settings saved");
+                // Route rules / DNS are compiled only at Start — bounce if live.
+                self.state.push_log("Routing settings saved");
+                self.reload_core_for_route_change("Routing settings saved", cx);
             }
             Err(e) => {
                 if let Dialog::RoutingSettings(d) = &mut self.dialog {
                     d.notice = e.to_string();
                 }
+                cx.notify();
             }
         }
-        cx.notify();
+    }
+
+    /// Rebuild core config after route profile edits or active-route switches.
+    ///
+    /// Upstream reloads on route change; we Stop→Start so Direct/Proxy `suffix:`
+    /// rules take effect without a manual restart.
+    fn reload_core_for_route_change(&mut self, reason: &str, cx: &mut Context<Self>) {
+        let live = self.state.core_status().is_running()
+            || matches!(self.state.core_status(), CoreStatus::Starting)
+            || self.core_op_busy;
+        if !live {
+            self.state
+                .set_status_message_only(format!("{reason} (apply on next Start)"));
+            cx.notify();
+            return;
+        }
+        if should_queue_recovery_restart(self.network_recovery_busy) {
+            self.restart_when_idle = true;
+            self.state
+                .set_status_message_only(format!("{reason} · restart queued (restoring network)…"));
+            cx.notify();
+            return;
+        }
+        if self.state.core_status().is_running()
+            || matches!(self.state.core_status(), CoreStatus::Starting)
+        {
+            self.restart_when_idle = true;
+            self.state
+                .set_status_message_only(format!("{reason} · restarting core…"));
+            self.stop_proxy(cx);
+        } else {
+            // Stop/start already in flight — apply when idle.
+            self.restart_when_idle = true;
+            self.state
+                .set_status_message_only(format!("{reason} · restart queued…"));
+            cx.notify();
+        }
     }
 
     /// Import route text into the open routing draft. Returns true if handled.
@@ -2150,11 +2189,15 @@ impl MainWindow {
                         }
                         this.state.set_status_message_only(msg);
                         let _ = this.persist_db();
+                        // Flush any Start-time core lines (sing-box boot + first dials).
+                        let _ = this.drain_core_logs_into_ui();
                     }
                     Err(e) => {
                         this.state.set_core_status(CoreStatus::Error(e.clone()));
                         this.state
                             .set_status_message_only(format!("Start failed: {e}"));
+                        // Surface core decode / panic lines even on failed Start.
+                        let _ = this.drain_core_logs_into_ui();
                     }
                 }
                 if this.restart_when_idle {
@@ -2838,8 +2881,31 @@ impl MainWindow {
         .detach();
     }
 
+    /// Move buffered ThroneCore stdout/stderr lines into the Logs panel.
+    /// Returns true when at least one line was appended.
+    fn drain_core_logs_into_ui(&mut self) -> bool {
+        let lines = match self.core.lock() {
+            Ok(guard) => guard.take_core_logs(),
+            Err(_) => return false,
+        };
+        if lines.is_empty() {
+            return false;
+        }
+        for line in lines {
+            self.state.push_log_only(line);
+        }
+        true
+    }
+
     fn poll_core_runtime(&mut self, cx: &mut Context<Self>) {
+        // Always pull core stdout/stderr so Logs shows inbound/outbound traffic
+        // like upstream, and so pipe buffers cannot block ThroneCore.
+        let logs_changed = self.drain_core_logs_into_ui();
+
         if !self.state.core_status().is_running() || self.core_op_busy || self.runtime_poll_busy {
+            if logs_changed {
+                cx.notify();
+            }
             return;
         }
         self.runtime_poll_busy = true;
@@ -2853,13 +2919,15 @@ impl MainWindow {
                     let mut guard = core
                         .lock()
                         .map_err(|_| "core session lock poisoned".to_string())?;
+                    // Drain logs under the same lock so lines stay ordered with stats.
+                    let core_logs = guard.take_core_logs();
                     let stats = guard.query_stats().map_err(|error| error.to_string())?;
                     let conns = if want_conn {
                         guard.query_connections().unwrap_or_default()
                     } else {
                         Vec::new()
                     };
-                    Ok::<_, String>((stats, conns))
+                    Ok::<_, String>((stats, conns, core_logs))
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -2871,7 +2939,12 @@ impl MainWindow {
                     runtime_poll_health(this.runtime_poll_failures, snap.is_ok());
                 this.runtime_poll_failures = failures;
                 match snap {
-                    Ok((cum, conns)) => {
+                    Ok((cum, conns, core_logs)) => {
+                        let mut logs_changed = false;
+                        for line in core_logs {
+                            this.state.push_log_only(line);
+                            logs_changed = true;
+                        }
                         let now = std::time::Instant::now();
                         let rates = if let Some(prev_at) = this.prev_traffic_at {
                             let dt = now.duration_since(prev_at).as_secs_f64().max(0.4);
@@ -2894,7 +2967,7 @@ impl MainWindow {
                         if want_conn {
                             this.connections = conns;
                         }
-                        if traffic_changed || want_conn {
+                        if traffic_changed || want_conn || logs_changed {
                             cx.notify();
                         }
                     }
@@ -2945,9 +3018,42 @@ impl MainWindow {
 
     fn cycle_route(&mut self, cx: &mut Context<Self>) {
         self.close_menus();
+        let prev = self.state.active_route().map(|r| r.id);
         self.state.cycle_active_route();
         let _ = self.persist_db();
-        cx.notify();
+        let next = self.state.active_route().map(|r| r.id);
+        if prev != next {
+            let label = self
+                .state
+                .active_route()
+                .map(|r| r.name.clone())
+                .unwrap_or_else(|| "route".into());
+            self.reload_core_for_route_change(&format!("Active route · {label}"), cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn select_active_route(&mut self, id: i64, cx: &mut Context<Self>) {
+        let prev = self.state.active_route().map(|r| r.id);
+        if prev == Some(id) {
+            self.close_menus();
+            cx.notify();
+            return;
+        }
+        if self.state.set_active_route(id).is_err() {
+            self.close_menus();
+            cx.notify();
+            return;
+        }
+        let _ = self.persist_db();
+        self.close_menus();
+        let label = self
+            .state
+            .active_route()
+            .map(|r| r.name.clone())
+            .unwrap_or_else(|| "route".into());
+        self.reload_core_for_route_change(&format!("Active route · {label}"), cx);
     }
 
     fn set_vpn(&mut self, on: bool, cx: &mut Context<Self>) {
@@ -3760,10 +3866,7 @@ impl MainWindow {
                             active,
                             move |_, _, cx| {
                                 e.update(cx, |t, cx| {
-                                    let _ = t.state.set_active_route(id);
-                                    let _ = t.persist_db();
-                                    t.close_menus();
-                                    cx.notify();
+                                    t.select_active_route(id, cx);
                                 });
                             },
                         ));

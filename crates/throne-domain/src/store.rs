@@ -90,7 +90,8 @@ pub struct AppState {
     next_route_id: i64,
 }
 
-const LOG_HISTORY_CAP: usize = 300;
+/// Ring buffer for Logs panel. Sized for core traffic (inbound/outbound) lines.
+const LOG_HISTORY_CAP: usize = 1_000;
 
 impl Default for AppState {
     fn default() -> Self {
@@ -204,19 +205,35 @@ impl AppState {
         if msg.is_empty() {
             return;
         }
+        self.append_log_line(&msg);
+        self.status_message = msg;
+    }
+
+    /// Append log line(s) without touching the status strip.
+    ///
+    /// Used for high-volume core traffic (inbound/outbound connection) logs so
+    /// the status bar is not overwritten on every connection.
+    pub fn push_log_only(&mut self, msg: impl Into<String>) {
+        let msg = msg.into();
+        if msg.is_empty() {
+            return;
+        }
+        self.append_log_line(&msg);
+    }
+
+    fn append_log_line(&mut self, msg: &str) {
         // Dedupe consecutive identical messages (ignore timestamp prefix).
         let dup = self
             .log_lines
             .back()
-            .and_then(|s| s.split_once("] ").map(|(_, body)| body == msg.as_str()))
+            .and_then(|s| s.split_once("] ").map(|(_, body)| body == msg))
             .unwrap_or(false);
         if !dup {
-            self.log_lines.push_back(format_log_line(&msg));
+            self.log_lines.push_back(format_log_line(msg));
             while self.log_lines.len() > LOG_HISTORY_CAP {
                 self.log_lines.pop_front();
             }
         }
-        self.status_message = msg;
     }
 
     pub fn clear_logs(&mut self) {
@@ -1749,6 +1766,24 @@ mod tests {
 
         assert_eq!(state.status_message(), "Running [Tun]");
         assert_eq!(state.logs_text(), logs_before);
+    }
+
+    #[test]
+    fn push_log_only_appends_without_changing_status() {
+        let mut state = AppState::empty();
+        state.set_status_message_only("Running [System Proxy]");
+        state.push_log_only(
+            "inbound/mixed[mixed-in]: inbound connection from 127.0.0.1:12345",
+        );
+        state.push_log_only(
+            "outbound/direct[direct]: outbound connection to apple.com:443",
+        );
+
+        assert_eq!(state.status_message(), "Running [System Proxy]");
+        let logs = state.logs_text();
+        assert!(logs.contains("inbound/mixed"));
+        assert!(logs.contains("outbound/direct"));
+        assert!(logs.contains("apple.com"));
     }
 
     #[test]
