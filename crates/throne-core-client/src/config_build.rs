@@ -32,8 +32,9 @@ pub fn build_load_config(
     route_profile: Option<&RouteProfile>,
 ) -> Result<BuiltConfig, CoreError> {
     let outbound = build_proxy_outbound(profile)?;
-    // Always bind mixed inbound on IPv4 loopback for system-proxy compatibility.
-    // Upstream often stores `::`; browsers + networksetup use 127.0.0.1.
+    // Upstream `buildInboundSection`: mixed inbound listen = settings.inbound_address
+    // as-is. Tray "Allow other devices to connect" sets `::` (or user sets
+    // `0.0.0.0`); system-proxy *clients* still use loopback via `proxy_client_host`.
     let listen = normalize_listen_address(&settings.inbound_address);
     let port = settings.inbound_socks_port.clamp(1, 65535) as u16;
     let log_level = if settings.log_level.trim().is_empty() {
@@ -674,13 +675,21 @@ fn is_plausible_ipv4_cidr(s: &str) -> bool {
     parts.iter().all(|p| p.parse::<u8>().is_ok())
 }
 
+/// Normalize mixed-inbound listen host for sing-box.
+///
+/// Upstream passes `inbound_address` through unchanged. We only rewrite empty /
+/// hostname placeholders so a missing value still binds loopback. Explicit
+/// `::` / `0.0.0.0` (Allow LAN) and other IPs are preserved.
 fn normalize_listen_address(addr: &str) -> String {
     match addr.trim() {
-        "" | "*" | "::" | "[::]" | "::0" | "localhost" => "127.0.0.1".into(),
-        value => value
-            .parse::<std::net::IpAddr>()
-            .map(|ip| ip.to_string())
-            .unwrap_or_else(|_| "127.0.0.1".into()),
+        "" | "localhost" => "127.0.0.1".into(),
+        "*" => "0.0.0.0".into(),
+        value => {
+            let bare = value.trim_start_matches('[').trim_end_matches(']');
+            bare.parse::<std::net::IpAddr>()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|_| "127.0.0.1".into())
+        }
     }
 }
 
@@ -1503,8 +1512,7 @@ mod tests {
             sni: Some("example.com".into()),
             ..Default::default()
         };
-        let mut settings = AppSettings::default();
-        settings.inbound_address = "::".into(); // upstream default on some installs
+        let settings = AppSettings::default(); // inbound 127.0.0.1
         let built = build_load_config(&p, &settings, None).unwrap();
         let v: Value = serde_json::from_str(&built.core_config_json).unwrap();
         assert_eq!(v["inbounds"][0]["listen_port"], 2080);
@@ -1528,7 +1536,6 @@ mod tests {
         assert_eq!(v["dns"]["final"], "local");
         assert_eq!(v["route"]["default_domain_resolver"]["server"], "local");
         assert_eq!(v["route"]["rules"][0]["action"], "sniff");
-        assert_eq!(v["inbounds"][0]["listen"], "127.0.0.1");
         // Default route: private → direct
         let rules = v["route"]["rules"].as_array().unwrap();
         assert!(
@@ -1549,12 +1556,25 @@ mod tests {
             uuid: Some("11111111-1111-1111-1111-111111111111".into()),
             ..Default::default()
         };
-        let mut settings = AppSettings::default();
-        settings.inbound_address = "0.0.0.0".into();
 
+        // Tray "Allow other devices to connect" → `::` (current upstream).
+        let mut settings = AppSettings::default();
+        settings.inbound_address = "::".into();
+        let config = build_load_config(&profile, &settings, None).unwrap();
+        let value: Value = serde_json::from_str(&config.core_config_json).unwrap();
+        assert_eq!(value["inbounds"][0]["listen"], "::");
+
+        // Manual Basic Settings / older Allow LAN → `0.0.0.0`.
+        settings.inbound_address = "0.0.0.0".into();
         let config = build_load_config(&profile, &settings, None).unwrap();
         let value: Value = serde_json::from_str(&config.core_config_json).unwrap();
         assert_eq!(value["inbounds"][0]["listen"], "0.0.0.0");
+
+        // Bracketed IPv6 form also accepted.
+        settings.inbound_address = "[::]".into();
+        let config = build_load_config(&profile, &settings, None).unwrap();
+        let value: Value = serde_json::from_str(&config.core_config_json).unwrap();
+        assert_eq!(value["inbounds"][0]["listen"], "::");
     }
 
     #[test]

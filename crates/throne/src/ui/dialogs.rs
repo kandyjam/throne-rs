@@ -264,7 +264,7 @@ pub fn basic_settings_body(
         .flex()
         .flex_col()
         .child(section_hint(
-            "Basic Settings · LAN: set Inbound address to 0.0.0.0, then restart (no auth)",
+            "Basic Settings · Allow LAN: set Inbound to :: or 0.0.0.0 (or tray toggle), then restart · no auth",
         ))
         .child(input_field_row("Inbound address", inbound_address, 150.))
         .child(input_field_row("Mixed / SOCKS port", inbound_port, 150.))

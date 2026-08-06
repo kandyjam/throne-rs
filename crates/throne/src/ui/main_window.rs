@@ -1898,6 +1898,9 @@ impl MainWindow {
         cx.notify();
     }
 
+    /// Upstream `actionAllow_LAN`: toggle mixed inbound between `::` (LAN) and
+    /// `127.0.0.1` (loopback only), persist, refresh tray check, then if a
+    /// profile is running ask-equivalent restart so the new listen takes effect.
     pub(crate) fn tray_toggle_allow_lan(&mut self, cx: &mut Context<Self>) {
         let allow = !crate::tray::allow_lan_from_address(&self.state.settings().inbound_address);
         let addr = crate::tray::inbound_address_for_allow_lan(allow).to_string();
@@ -1915,13 +1918,23 @@ impl MainWindow {
             s.adblock_enable,
         );
         let _ = self.persist_db();
-        self.state.set_status_message_only(if allow {
+        let msg = if allow {
             "Allow other devices to connect: on (inbound ::)"
         } else {
             "Allow other devices to connect: off (127.0.0.1)"
-        });
+        };
         self.sync_tray_menu();
-        cx.notify();
+        // Upstream UpdateSettings + "Settings changed, restart proxy?" when
+        // started_id >= 0. Auto-restart here (same path as route changes).
+        if self.state.core_status().is_running()
+            || matches!(self.state.core_status(), CoreStatus::Starting)
+            || self.core_op_busy
+        {
+            self.reload_core_for_route_change(msg, cx);
+        } else {
+            self.state.set_status_message_only(msg);
+            cx.notify();
+        }
     }
 
     pub(crate) fn tray_set_system_proxy(&mut self, on: bool, cx: &mut Context<Self>) {

@@ -640,14 +640,16 @@ impl AppState {
     }
 
     /// Inbound summary for `label_inbound`.
+    ///
+    /// Upstream: `Mixed: {DisplayAddress(inbound_address, port)}` — show the
+    /// stored listen host, including `::` / `0.0.0.0` when Allow LAN is on.
+    /// IPv6 hosts are bracket-wrapped (`[::]:2080`) like `WrapIPV6Host`.
     pub fn inbound_label(&self) -> String {
         let s = &self.settings;
-        // Match core bind (loopback), not stored `::` from upstream DB.
-        let addr = match s.inbound_address.trim() {
-            "" | "*" | "::" | "[::]" | "::0" | "localhost" => "127.0.0.1",
-            other => other,
-        };
-        format!("Mixed: {addr}:{}", s.inbound_socks_port)
+        let raw = s.inbound_address.trim();
+        let host = if raw.is_empty() { "127.0.0.1" } else { raw };
+        let display = display_listen_address(host, s.inbound_socks_port);
+        format!("Mixed: {display}")
     }
 
     /// Speed lines for `label_speed`.
@@ -1714,6 +1716,17 @@ fn human_rate(bytes: i64) -> String {
     }
 }
 
+/// Upstream `DisplayAddress` / `WrapIPV6Host` for status bar inbound label.
+fn display_listen_address(host: &str, port: i32) -> String {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let wrapped = match bare.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(ip)) => format!("[{ip}]"),
+        Ok(std::net::IpAddr::V4(ip)) => ip.to_string(),
+        Err(_) => host.to_string(),
+    };
+    format!("{wrapped}:{port}")
+}
+
 fn format_log_line(msg: &str) -> String {
     format_log_line_at(chrono::Local::now(), msg)
 }
@@ -1959,6 +1972,19 @@ mod tests {
         assert_eq!(s.settings().log_level, "info");
         assert_eq!(s.settings().ruleset_mirror, crate::models::RulesetMirror::Github);
         assert!(s.settings().adblock_enable);
+    }
+
+    #[test]
+    fn inbound_label_shows_allow_lan_addresses() {
+        let mut s = AppState::with_demo_data();
+        assert_eq!(s.inbound_label(), "Mixed: 127.0.0.1:2080");
+
+        s.settings_mut().inbound_address = "::".into();
+        assert_eq!(s.inbound_label(), "Mixed: [::]:2080");
+
+        s.settings_mut().inbound_address = "0.0.0.0".into();
+        s.settings_mut().inbound_socks_port = 1080;
+        assert_eq!(s.inbound_label(), "Mixed: 0.0.0.0:1080");
     }
 
     #[test]
