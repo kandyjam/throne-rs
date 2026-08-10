@@ -1318,12 +1318,13 @@ mod tests {
             ..Default::default()
         };
         let built = build_load_config(&p, &AppSettings::default(), None).unwrap();
-        let bytes = proto_wire::encode_load_config_req(
+        let bytes = proto_wire::encode_load_config_req_ex(
             &built.core_config_json,
             false,
             false,
             "",
             &built.tun_ipv4_cidr,
+            &proto_wire::LoadConfigExtras::default(),
         );
         assert!(bytes.len() > 10);
     }

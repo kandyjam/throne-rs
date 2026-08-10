@@ -22,24 +22,8 @@ pub struct LoadConfigExtras {
 /// Important: upstream Go core dereferences optional bool pointers with `*in.NeedXray`
 /// etc. (not getters). Unset fields are nil and **panic**, which drops the IPC
 /// socket mid-call. Always encode every bool we might touch on the Start path.
-pub fn encode_load_config_req(
-    core_config: &str,
-    disable_stats: bool,
-    need_xray: bool,
-    xray_config: &str,
-    tun_ipv4_cidr: &str,
-) -> Vec<u8> {
-    encode_load_config_req_ex(
-        core_config,
-        disable_stats,
-        need_xray,
-        xray_config,
-        tun_ipv4_cidr,
-        &LoadConfigExtras::default(),
-    )
-}
-
-/// Full Start payload including Auto Selector / Xray full-config fields (1.2.4).
+///
+/// Pass [`LoadConfigExtras::default()`] when no Xray full-config / lazy fields apply.
 pub fn encode_load_config_req_ex(
     core_config: &str,
     disable_stats: bool,
@@ -924,14 +908,21 @@ mod tests {
 
     #[test]
     fn encode_load_has_core_config() {
-        let b = encode_load_config_req(r#"{"log":{}}"#, false, false, "", "");
+        let b = encode_load_config_req_ex(
+            r#"{"log":{}}"#,
+            false,
+            false,
+            "",
+            "",
+            &LoadConfigExtras::default(),
+        );
         assert!(!b.is_empty());
         assert_eq!(b[0], 0x0a);
     }
 
     #[test]
     fn encode_load_always_includes_bool_fields() {
-        let b = encode_load_config_req("{}", false, false, "", "");
+        let b = encode_load_config_req_ex("{}", false, false, "", "", &LoadConfigExtras::default());
         assert!(
             b.contains(&0x18),
             "need_extra_process must be encoded: {b:02x?}"
@@ -941,7 +932,14 @@ mod tests {
 
     #[test]
     fn encode_load_includes_tun_ipv4_cidr() {
-        let b = encode_load_config_req("{}", false, false, "", "172.19.0.1/24");
+        let b = encode_load_config_req_ex(
+            "{}",
+            false,
+            false,
+            "",
+            "172.19.0.1/24",
+            &LoadConfigExtras::default(),
+        );
         // field 11 string tag = (11 << 3) | 2 = 0x5a
         assert!(
             b.contains(&0x5a),
