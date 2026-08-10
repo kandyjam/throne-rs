@@ -2,9 +2,9 @@
 
 Remote: `upstream` → `https://github.com/throneproj/Throne.git`  
 Baseline branch: `upstream/dev`  
-**Target release (this audit):** tag **`1.2.4`** (`33777e27` — Improve tab navigation in profile editor dialogs)  
-Last local `upstream/dev` tip at audit: `ed2fdde2` (*update naiveproxy…*) — describe `1.2.4-1-ged2fdde2`.  
-**Product version:** `1.2.4` (root [`VERSION`](../VERSION) + workspace Cargo version = upstream release tag / `NKR_VERSION`)
+**Target release (this audit):** tag **`1.2.4`** (`33777e27`) — **tag `1.2.5` does not exist yet** on GitHub (no release, no tag as of 2026-08-10 audit).  
+Last local `upstream/dev` tip at audit: `ed2fdde2` (*update naiveproxy to v150.0.7871.63-1*) — describe `1.2.4-1-ged2fdde2`.  
+**Product version:** `1.2.4` (root [`VERSION`](../VERSION) + workspace Cargo version = latest **released** upstream tag / `NKR_VERSION`). Do **not** invent `1.2.5` until upstream tags it.
 
 Agent skill for ongoing parity work: [`skills/throne-upstream-parity/SKILL.md`](../skills/throne-upstream-parity/SKILL.md).
 
@@ -17,6 +17,8 @@ git log --oneline upstream/dev -50
 git log --oneline <last-audited>..upstream/dev
 # vs release
 git log --oneline 1.2.3..1.2.4
+# when 1.2.5 lands:
+git log --oneline 1.2.4..1.2.5
 ```
 
 ## Feature parity matrix
@@ -83,6 +85,15 @@ Status legend: ✅ done · 🧩 partial · ⏳ planned · ❌ out of scope (Go c
 5. **Wave B+** — HTTP sub ✅; remote route fetch ✅; full Clash option parity / OS deeplink registration  
 6. **Wave 1.2.3** — version pin · Auto Selector create/plan/Start · multi-file import · Program menu · core + stats dialog ✅  
 7. **Wave 1.2.4** — version pin · core sync (egress, xray full gates, DNS quiet) · Auto Selector Xray full · Tun exclude hole · sub kept-in-use ✅  
+8. **Wave 1.2.5 (pending upstream tag)** — only tip commit so far: naiveproxy/cronet-go bump ✅ in `core/server/go.mod`+`go.sum`; product version stays 1.2.4  
+
+## Commit triage notes (1.2.4 → tip / pre-1.2.5)
+
+| SHA | Summary | Action |
+|-----|---------|--------|
+| `ed2fdde2` | update naiveproxy to v150.0.7871.63-1 (`cronet-go` replace + platform libs) | ✅ `core/server/go.mod` + `go.sum` synced from tip |
+
+No GUI/RPC/proto changes. Re-audit when upstream tags **1.2.5**.
 
 ## Commit triage notes (1.2.3 → 1.2.4)
 

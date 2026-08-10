@@ -4,7 +4,7 @@ description: >-
   Track and close feature gaps between throne-rs (Rust/GPUI rewrite) and
   upstream throneproj/Throne. Use when aligning versions, auditing parity,
   implementing missing upstream features, or refreshing docs/UPSTREAM_TRACKING.md.
-  Triggers: 对齐原版, upstream parity, 1.2.x, 1.2.4, throneproj/Throne, Auto Selector,
+  Triggers: 对齐原版, upstream parity, 1.2.x, 1.2.4, 1.2.5, throneproj/Throne, Auto Selector,
   feature gap, NKR_VERSION, UPSTREAM_TRACKING, Xray full config, Tun DNS.
 ---
 
@@ -20,11 +20,14 @@ Keep **throne-rs** (`rewrite/rust-gpui`) behaviorally aligned with
 | Upstream remote | `upstream` → `https://github.com/throneproj/Throne.git` |
 | Baseline branch | `upstream/dev` (or a release tag e.g. `1.2.4`) |
 | **Current pin** | tag **`1.2.4`** (`33777e27`) |
-| Product version | root [`VERSION`](../../VERSION) + workspace `Cargo.toml` `version` (= upstream `NKR_VERSION` / release tag) |
+| **Tip tracked** | `upstream/dev` @ `ed2fdde2` (`1.2.4-1-g…`, naiveproxy only) |
+| **1.2.5** | **Not released** (no tag / no GitHub release as of 2026-08-10). Do not bump product version to 1.2.5 until upstream tags it. |
+| Product version | root [`VERSION`](../../VERSION) + workspace `Cargo.toml` `version` (= latest **released** upstream tag / `NKR_VERSION`) |
 | Parity matrix | [`docs/UPSTREAM_TRACKING.md`](../../docs/UPSTREAM_TRACKING.md) |
 | This rewrite | branch `rewrite/rust-gpui`, crates under `crates/` |
 
 **Do not** treat historical `4.x` tags as current product line; they are ancestors.
+**Do not** invent the next release number when the tag is missing — port tip commits under the current pin and re-pin when the tag appears.
 
 ### Refresh upstream
 
@@ -87,6 +90,16 @@ When moving e.g. `1.2.3` → `1.2.4`:
 - [ ] This skill’s “Current pin” row + feature notes section
 
 Packaging scripts already read root `VERSION`.
+
+## Pre-1.2.5 tip (not a release)
+
+`1.2.4..upstream/dev` as of audit:
+
+| SHA | Summary | Status |
+|-----|---------|--------|
+| `ed2fdde2` | naiveproxy v150 / `cronet-go` replace bump | ✅ `core/server/go.mod` + `go.sum` |
+
+When **1.2.5** is tagged: `git log --oneline 1.2.4..1.2.5` → triage → bump `VERSION` + skill pin + matrix.
 
 ## 1.2.4 feature notes (current pin)
 
