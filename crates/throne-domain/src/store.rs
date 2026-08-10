@@ -47,6 +47,8 @@ pub struct SubscriptionUpdateReport {
     pub added: Vec<SubscriptionChange>,
     pub updated: Vec<SubscriptionChange>,
     pub deleted: Vec<SubscriptionChange>,
+    /// Running profiles kept because they are still in use (upstream 1.2.4 #1753).
+    pub kept_in_use: Vec<SubscriptionChange>,
     pub unchanged: usize,
     pub result_order: Vec<ProfileId>,
 }
@@ -1703,9 +1705,15 @@ impl AppState {
 
         if let Some(running_id) = protected_running_id {
             if !retained.contains(&running_id) {
+                // Remote snapshot dropped the running profile; keep it so Start
+                // state and Auto Selector pools stay consistent (#1753 / 1.2.4).
                 retained.insert(running_id);
                 report.result_order.push(running_id);
-                report.unchanged += 1;
+                if let Some(profile) = self.profiles.get(&running_id) {
+                    report.kept_in_use.push(subscription_change(profile));
+                } else {
+                    report.unchanged += 1;
+                }
             }
         }
 

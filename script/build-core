@@ -38,11 +38,33 @@ echo "==> generating gen/ from libcore.proto"
     libcore.proto
 )
 
+# Match upstream throneproj/Throne `script/build_go.sh` (tag 1.2.4).
+# Base tags + platform extras. Override with THRONE_CORE_TAGS=...
+if [[ -n "${THRONE_CORE_TAGS:-}" ]]; then
+  TAGS="$THRONE_CORE_TAGS"
+else
+  TAGS="with_clash_api,with_gvisor,with_quic,with_wireguard,with_utls,with_dhcp,with_tailscale,badlinkname,tfogo_checklinkname0"
+  case "$(uname -s)" in
+    Darwin|Linux) TAGS+=",with_naive_outbound" ;;
+  esac
+fi
+
 mkdir -p "$OUT_DIR"
 echo "==> building ThroneCore → $OUT_BIN"
+echo "    tags: $TAGS"
 (
   cd "$CORE_DIR"
-  go build -trimpath -ldflags="-s -w" -o "$OUT_BIN" .
+  VERSION_SINGBOX="$(go list -m -f '{{.Version}}' github.com/sagernet/sing-box 2>/dev/null || true)"
+  LDFLAGS="-w -s -X 'internal/godebug.defaultGODEBUG=multipathtcp=0' -checklinkname=0"
+  if [[ -n "$VERSION_SINGBOX" ]]; then
+    LDFLAGS="-w -s -X 'github.com/sagernet/sing-box/constant.Version=${VERSION_SINGBOX}' -X 'internal/godebug.defaultGODEBUG=multipathtcp=0' -checklinkname=0"
+  fi
+  # shellcheck disable=SC2086
+  extra_env=()
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    extra_env+=(CGO_ENABLED=1 CGO_LDFLAGS="-weak_framework UniformTypeIdentifiers")
+  fi
+  env "${extra_env[@]}" go build -trimpath -tags "$TAGS" -ldflags "$LDFLAGS" -o "$OUT_BIN" .
 )
 
 # macOS: clear quarantine so setuid / Gatekeeper don't block

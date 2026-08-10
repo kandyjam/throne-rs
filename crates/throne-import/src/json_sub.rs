@@ -145,7 +145,8 @@ fn import_xray(doc: &Value, kind: XrayKind, _raw: &str) -> Vec<ImportedProfile> 
             .filter_map(xray_outbound)
             .collect(),
         XrayKind::ConfigArray => {
-            // Each element is a full Xray config → store as custom xray config.
+            // Each element is a full Xray config → store as custom xray full config
+            // (upstream subtype `xrayfullconfig`, eligible for Auto Selector since 1.2.4).
             doc.as_array()
                 .into_iter()
                 .flatten()
@@ -158,7 +159,7 @@ fn import_xray(doc: &Value, kind: XrayKind, _raw: &str) -> Vec<ImportedProfile> 
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| format!("Xray config {}", i + 1));
                     let text = serde_json::to_string(cfg).ok()?;
-                    Some(custom_profile(&name, &text, true))
+                    Some(custom_xray_full_profile(&name, &text))
                 })
                 .collect()
         }
@@ -446,22 +447,56 @@ fn xray_outbound(v: &Value) -> Option<ImportedProfile> {
 }
 
 fn custom_profile(name: &str, config: &str, full: bool) -> ImportedProfile {
-    let mut outbound = ParsedOutbound {
-        tag: Some(name.to_string()),
-        raw_json: Some(config.to_string()),
-        ..Default::default()
-    };
-    if full {
-        outbound.security = Some("full-config".into());
-    }
+    // Wire-compatible custom bean (upstream ExportToJson).
+    let subtype = if full { "fullconfig" } else { "outbound" };
+    let outbound_json = serde_json::json!({
+        "type": "custom",
+        "name": name,
+        "subtype": subtype,
+        "config": config,
+    });
     ImportedProfile {
         name: name.to_string(),
         profile_type: ProfileType::Custom,
-        outbound,
+        outbound: ParsedOutbound {
+            tag: Some(name.to_string()),
+            security: if full {
+                Some("full-config".into())
+            } else {
+                None
+            },
+            raw_json: Some(
+                serde_json::to_string(&outbound_json).unwrap_or_else(|_| config.to_string()),
+            ),
+            ..Default::default()
+        },
         source: if full {
             "custom-full".into()
         } else {
             "custom-outbound".into()
         },
+    }
+}
+
+/// Upstream `CustomXrayFullConfig` (`subtype = xrayfullconfig`).
+fn custom_xray_full_profile(name: &str, config: &str) -> ImportedProfile {
+    let outbound_json = serde_json::json!({
+        "type": "custom",
+        "name": name,
+        "subtype": "xrayfullconfig",
+        "config": config,
+    });
+    ImportedProfile {
+        name: name.to_string(),
+        profile_type: ProfileType::Custom,
+        outbound: ParsedOutbound {
+            tag: Some(name.to_string()),
+            security: Some("xray-full-config".into()),
+            raw_json: Some(
+                serde_json::to_string(&outbound_json).unwrap_or_else(|_| config.to_string()),
+            ),
+            ..Default::default()
+        },
+        source: "custom-xray-full".into(),
     }
 }

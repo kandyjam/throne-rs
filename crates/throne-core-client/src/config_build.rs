@@ -6,13 +6,13 @@
 use serde_json::{Map, Value, json};
 use throne_domain::{
     AppSettings, AutoSelectorConfig, DefaultOutbound, ParsedOutbound, Profile, ProfileType,
-    RouteProfile, RouteRule, RulesetMirror,
+    RouteProfile, RouteRule, RulesetMirror, is_xray_full_config_member,
 };
 
 use crate::CoreError;
 
-/// Result of building a core load request payload.
-#[derive(Debug, Clone)]
+/// Result of building a core load request payload (maps to `LoadConfigReq`, 1.2.4 fields).
+#[derive(Debug, Clone, Default)]
 pub struct BuiltConfig {
     pub core_config_json: String,
     pub need_xray: bool,
@@ -20,6 +20,17 @@ pub struct BuiltConfig {
     /// Upstream `LoadConfigReq.tun_ipv4_cidr` — set when Tun inbound is present.
     /// Empty when Tun is off. Core uses this on Darwin to set system DNS to tunIP+1.
     pub tun_ipv4_cidr: String,
+    /// Opaque full Xray configs, each its own gated instance (proto field 16).
+    pub xray_full_configs: Vec<String>,
+    /// Keep the shared Xray sidecar cold until dialed (auto-selector pools).
+    pub xray_lazy_start: bool,
+    /// Idle seconds for the shared sidecar; 0 keeps resident once started.
+    pub xray_idle_seconds: i32,
+    /// Idle seconds for full-config gates; 0 keeps resident (1.2.4 auto-selector).
+    pub xray_full_idle_seconds: i32,
+    /// Loopback DNS-in for Xray outbound resolution (e.g. `127.0.0.1:15353`).
+    pub xray_outbound_dns_address: String,
+    pub xray_outbound_dns_strategy: String,
 }
 
 /// Optional Auto Selector expansion for Start.
@@ -51,14 +62,38 @@ pub fn build_load_config_ex(
     route_profile: Option<&RouteProfile>,
     auto_selector: Option<&AutoSelectorBuild>,
 ) -> Result<BuiltConfig, CoreError> {
+    let mut xray_full_configs = Vec::new();
+    let mut xray_lazy_start = false;
+    let mut xray_idle_seconds = 0;
+    let mut xray_full_idle_seconds = 0;
+
     let (proxy_outbound, extra_outbounds, proxy_direct_domains) =
         if let Some(auto) = auto_selector {
-            build_auto_selector_outbounds(auto, settings)?
+            let built = build_auto_selector_outbounds(auto, settings)?;
+            xray_full_configs = built.xray_full_configs;
+            // Pool Xray members may be probe-only: keep sidecar cold between dials.
+            // Idle must outlast the probe interval or it restarts every round.
+            if built.any_xray_member || !xray_full_configs.is_empty() {
+                xray_lazy_start = true;
+                xray_idle_seconds = auto.config.interval_sec.max(60) * 2;
+                if xray_idle_seconds < 120 {
+                    xray_idle_seconds = 120;
+                }
+                // Resident on purpose: recycling would put an instance build in
+                // front of every failover (upstream 1.2.4).
+                xray_full_idle_seconds = 0;
+            }
+            (built.group, built.member_outbounds, built.domains)
         } else if profile.profile_type == ProfileType::AutoSelector {
             return Err(CoreError::Config(
                 "Auto Selector requires resolved members — call resolve_auto_selector_members first"
                     .into(),
             ));
+        } else if is_xray_full_config_member(profile) {
+            let bridge = build_xray_full_member(profile)?;
+            xray_full_configs.push(bridge.xray_config);
+            let domains = collect_outbound_server_domains(profile);
+            (bridge.socks_outbound, Vec::new(), domains)
         } else {
             let outbound = build_proxy_outbound(profile)?;
             let domains = collect_outbound_server_domains(profile);
@@ -115,22 +150,17 @@ pub fn build_load_config_ex(
                 .unwrap()
                 .insert("auto_redirect".into(), json!(true));
         }
-        // Upstream route_exclude_address: private LAN only when bypass enabled.
-        // (enable_tun_routing direct-IP sets are not wired yet.)
-        // Outbound dials rely on route.auto_detect_interface — same as Qt Throne.
+        // Upstream route_exclude_address (1.2.3+ / #1738 macOS DNS fix):
+        // - loopback + broadcast always excluded
+        // - private LAN ranges excluded when bypass is enabled
+        // - on Darwin, punch a hole for the Tun subnet itself: system DNS is
+        //   repointed at tunIP+1 (inside that subnet), and excluding the whole
+        //   172.16.0.0/12 would black-hole every DNS query.
         if !settings.disable_private_range_bypass {
-            tun.as_object_mut().unwrap().insert(
-                "route_exclude_address".into(),
-                json!([
-                    "127.0.0.0/8",
-                    "10.0.0.0/8",
-                    "172.16.0.0/12",
-                    "192.168.0.0/16",
-                    "169.254.0.0/16",
-                    "224.0.0.0/4",
-                    "255.255.255.255/32"
-                ]),
-            );
+            let excludes = build_tun_route_exclude_addrs(&tun_ipv4_cidr);
+            tun.as_object_mut()
+                .unwrap()
+                .insert("route_exclude_address".into(), json!(excludes));
         }
         inbounds.push(tun);
     }
@@ -211,12 +241,42 @@ pub fn build_load_config_ex(
     let core_config_json =
         serde_json::to_string(&config).map_err(|e| CoreError::Config(e.to_string()))?;
 
+    // When any Xray path is used, point outbound DNS at sing-box loopback DNS-in
+    // (upstream mainwindow_profile_lifecycle 1.2.4). Default port matches
+    // SettingsRepo::core_dns_in_port when the GUI has not exposed it yet.
+    let need_xray_dns = !xray_full_configs.is_empty() || xray_lazy_start;
+    let (xray_outbound_dns_address, xray_outbound_dns_strategy) = if need_xray_dns {
+        (
+            "127.0.0.1:15353".to_string(),
+            xray_outbound_domain_strategy(settings),
+        )
+    } else {
+        (String::new(), String::new())
+    };
+
     Ok(BuiltConfig {
         core_config_json,
         need_xray: false,
         xray_config: String::new(),
         tun_ipv4_cidr,
+        xray_full_configs,
+        xray_lazy_start,
+        xray_idle_seconds,
+        xray_full_idle_seconds,
+        xray_outbound_dns_address,
+        xray_outbound_dns_strategy,
     })
+}
+
+fn xray_outbound_domain_strategy(settings: &AppSettings) -> String {
+    let s = settings.default_domain_strategy.trim();
+    match s {
+        "" | "prefer_ipv4" => "UseIPv4".into(),
+        "prefer_ipv6" => "UseIPv6".into(),
+        "ipv4_only" => "UseIPv4".into(),
+        "ipv6_only" => "UseIPv6".into(),
+        other => other.to_string(),
+    }
 }
 
 /// Build route.rules + route.rule_set + final outbound tag from a Throne route profile.
@@ -690,6 +750,125 @@ fn normalize_tun_ipv4_cidr(raw: &str) -> String {
     }
 }
 
+/// Upstream `tunBypassablePrivateRanges` + unconditional loopback/broadcast.
+///
+/// On Darwin, `subtract_prefix` carves the Tun CIDR out of the exclude list so
+/// system DNS at tunIP+1 stays on the Tun (upstream #1738 / 1.2.4).
+fn build_tun_route_exclude_addrs(tun_ipv4_cidr: &str) -> Vec<String> {
+    // Unconditional: never route loopback/broadcast into Tun.
+    let mut excludes = vec!["127.0.0.0/8".into(), "255.255.255.255/32".into()];
+    // Bypassable private ranges (upstream RouteProfile.h).
+    let mut private = vec![
+        "10.0.0.0/8".into(),
+        "172.16.0.0/12".into(),
+        "192.168.0.0/16".into(),
+        "169.254.0.0/16".into(),
+        "224.0.0.0/4".into(),
+    ];
+    #[cfg(target_os = "macos")]
+    {
+        private = subtract_ipv4_prefix(&private, tun_ipv4_cidr);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = tun_ipv4_cidr;
+    }
+    excludes.extend(private);
+    excludes
+}
+
+/// Upstream `subtractPrefix` (IPv4 only — Tun default is IPv4).
+///
+/// When `hole` sits inside a range, replace that range with the complementary
+/// siblings so the hole stays routed through Tun while the rest is still bypassed.
+fn subtract_ipv4_prefix(ranges: &[String], hole: &str) -> Vec<String> {
+    let Some(cut) = parse_ipv4_prefix(hole) else {
+        return ranges.to_vec();
+    };
+    let mut out = Vec::new();
+    for entry in ranges {
+        let Some(range) = parse_ipv4_prefix(entry) else {
+            out.push(entry.clone());
+            continue;
+        };
+        // hole fully contains range → drop range
+        if prefix_contains_v4(&cut, &range) {
+            continue;
+        }
+        // range does not contain hole → keep as-is
+        if !prefix_contains_v4(&range, &cut) {
+            out.push(entry.clone());
+            continue;
+        }
+        // range contains hole → emit siblings that cover range \ hole
+        for bits in (range.bits + 1)..=cut.bits {
+            let mut sibling = cut;
+            sibling.bits = bits;
+            let flipped = bits - 1;
+            let byte = (flipped / 8) as usize;
+            let bit = flipped % 8;
+            sibling.addr[byte] ^= 0x80u8 >> bit;
+            // zero host bits below `bits`
+            for i in bits..32 {
+                let b = (i / 8) as usize;
+                let m = 0x80u8 >> (i % 8);
+                sibling.addr[b] &= !m;
+            }
+            out.push(format_ipv4_prefix(&sibling));
+        }
+    }
+    out
+}
+
+#[derive(Clone, Copy)]
+struct Ipv4Prefix {
+    addr: [u8; 4],
+    bits: u8,
+}
+
+fn parse_ipv4_prefix(cidr: &str) -> Option<Ipv4Prefix> {
+    let (addr, pref) = cidr.trim().split_once('/')?;
+    let bits: u8 = pref.parse().ok()?;
+    if bits > 32 {
+        return None;
+    }
+    let parts: Vec<u8> = addr
+        .split('.')
+        .filter_map(|p| p.parse().ok())
+        .collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let mut a = [parts[0], parts[1], parts[2], parts[3]];
+    // Normalize network address: zero host bits
+    for i in bits..32 {
+        let b = (i / 8) as usize;
+        let m = 0x80u8 >> (i % 8);
+        a[b] &= !m;
+    }
+    Some(Ipv4Prefix { addr: a, bits })
+}
+
+fn format_ipv4_prefix(p: &Ipv4Prefix) -> String {
+    format!("{}.{}.{}.{}/{}", p.addr[0], p.addr[1], p.addr[2], p.addr[3], p.bits)
+}
+
+fn prefix_contains_v4(outer: &Ipv4Prefix, inner: &Ipv4Prefix) -> bool {
+    if outer.bits > inner.bits {
+        return false;
+    }
+    let whole = (outer.bits / 8) as usize;
+    if outer.addr[..whole] != inner.addr[..whole] {
+        return false;
+    }
+    let rest = outer.bits % 8;
+    if rest == 0 {
+        return true;
+    }
+    let mask = 0xFFu8 << (8 - rest);
+    (outer.addr[whole] & mask) == (inner.addr[whole] & mask)
+}
+
 fn is_plausible_ipv4_cidr(s: &str) -> bool {
     let Some((addr, pref)) = s.split_once('/') else {
         return false;
@@ -725,15 +904,23 @@ fn normalize_listen_address(addr: &str) -> String {
     }
 }
 
+/// Intermediate result of expanding an Auto Selector into outbounds + full configs.
+struct AutoSelectorOutbounds {
+    group: Value,
+    member_outbounds: Vec<Value>,
+    domains: Vec<String>,
+    xray_full_configs: Vec<String>,
+    any_xray_member: bool,
+}
+
 /// Build member outbounds + upstream `auto-selector` group tagged `proxy`.
 ///
-/// Matches Throne 1.2.3 `buildAutoSelectorGroup` (generate.cpp). Requires
-/// ThroneCore built against the Throneproj/sing-box fork that registers the
-/// `auto-selector` outbound type (core ≥ 1.2.3).
+/// Matches Throne 1.2.3+ `buildAutoSelectorGroup` (generate.cpp). 1.2.4 adds
+/// Xray full-config members as socks bridges + `xray_full_configs` instances.
 fn build_auto_selector_outbounds(
     auto: &AutoSelectorBuild,
     settings: &AppSettings,
-) -> Result<(Value, Vec<Value>, Vec<String>), CoreError> {
+) -> Result<AutoSelectorOutbounds, CoreError> {
     if auto.members.is_empty() {
         return Err(CoreError::Config(
             "Auto selector produced no usable members".into(),
@@ -742,14 +929,27 @@ fn build_auto_selector_outbounds(
 
     let mut domains = Vec::new();
     let mut member_outbounds = Vec::new();
+    let mut xray_full_configs = Vec::new();
+    let mut any_xray_member = false;
     let mut tags = Vec::new();
     let mut warm = Vec::new();
     let mut pinned_tag = None;
     let validity_mins = auto.config.result_validity_mins.max(0) as i64;
 
     for member in &auto.members {
-        let mut ob = build_proxy_outbound(member)?;
         let tag = format!("p{}", member.id);
+        let mut ob = if is_xray_full_config_member(member) {
+            let bridge = build_xray_full_member(member)?;
+            xray_full_configs.push(bridge.xray_config);
+            any_xray_member = true;
+            bridge.socks_outbound
+        } else {
+            // Regular Xray-backed leaves still share the sidecar; flag lazy start.
+            if member_uses_xray_sidecar(member) {
+                any_xray_member = true;
+            }
+            build_proxy_outbound(member)?
+        };
         if let Some(obj) = ob.as_object_mut() {
             obj.insert("tag".into(), json!(tag.clone()));
         }
@@ -819,7 +1019,127 @@ fn build_auto_selector_outbounds(
         }
     }
 
-    Ok((group, member_outbounds, domains))
+    Ok(AutoSelectorOutbounds {
+        group,
+        member_outbounds,
+        domains,
+        xray_full_configs,
+        any_xray_member,
+    })
+}
+
+/// One Xray full-config member: socks outbound in sing-box + opaque Xray JSON.
+struct XrayFullBridge {
+    socks_outbound: Value,
+    xray_config: String,
+}
+
+/// Build a socks bridge outbound + Xray full config with a matching socks inbound.
+///
+/// Upstream Custom::Build for `xrayfullconfig` + generate.cpp soleXrayInbound path.
+fn build_xray_full_member(profile: &Profile) -> Result<XrayFullBridge, CoreError> {
+    let raw = xray_full_config_raw(profile).ok_or_else(|| {
+        CoreError::Config(format!(
+            "Xray full config profile '{}' has no config body",
+            profile.name
+        ))
+    })?;
+    let mut user_cfg: Value = serde_json::from_str(&raw)
+        .map_err(|e| CoreError::Config(format!("invalid Xray full config JSON: {e}")))?;
+
+    let port = reserve_loopback_port().map_err(|e| {
+        CoreError::Config(format!(
+            "Could not reserve a local port for the custom Xray full config bridge: {e}"
+        ))
+    })?;
+    let auth = random_bridge_auth();
+
+    // Sole inbound: only Throne's bridge (sibling subscription configs repeat ports).
+    let bridge_inbound = json!({
+        "tag": "throne-bridge",
+        "port": port,
+        "listen": "127.0.0.1",
+        "protocol": "socks",
+        "settings": {
+            "auth": "password",
+            "accounts": [{ "user": auth, "pass": auth }],
+            "udp": true
+        },
+        "sniffing": {
+            "enabled": true,
+            "destOverride": ["http", "tls", "quic"]
+        }
+    });
+    if let Some(obj) = user_cfg.as_object_mut() {
+        obj.insert("inbounds".into(), json!([bridge_inbound]));
+    } else {
+        return Err(CoreError::Config(
+            "Xray full config root must be a JSON object".into(),
+        ));
+    }
+
+    let xray_config =
+        serde_json::to_string(&user_cfg).map_err(|e| CoreError::Config(e.to_string()))?;
+    let socks_outbound = json!({
+        "type": "socks",
+        "server": "127.0.0.1",
+        "server_port": port,
+        "username": auth,
+        "password": auth,
+    });
+    Ok(XrayFullBridge {
+        socks_outbound,
+        xray_config,
+    })
+}
+
+fn xray_full_config_raw(profile: &Profile) -> Option<String> {
+    if let Ok(v) = serde_json::from_str::<Value>(&profile.outbound_json) {
+        if let Some(cfg) = v.get("config").and_then(|c| c.as_str()) {
+            if !cfg.trim().is_empty() {
+                return Some(cfg.to_string());
+            }
+        }
+        // Entire outbound_json may itself be the Xray document.
+        if v.get("outbounds").is_some() && v.get("protocol").is_none() {
+            if let Ok(s) = serde_json::to_string(&v) {
+                return Some(s);
+            }
+        }
+    }
+    profile.outbound.raw_json.clone()
+}
+
+fn member_uses_xray_sidecar(member: &Profile) -> bool {
+    matches!(
+        member.profile_type,
+        ProfileType::XrayVless | ProfileType::Vmess
+    ) || member
+        .outbound_json
+        .contains("\"subtype\":\"xrayoutbound\"")
+        || member
+            .outbound
+            .security
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case("xray"))
+}
+
+fn reserve_loopback_port() -> std::io::Result<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    // Drop listener so the core can bind the same port shortly after.
+    drop(listener);
+    Ok(port)
+}
+
+fn random_bridge_auth() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // 32 hex chars ≈ upstream GetRandomString(32) entropy for the bridge.
+    format!("thr{:028x}", nanos)
 }
 
 fn build_proxy_outbound(profile: &Profile) -> Result<Value, CoreError> {
@@ -1526,6 +1846,21 @@ mod tests {
     }
 
     #[test]
+    fn subtract_ipv4_punches_tun_subnet_out_of_private_range() {
+        let ranges = vec!["172.16.0.0/12".into()];
+        let out = subtract_ipv4_prefix(&ranges, "172.19.0.1/24");
+        // Hole 172.19.0.0/24 must not be covered as a single excluded /12.
+        assert!(!out.iter().any(|s| s == "172.16.0.0/12"));
+        // Siblings should still bypass the rest of 172.16/12.
+        assert!(
+            out.iter().any(|s| s.starts_with("172.")),
+            "expected sibling prefixes, got {out:?}"
+        );
+        // The hole itself is never listed as an exclude.
+        assert!(!out.iter().any(|s| s == "172.19.0.0/24" || s == "172.19.0.1/24"));
+    }
+
+    #[test]
     fn tun_inbound_matches_upstream_generate() {
         let mut p = Profile::new(1, 1, "n1", ProfileType::Vless);
         p.outbound = ParsedOutbound {
@@ -1552,6 +1887,24 @@ mod tests {
         let excludes = tun["route_exclude_address"].as_array().unwrap();
         assert!(excludes.iter().any(|e| e.as_str() == Some("192.168.0.0/16")));
         assert!(!excludes.iter().any(|e| e.as_str() == Some("1.2.3.4/32")));
+        #[cfg(target_os = "macos")]
+        {
+            // #1738: Tun subnet must not be fully excluded (macOS system DNS = tunIP+1).
+            assert!(
+                !excludes
+                    .iter()
+                    .any(|e| e.as_str() == Some("172.16.0.0/12")),
+                "172.16.0.0/12 must be split around Tun CIDR on Darwin, raw exclude was {excludes:?}"
+            );
+            // Hole is 172.19.0.0/24; siblings like 172.19.1.0/24 are expected.
+            assert!(
+                !excludes.iter().any(|e| {
+                    e.as_str()
+                        .is_some_and(|s| s == "172.19.0.0/24" || s == "172.19.0.1/24")
+                }),
+                "Tun /24 hole must not appear in route_exclude_address: {excludes:?}"
+            );
+        }
         // Upstream buildRouteSection
         assert_eq!(v["route"]["default_domain_resolver"]["server"], "dns-direct");
         assert_eq!(v["route"]["auto_detect_interface"], true);

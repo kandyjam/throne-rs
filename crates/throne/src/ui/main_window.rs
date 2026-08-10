@@ -386,7 +386,11 @@ fn subscription_fetch_options(
 }
 
 fn format_subscription_changes(report: &throne_domain::SubscriptionUpdateReport) -> String {
-    if report.added.is_empty() && report.updated.is_empty() && report.deleted.is_empty() {
+    if report.added.is_empty()
+        && report.updated.is_empty()
+        && report.deleted.is_empty()
+        && report.kept_in_use.is_empty()
+    {
         return "Nothing".into();
     }
     let entries = |prefix: &str, changes: &[throne_domain::SubscriptionChange]| {
@@ -396,7 +400,7 @@ fn format_subscription_changes(report: &throne_domain::SubscriptionUpdateReport)
             .collect::<Vec<_>>()
             .join("\n")
     };
-    format!(
+    let mut text = format!(
         "Added {} profiles:\n{}\n\nUpdated {} profiles:\n{}\n\nDeleted {} profiles:\n{}",
         report.added.len(),
         entries("[+]", &report.added),
@@ -404,7 +408,15 @@ fn format_subscription_changes(report: &throne_domain::SubscriptionUpdateReport)
         entries("[~]", &report.updated),
         report.deleted.len(),
         entries("[-]", &report.deleted),
-    )
+    );
+    // Upstream 1.2.4: "Still in use, so kept instead of deleted"
+    if !report.kept_in_use.is_empty() {
+        text.push_str(&format!(
+            "\n\nStill in use, so kept instead of deleted:\n{}",
+            entries("[=]", &report.kept_in_use)
+        ));
+    }
+    text
 }
 
 #[derive(Debug, Default)]
@@ -5627,9 +5639,14 @@ fn build_gpui_dialog(
             } else {
                 "New group"
             };
+            // Cap dialog height; body scrolls (OK/Cancel stay visible below).
+            let dialog_max_h = (window.viewport_size().height * 0.82).max(px(360.));
+            // Leave room for title chrome + footer actions inside the dialog.
+            let content_max_h = (f32::from(dialog_max_h) - 120.).clamp(220., 560.);
             dialog
                 .title(title)
                 .w(px(420.))
+                .max_h(dialog_max_h)
                 .on_cancel({
                     let entity = entity.clone();
                     move |_, window, cx| {
@@ -5652,6 +5669,7 @@ fn build_gpui_dialog(
                     &view,
                     name,
                     url,
+                    content_max_h,
                     move |_, cx| {
                         e_type.update(cx, |t, cx| {
                             if let Dialog::EditGroup {

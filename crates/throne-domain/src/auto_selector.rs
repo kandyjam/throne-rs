@@ -1,9 +1,12 @@
-//! Auto Selector profile support (upstream Throne 1.2.3).
+//! Auto Selector profile support (upstream Throne 1.2.3+ / 1.2.4).
 //!
 //! An Auto Selector tracks a whole group instead of one server. Membership is
 //! resolved at build/start time from `gid` + filters; ranking prefers measured
 //! latency. The core then switches among the built pool (or we sticky-pick the
 //! best member when the running ThroneCore lacks `auto-selector` outbound).
+//!
+//! 1.2.4: Xray full-config members are eligible (each gets its own gated Xray
+//! instance + socks bridge). Sing-box full configs still skip as [`AutoSelectorSkip::FullConfig`].
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -17,12 +20,15 @@ pub enum AutoSelectorSkip {
     Missing,
     MetaType,
     ExtraCore,
+    /// Sing-box full config wants the whole box (1.2.4: Xray full is no longer this).
     FullConfig,
     Malformed,
     Tailscale,
     NameFilter,
     CountryFilter,
     Unavailable,
+    /// Xray full config cannot be combined with the group's landing/front proxies.
+    XrayFullChained,
 }
 
 impl AutoSelectorSkip {
@@ -37,6 +43,9 @@ impl AutoSelectorSkip {
             Self::NameFilter => "filtered out by name",
             Self::CountryFilter => "filtered out by country",
             Self::Unavailable => "last test failed",
+            Self::XrayFullChained => {
+                "Xray full config cannot be combined with the group's proxies"
+            }
         }
     }
 }
@@ -465,9 +474,110 @@ fn name_filter_matches(filter: &str, name: &str) -> bool {
     name_l.contains(&filter_l)
 }
 
+/// Classify a custom profile for Auto Selector membership (upstream 1.2.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustomMemberKind {
+    /// Ordinary custom outbound JSON — fine as a leaf.
+    Outbound,
+    /// Xray full config — allowed; core runs a gated instance + socks bridge.
+    XrayFull,
+    /// Sing-box full config — still excluded (wants the whole box).
+    SingBoxFull,
+    Unknown,
+}
+
+/// Detect custom/full-config shape from stored outbound JSON / raw_json.
+pub fn classify_custom_member(member: &Profile) -> CustomMemberKind {
+    if member.profile_type != ProfileType::Custom {
+        return CustomMemberKind::Unknown;
+    }
+    // Prefer structured outbound_json (upstream ExportToJson: type=custom, subtype=…).
+    if let Ok(v) = serde_json::from_str::<Value>(&member.outbound_json) {
+        let subtype = v
+            .get("subtype")
+            .or_else(|| v.get("custom_type"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        match subtype {
+            "xrayfullconfig" | "xray_full" | "xray-full" => return CustomMemberKind::XrayFull,
+            "fullconfig" | "full_config" | "full-config" => return CustomMemberKind::SingBoxFull,
+            "outbound" | "xrayoutbound" | "xray_outbound" => return CustomMemberKind::Outbound,
+            _ => {}
+        }
+        let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if matches!(ty, "custom" | "") {
+            if let Some(cfg) = v.get("config").and_then(|c| c.as_str()) {
+                return classify_raw_config_blob(cfg);
+            }
+            if v.get("config").is_some() || v.get("core").is_some() {
+                // Embedded object without subtype — treat as sing-box full unless Xray-shaped.
+                if let Some(cfg) = v.get("config") {
+                    if looks_like_xray_full(cfg) {
+                        return CustomMemberKind::XrayFull;
+                    }
+                }
+                return CustomMemberKind::SingBoxFull;
+            }
+        }
+    }
+    // Import path often stores full configs in raw_json + security marker.
+    if let Some(raw) = member.outbound.raw_json.as_deref() {
+        let sec = member.outbound.security.as_deref().unwrap_or("");
+        if sec == "xray-full-config" || sec == "xrayfullconfig" {
+            return CustomMemberKind::XrayFull;
+        }
+        if sec == "full-config" || sec == "fullconfig" {
+            return classify_raw_config_blob(raw);
+        }
+        if !raw.is_empty() {
+            return classify_raw_config_blob(raw);
+        }
+    }
+    CustomMemberKind::Outbound
+}
+
+fn classify_raw_config_blob(raw: &str) -> CustomMemberKind {
+    let Ok(v) = serde_json::from_str::<Value>(raw) else {
+        return CustomMemberKind::Unknown;
+    };
+    if looks_like_xray_full(&v) {
+        return CustomMemberKind::XrayFull;
+    }
+    if looks_like_singbox_full(&v) {
+        return CustomMemberKind::SingBoxFull;
+    }
+    CustomMemberKind::Outbound
+}
+
+fn looks_like_xray_full(v: &Value) -> bool {
+    let Some(outs) = v.get("outbounds").and_then(|o| o.as_array()) else {
+        return false;
+    };
+    // Xray outbounds use `protocol`; sing-box uses `type`.
+    outs.iter().any(|o| o.get("protocol").is_some())
+}
+
+fn looks_like_singbox_full(v: &Value) -> bool {
+    let has_inbounds = v
+        .get("inbounds")
+        .and_then(|a| a.as_array())
+        .is_some_and(|a| !a.is_empty());
+    let has_typed_outbounds = v
+        .get("outbounds")
+        .and_then(|a| a.as_array())
+        .is_some_and(|a| a.iter().any(|o| o.get("type").is_some()));
+    has_inbounds && has_typed_outbounds
+}
+
+/// True when this member should be started as an opaque Xray full-config instance.
+pub fn is_xray_full_config_member(member: &Profile) -> bool {
+    classify_custom_member(member) == CustomMemberKind::XrayFull
+}
+
 fn member_skip(
     member: Option<&Profile>,
     selector: &AutoSelectorConfig,
+    group: Option<&Group>,
 ) -> Option<AutoSelectorSkip> {
     let Some(member) = member else {
         return Some(AutoSelectorSkip::Missing);
@@ -478,16 +588,17 @@ fn member_skip(
         }
         ProfileType::Tailscale => return Some(AutoSelectorSkip::Tailscale),
         ProfileType::ExtraCore => return Some(AutoSelectorSkip::ExtraCore),
-        ProfileType::Custom => {
-            if let Ok(v) = serde_json::from_str::<Value>(&member.outbound_json) {
-                let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                if matches!(ty, "custom" | "")
-                    && (v.get("config").is_some() || v.get("core").is_some())
-                {
-                    return Some(AutoSelectorSkip::FullConfig);
+        ProfileType::Custom => match classify_custom_member(member) {
+            // 1.2.4: only sing-box full config is excluded; Xray full is fine
+            // unless the group chains landing/front proxies (XrayFullChained).
+            CustomMemberKind::SingBoxFull => return Some(AutoSelectorSkip::FullConfig),
+            CustomMemberKind::XrayFull => {
+                if !xray_full_config_fits_group_chain(group) {
+                    return Some(AutoSelectorSkip::XrayFullChained);
                 }
             }
-        }
+            CustomMemberKind::Outbound | CustomMemberKind::Unknown => {}
+        },
         _ => {}
     }
     if !name_filter_matches(&selector.name_filter, &member.name) {
@@ -508,6 +619,16 @@ fn member_skip(
         return Some(AutoSelectorSkip::Unavailable);
     }
     None
+}
+
+/// Upstream `xrayFullConfigFitsChain`: Xray full config only works with a bare
+/// group (no landing / front proxy). Those would force a multi-hop chain the
+/// full config cannot join.
+fn xray_full_config_fits_group_chain(group: Option<&Group>) -> bool {
+    let Some(group) = group else {
+        return true;
+    };
+    group.landing_proxy_id < 0 && group.front_proxy_id < 0
 }
 
 /// Resolve membership for an auto-selector profile.
@@ -544,7 +665,7 @@ pub fn plan_auto_selector(
         }
         plan.members_in_group += 1;
         let member = lookup(id);
-        if let Some(skip) = member_skip(member.as_ref(), selector) {
+        if let Some(skip) = member_skip(member.as_ref(), selector, Some(group)) {
             bump(skip);
             continue;
         }
@@ -732,5 +853,72 @@ mod tests {
         assert!(name_filter_matches("sing", "Singapore-01"));
         assert!(!name_filter_matches("jp", "Singapore-01"));
         assert!(name_filter_matches("*sg*", "xx-sg-01"));
+    }
+
+    #[test]
+    fn xray_full_members_eligible_singbox_full_skipped() {
+        let mut map = HashMap::new();
+        map.insert(1, {
+            let mut p = make_node(1, 10, "xray-full", 30);
+            p.profile_type = ProfileType::Custom;
+            p.outbound.security = Some("full-config".into());
+            p.outbound.raw_json = Some(
+                r#"{"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"x.example.com","port":443}]}}],"inbounds":[]}"#
+                    .into(),
+            );
+            p.outbound_json = r#"{"type":"custom","subtype":"xrayfullconfig","config":"{}"}"#.into();
+            p
+        });
+        map.insert(2, {
+            let mut p = make_node(2, 10, "sb-full", 20);
+            p.profile_type = ProfileType::Custom;
+            p.outbound.security = Some("full-config".into());
+            p.outbound.raw_json = Some(
+                r#"{"inbounds":[{"type":"mixed"}],"outbounds":[{"type":"direct","tag":"direct"}]}"#
+                    .into(),
+            );
+            p.outbound_json = r#"{"type":"custom","subtype":"fullconfig","config":"{}"}"#.into();
+            p
+        });
+        let selector_profile = Profile::new(99, 10, "auto", ProfileType::AutoSelector);
+        let cfg = AutoSelectorConfig::new_for_group(10, "auto");
+        let group = make_group(10, &[1, 2, 99]);
+        let plan = plan_auto_selector(&selector_profile, &cfg, Some(&group), |id| {
+            map.get(&id).cloned()
+        });
+        assert!(plan.error.is_none(), "{:?}", plan.error);
+        assert_eq!(plan.eligible, 1);
+        assert_eq!(plan.build, vec![1]);
+        assert!(
+            plan.skipped
+                .iter()
+                .any(|(s, n)| *s == AutoSelectorSkip::FullConfig && *n == 1)
+        );
+    }
+
+    #[test]
+    fn xray_full_skipped_when_group_has_landing() {
+        let mut map = HashMap::new();
+        map.insert(1, {
+            let mut p = make_node(1, 10, "xray-full", 30);
+            p.profile_type = ProfileType::Custom;
+            p.outbound_json =
+                r#"{"type":"custom","subtype":"xrayfullconfig","config":"{}"}"#.into();
+            p
+        });
+        let selector_profile = Profile::new(99, 10, "auto", ProfileType::AutoSelector);
+        let cfg = AutoSelectorConfig::new_for_group(10, "auto");
+        let mut group = make_group(10, &[1, 99]);
+        group.landing_proxy_id = 5;
+        let plan = plan_auto_selector(&selector_profile, &cfg, Some(&group), |id| {
+            map.get(&id).cloned()
+        });
+        assert!(
+            plan.skipped
+                .iter()
+                .any(|(s, _)| *s == AutoSelectorSkip::XrayFullChained),
+            "{:?}",
+            plan.skipped
+        );
     }
 }

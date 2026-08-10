@@ -444,10 +444,13 @@ pub fn manage_groups_body(
 }
 
 /// Upstream DialogEditGroup body.
+///
+/// Content scrolls when taller than the dialog; OK/Cancel stay pinned below.
 pub fn edit_group_body(
     draft: &crate::ui::dialogs::EditGroupView,
     name: &Entity<InputState>,
     url: &Entity<InputState>,
+    content_max_h: f32,
     on_cycle_type: impl Fn(&mut Window, &mut App) + 'static,
     on_cycle_front: impl Fn(&mut Window, &mut App) + 'static,
     on_cycle_landing: impl Fn(&mut Window, &mut App) + 'static,
@@ -539,10 +542,10 @@ pub fn edit_group_body(
         )),
     );
 
-    let mut root = div().flex().flex_col().w_full().child(group_panel("Common", common));
+    let mut sections = div().flex().flex_col().w_full().child(group_panel("Common", common));
 
     if draft.is_subscription {
-        root = root.child(group_panel(
+        sections = sections.child(group_panel(
             "Subscription",
             div()
                 .flex()
@@ -558,7 +561,7 @@ pub fn edit_group_body(
     }
 
     if show_share {
-        root = root.child(group_panel(
+        sections = sections.child(group_panel(
             "Share",
             div()
                 .flex()
@@ -577,14 +580,29 @@ pub fn edit_group_body(
         ));
     }
 
-    root.child(dialog_actions(
-        "eg-cancel",
-        "Cancel",
-        "eg-ok",
-        "OK",
-        on_cancel,
-        on_ok,
-    ))
+    // Scrollable body (upstream DialogEditGroup scrolls when Share/Subscription
+    // push content past the dialog height); footer actions stay pinned.
+    let scroll_h = content_max_h.max(200.);
+    div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .child(
+            div()
+                .id("edit-group-scroll")
+                .w_full()
+                .max_h(px(scroll_h))
+                .overflow_y_scroll()
+                .child(sections),
+        )
+        .child(dialog_actions(
+            "eg-cancel",
+            "Cancel",
+            "eg-ok",
+            "OK",
+            on_cancel,
+            on_ok,
+        ))
 }
 
 /// View-model for Edit Group (labels resolved in main_window).

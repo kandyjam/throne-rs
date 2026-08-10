@@ -469,12 +469,22 @@ impl CoreSession {
             self.running_profile = None;
         }
 
-        let payload = proto_wire::encode_load_config_req(
+        let extras = proto_wire::LoadConfigExtras {
+            xray_outbound_dns_address: built.xray_outbound_dns_address.clone(),
+            xray_outbound_dns_strategy: built.xray_outbound_dns_strategy.clone(),
+            xray_lazy_start: built.xray_lazy_start,
+            xray_idle_seconds: built.xray_idle_seconds,
+            xray_full_configs: built.xray_full_configs.clone(),
+            xray_full_idle_seconds: built.xray_full_idle_seconds,
+        };
+        // need_xray = shared sidecar only; full configs ride on field 16 (1.2.4).
+        let payload = proto_wire::encode_load_config_req_ex(
             &built.core_config_json,
             false,
             built.need_xray,
             &built.xray_config,
             &built.tun_ipv4_cidr,
+            &extras,
         );
         // 12s is enough for normal Start; longer hangs freeze node switching UI.
         let resp = match self.call("Start", &payload, Duration::from_secs(12)) {

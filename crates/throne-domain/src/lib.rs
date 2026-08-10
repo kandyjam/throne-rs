@@ -10,7 +10,8 @@ mod store;
 mod version;
 
 pub use auto_selector::{
-    AutoSelectorConfig, AutoSelectorPlan, AutoSelectorSkip, plan_auto_selector,
+    AutoSelectorConfig, AutoSelectorPlan, AutoSelectorSkip, CustomMemberKind,
+    classify_custom_member, is_xray_full_config_member, plan_auto_selector,
     profile_auto_selector, rerank_auto_selector_pool,
 };
 pub use models::*;

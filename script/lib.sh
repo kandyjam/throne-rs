@@ -103,10 +103,28 @@ ensure_core_binary() {
 
   local go_bin=""
   if go_bin="$(find_go)"; then
-    log "Building Go ThroneCore with $go_bin → $core_out"
+    # Keep in sync with script/build-core / upstream script/build_go.sh.
+    local tags="${THRONE_CORE_TAGS:-}"
+    if [[ -z "$tags" ]]; then
+      tags="with_clash_api,with_gvisor,with_quic,with_wireguard,with_utls,with_dhcp,with_tailscale,badlinkname,tfogo_checklinkname0"
+      case "$(uname -s 2>/dev/null || echo unknown)" in
+        Darwin|Linux|darwin|linux) tags+=",with_naive_outbound" ;;
+      esac
+    fi
+    log "Building Go ThroneCore with $go_bin → $core_out (tags=$tags)"
     (
       cd "$ROOT/core/server"
-      "$go_bin" build -trimpath -ldflags="-s -w" -o "$core_out" .
+      local ver
+      ver="$("$go_bin" list -m -f '{{.Version}}' github.com/sagernet/sing-box 2>/dev/null || true)"
+      local ldflags="-w -s -X 'internal/godebug.defaultGODEBUG=multipathtcp=0' -checklinkname=0"
+      if [[ -n "$ver" ]]; then
+        ldflags="-w -s -X 'github.com/sagernet/sing-box/constant.Version=${ver}' -X 'internal/godebug.defaultGODEBUG=multipathtcp=0' -checklinkname=0"
+      fi
+      if [[ "$(uname -s 2>/dev/null || true)" == "Darwin" ]]; then
+        export CGO_ENABLED=1
+        export CGO_LDFLAGS="-weak_framework UniformTypeIdentifiers"
+      fi
+      "$go_bin" build -trimpath -tags "$tags" -ldflags "$ldflags" -o "$core_out" .
     )
     return 0
   fi

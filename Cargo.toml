@@ -10,9 +10,10 @@ members = [
 default-members = ["crates/throne"]
 
 [workspace.package]
-# Keep in lockstep with upstream throneproj/Throne `dev` tip tag (NKR_VERSION / INPUT_VERSION).
-# `git describe upstream/dev --tags` → 1.2.3 (tip == tag). Do NOT use max 4.x tags; those are older ancestors.
-version = "1.2.3"
+# Keep in lockstep with upstream throneproj/Throne release tag (NKR_VERSION / INPUT_VERSION).
+# Pin: tag `1.2.4` (`33777e27`). `git describe upstream/dev --tags` may be 1.2.4-N-g… ahead of tag.
+# Do NOT use max 4.x tags; those are older ancestors.
+version = "1.2.4"
 edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/kandyjam/throne-rs"

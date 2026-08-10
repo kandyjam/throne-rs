@@ -73,7 +73,7 @@ pub fn fetch_url_with_options(
         .get(url)
         .header(
             "User-Agent",
-            "Throne/1.2.3 (throne-rs; +https://github.com/throneproj/Throne)",
+            "Throne/1.2.4 (throne-rs; +https://github.com/throneproj/Throne)",
         )
         .header("Accept", "*/*")
         .call()

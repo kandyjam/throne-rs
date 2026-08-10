@@ -43,10 +43,13 @@ var stateMu sync.RWMutex
 var boxInstance *boxbox.Box
 var instanceCancel context.CancelFunc
 
-// Exactly one is set while a profile runs: xrayInstance when eager, xrayGate when
-// the profile asked it to stay cold until something dials it.
+// Exactly one is set while a profile runs, both covering the single merged sidecar:
+// xrayInstance when eager, xrayGate when the profile asked it to stay cold.
 var xrayInstance *core.Instance
 var xrayGate *xray.Gate
+
+// One gate per opaque full config; never merged into the sidecar above.
+var xrayFullGates []*xray.Gate
 
 // Reached only from Start/Stop, i.e. always under lifecycleMu.
 var extraProcess *process.Process
@@ -79,20 +82,34 @@ func setXray(instance *core.Instance, gate *xray.Gate) {
 	xrayInstance, xrayGate = instance, gate
 }
 
-// liveXrayInstance is whichever Xray instance is up right now, or nil. A gated
-// sidecar has none between activations.
-func liveXrayInstance() *core.Instance {
+func setXrayFullGates(gates []*xray.Gate) {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	xrayFullGates = gates
+}
+
+// Shorter than the configs the profile brought: a gated instance is absent
+// between activations.
+func liveXrayInstances() []*core.Instance {
 	stateMu.RLock()
 	instance, gate := xrayInstance, xrayGate
+	fullGates := xrayFullGates
 	stateMu.RUnlock()
 
+	var instances []*core.Instance
 	if instance != nil {
-		return instance
+		instances = append(instances, instance)
+	} else if gate != nil {
+		if live := gate.Instance(); live != nil {
+			instances = append(instances, live)
+		}
 	}
-	if gate != nil {
-		return gate.Instance()
+	for _, fullGate := range fullGates {
+		if live := fullGate.Instance(); live != nil {
+			instances = append(instances, live)
+		}
 	}
-	return nil
+	return instances
 }
 
 type server struct {
@@ -104,16 +121,6 @@ func To[T any](v T) *T {
 	return &v
 }
 
-// Physical default-route interface, or "" - the same source the GetDefaultInterface
-// RPC uses. Xray binds egress there instead of the config-baked sockopt.
-func defaultInterfaceFinder() string {
-	ifc := boxdns.DefaultInterface()
-	if ifc == nil {
-		return ""
-	}
-	return ifc.Name
-}
-
 // Keeps the live Xray instance's egress on the current default route as the network
 // changes. Test instances are short-lived and set theirs once, so are not tracked.
 func init() {
@@ -122,19 +129,19 @@ func init() {
 		return
 	}
 	m.Monitor.RegisterCallback(func(ifc *control.Interface, _ int) {
-		inst := liveXrayInstance()
-		if inst == nil {
-			return
-		}
 		name := ""
 		if ifc != nil {
 			name = ifc.Name
 		}
-		inst.SetEgressInterface(name)
+		// The callback's interface is fresher than currentEgress would report here;
+		// the mark is unaffected by a route move and carries over unchanged.
+		for _, inst := range liveXrayInstances() {
+			inst.SetEgress(name, autoRedirectMark.Load())
+		}
 	})
 }
 
-// One Xray instance per opaque full config, bound to the physical egress interface.
+// One Xray instance per opaque full config, wired to the current egress conditions.
 // On failure the started ones are torn down; on success the caller must close them.
 func startXrayFullConfigs(configs []string) ([]*core.Instance, error) {
 	instances := make([]*core.Instance, 0, len(configs))
@@ -144,7 +151,7 @@ func startXrayFullConfigs(configs []string) ([]*core.Instance, error) {
 			closeXrayInstances(instances)
 			return nil, err
 		}
-		inst.SetEgressInterface(defaultInterfaceFinder())
+		inst.SetEgress(currentEgress())
 		if err := inst.Start(); err != nil {
 			_ = inst.Close()
 			closeXrayInstances(instances)
@@ -160,15 +167,69 @@ func startXrayFullConfigs(configs []string) ([]*core.Instance, error) {
 func closeXray() {
 	stateMu.Lock()
 	instance, gate := xrayInstance, xrayGate
-	xrayInstance, xrayGate = nil, nil
+	fullGates := xrayFullGates
+	xrayInstance, xrayGate, xrayFullGates = nil, nil, nil
 	stateMu.Unlock()
 
 	if gate != nil {
 		gate.Close()
 	}
+	for _, fullGate := range fullGates {
+		fullGate.Close()
+	}
 	if instance != nil {
 		instance.Close()
 	}
+}
+
+// On failure the gates already opened are torn down; on success closeXray owns them.
+func startXrayFullGates(configs []string, idle time.Duration, prepare func(*core.Instance) error) ([]*xray.Gate, error) {
+	if len(configs) == 0 {
+		return nil, nil
+	}
+	gates := make([]*xray.Gate, len(configs))
+	errs := make([]error, len(configs))
+
+	unwind := func() {
+		for _, opened := range gates {
+			if opened != nil {
+				opened.Close()
+			}
+		}
+	}
+
+	// Alone, not in the fan-out below: validating a geoip/geosite config loads the
+	// geo tables the rest then share, so parallelizing it races to load them all.
+	gates[0], errs[0] = xray.StartGate(configs[0], idle, prepare)
+	if errs[0] != nil {
+		return nil, errs[0]
+	}
+
+	workers := runtime.NumCPU()
+	if workers < 1 {
+		workers = 1
+	}
+	slots := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+	for i := 1; i < len(configs); i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			slots <- struct{}{}
+			defer func() { <-slots }()
+			gates[i], errs[i] = xray.StartGate(configs[i], idle, prepare)
+		}()
+	}
+	wg.Wait()
+
+	for _, err := range errs {
+		if err == nil {
+			continue
+		}
+		unwind()
+		return nil, err
+	}
+	return gates, nil
 }
 
 func closeXrayInstances(instances []*core.Instance) {
@@ -220,9 +281,10 @@ func prepareTestEnv(current bool, needXray bool, xrayConfig string, xrayFullConf
 			unwind()
 			return nil, err
 		}
-		// Interface finder only (no DNS): keep test egress on the physical
-		// NIC so it doesn't loop through an active TUN. See Start().
-		instance.SetEgressInterface(defaultInterfaceFinder())
+		// Egress only (no DNS): keep test egress off an active TUN, both the
+		// route it would take and the auto_redirect that would pull it back
+		// in regardless of route. See Start().
+		instance.SetEgress(currentEgress())
 		if err = instance.Start(); err != nil {
 			_ = instance.Close()
 			unwind()
@@ -284,6 +346,7 @@ func (s *server) Start(ctx context.Context, in *gen.LoadConfigReq) (out *gen.Err
 		if err != nil {
 			out.Error = To(err.Error())
 			setBoxInstance(nil, nil)
+			autoRedirectMark.Store(0)
 		}
 	}()
 
@@ -330,24 +393,24 @@ func (s *server) Start(ctx context.Context, in *gen.LoadConfigReq) (out *gen.Err
 		}
 	}
 
-	if *in.NeedXray {
-		// Wire egress after creation, before Start. Test/validation instances get only the
-		// interface finder - never the DNS resolver - so their egress skips an active TUN.
-		dnsAddr := in.GetXrayOutboundDnsAddress()
-		dnsStrategy := in.GetXrayOutboundDnsStrategy()
-		prepareXray := func(instance *core.Instance) error {
-			instance.SetEgressInterface(defaultInterfaceFinder())
-			if dnsAddr == "" {
-				return nil
-			}
-			resolver, e := xthrone.NewResolver(dnsAddr)
-			if e != nil {
-				return E.Cause(e, "failed to create Xray outbound DNS resolver")
-			}
-			instance.SetOutboundDNS(resolver, xinternet.ParseDomainStrategy(dnsStrategy))
+	autoRedirectMark.Store(autoRedirectMarkFor([]byte(in.GetCoreConfig())))
+
+	dnsAddr := in.GetXrayOutboundDnsAddress()
+	dnsStrategy := in.GetXrayOutboundDnsStrategy()
+	prepareXray := func(instance *core.Instance) error {
+		instance.SetEgress(currentEgress())
+		if dnsAddr == "" {
 			return nil
 		}
+		resolver, e := xthrone.NewResolver(dnsAddr)
+		if e != nil {
+			return E.Cause(e, "failed to create Xray outbound DNS resolver")
+		}
+		instance.SetOutboundDNS(resolver, xinternet.ParseDomainStrategy(dnsStrategy))
+		return nil
+	}
 
+	if *in.NeedXray {
 		// Published only once fully up; error paths close what they built.
 		if in.GetXrayLazyStart() {
 			gate, e := xray.StartGate(*in.XrayConfig,
@@ -375,6 +438,17 @@ func (s *server) Start(ctx context.Context, in *gen.LoadConfigReq) (out *gen.Err
 			}
 			setXray(instance, nil)
 		}
+	}
+
+	if fullConfigs := in.GetXrayFullConfigs(); len(fullConfigs) > 0 {
+		gates, e := startXrayFullGates(fullConfigs,
+			time.Duration(in.GetXrayFullIdleSeconds())*time.Second, prepareXray)
+		if e != nil {
+			closeXray()
+			err = e
+			return
+		}
+		setXrayFullGates(gates)
 	}
 
 	box, cancel, err := boxmain.Create([]byte(*in.CoreConfig))
@@ -459,6 +533,9 @@ func (s *server) Stop(ctx context.Context, in *gen.EmptyReq) (out *gen.ErrorResp
 	}
 
 	closeXray()
+	// The Tun and its nftables rules went down with the box above, so test
+	// instances started from here on must not carry the exemption mark.
+	autoRedirectMark.Store(0)
 
 	return
 }

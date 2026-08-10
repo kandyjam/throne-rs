@@ -6,7 +6,18 @@ use std::collections::HashMap;
 
 use crate::CoreError;
 
-/// Encode `LoadConfigReq` (subset of libcore.proto).
+/// Optional 1.2.4 LoadConfigReq extensions (Xray full gates / lazy sidecar).
+#[derive(Debug, Clone, Default)]
+pub struct LoadConfigExtras {
+    pub xray_outbound_dns_address: String,
+    pub xray_outbound_dns_strategy: String,
+    pub xray_lazy_start: bool,
+    pub xray_idle_seconds: i32,
+    pub xray_full_configs: Vec<String>,
+    pub xray_full_idle_seconds: i32,
+}
+
+/// Encode `LoadConfigReq` (subset of libcore.proto, including 1.2.4 fields).
 ///
 /// Important: upstream Go core dereferences optional bool pointers with `*in.NeedXray`
 /// etc. (not getters). Unset fields are nil and **panic**, which drops the IPC
@@ -18,7 +29,34 @@ pub fn encode_load_config_req(
     xray_config: &str,
     tun_ipv4_cidr: &str,
 ) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(core_config.len() + xray_config.len() + tun_ipv4_cidr.len() + 80);
+    encode_load_config_req_ex(
+        core_config,
+        disable_stats,
+        need_xray,
+        xray_config,
+        tun_ipv4_cidr,
+        &LoadConfigExtras::default(),
+    )
+}
+
+/// Full Start payload including Auto Selector / Xray full-config fields (1.2.4).
+pub fn encode_load_config_req_ex(
+    core_config: &str,
+    disable_stats: bool,
+    need_xray: bool,
+    xray_config: &str,
+    tun_ipv4_cidr: &str,
+    extras: &LoadConfigExtras,
+) -> Vec<u8> {
+    let full_len: usize = extras.xray_full_configs.iter().map(|s| s.len() + 8).sum();
+    let mut buf = Vec::with_capacity(
+        core_config.len()
+            + xray_config.len()
+            + tun_ipv4_cidr.len()
+            + extras.xray_outbound_dns_address.len()
+            + full_len
+            + 128,
+    );
     write_string(&mut buf, 1, core_config);
     write_varint_field(&mut buf, 2, u64::from(disable_stats));
     write_varint_field(&mut buf, 3, 0); // need_extra_process
@@ -31,6 +69,25 @@ pub fn encode_load_config_req(
     if !tun_ipv4_cidr.is_empty() {
         write_string(&mut buf, 11, tun_ipv4_cidr);
     }
+    if !extras.xray_outbound_dns_address.is_empty() {
+        write_string(&mut buf, 12, &extras.xray_outbound_dns_address);
+    }
+    if !extras.xray_outbound_dns_strategy.is_empty() {
+        write_string(&mut buf, 13, &extras.xray_outbound_dns_strategy);
+    }
+    // Always encode lazy/idle so Go never sees nil bool/int on Start.
+    write_varint_field(&mut buf, 14, u64::from(extras.xray_lazy_start));
+    write_varint_field(&mut buf, 15, extras.xray_idle_seconds.max(0) as u64);
+    for full in &extras.xray_full_configs {
+        if !full.is_empty() {
+            write_string(&mut buf, 16, full);
+        }
+    }
+    write_varint_field(
+        &mut buf,
+        17,
+        extras.xray_full_idle_seconds.max(0) as u64,
+    );
     buf
 }
 
