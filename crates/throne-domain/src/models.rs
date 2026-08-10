@@ -28,6 +28,8 @@ pub enum ProfileType {
     Ssh,
     XrayVless,
     Chain,
+    /// Upstream 1.2.3 auto-selector: tracks a group and picks the best member.
+    AutoSelector,
     Custom,
     Direct,
     Tailscale,
@@ -57,6 +59,7 @@ impl ProfileType {
             // Upstream OutboundFactory uses "xrayvless" (no underscore).
             Self::XrayVless => "xrayvless",
             Self::Chain => "chain",
+            Self::AutoSelector => "autoselector",
             Self::Custom => "custom",
             Self::Direct => "direct",
             Self::Tailscale => "tailscale",
@@ -86,6 +89,7 @@ impl ProfileType {
             "ssh" => Some(Self::Ssh),
             "xrayvless" | "xray_vless" => Some(Self::XrayVless),
             "chain" => Some(Self::Chain),
+            "autoselector" | "auto_selector" | "auto-selector" => Some(Self::AutoSelector),
             "custom" => Some(Self::Custom),
             "direct" => Some(Self::Direct),
             "tailscale" => Some(Self::Tailscale),
@@ -115,6 +119,7 @@ impl ProfileType {
             Self::Ssh => "SSH",
             Self::XrayVless => "Xray VLESS",
             Self::Chain => "Chain",
+            Self::AutoSelector => "Auto Selector",
             Self::Custom => "Custom",
             Self::Direct => "Direct",
             Self::Tailscale => "Tailscale",
@@ -259,7 +264,16 @@ impl Profile {
     }
 
     /// Upstream ColAddress: `host:port` from outbound.
+    /// Auto Selector shows the tracked group name (no server of its own).
     pub fn display_address(&self) -> String {
+        if self.profile_type == ProfileType::AutoSelector {
+            if let Some(cfg) = crate::auto_selector::profile_auto_selector(self) {
+                if cfg.gid >= 0 {
+                    return format!("group#{}", cfg.gid);
+                }
+            }
+            return "group".into();
+        }
         let server = self
             .outbound
             .server

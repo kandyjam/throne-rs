@@ -11,12 +11,14 @@
 *.msi
 # (*.exe already ignored below)
 
-# Go core build artifacts
+# Go core build artifacts (binary names — not the core/ source tree)
 /deployment/
-**/Core
+# Note: never use **/Core — on case-insensitive FS it ignores core/ sources.
+**/ThroneCore
 **/nekobox_core
 **/nekobox_core.exe
 **/Core.exe
+/Core
 *.exe
 *.dll
 *.so

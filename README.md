@@ -2,11 +2,11 @@
 
 **Rust + [GPUI](https://github.com/zed-industries/zed) rewrite** of [Throne](https://github.com/throneproj/Throne) (formerly Nekoray) — a cross-platform desktop GUI proxy client powered by Sing-box / Xray.
 
-**Version:** `1.2.2` (aligned with `upstream/dev` tip tag / `NKR_VERSION` — `git describe upstream/dev --tags`; see root [`VERSION`](./VERSION))
+**Version:** `1.2.3` (aligned with upstream release tag / `NKR_VERSION` — see root [`VERSION`](./VERSION))
 
-> Status: **Wave C+** — Start/Stop with **route + MetaCubeX srslist + jsDelivr mirror + optional adblock** + URL Test/Stats/Connections + HTTP sub diff + macOS system proxy + Edit Profile rename.  
-> Upstream remote: `upstream` → [throneproj/Throne](https://github.com/throneproj/Throne) (`dev`).  
-> Parity matrix: [docs/UPSTREAM_TRACKING.md](./docs/UPSTREAM_TRACKING.md).
+> Status: **Wave 1.2.3** — version pin + **Auto Selector** (create / plan / Start via urltest group) + multi-file import + Program menu entries; plus prior Wave C+ Start/Stop, routes, stats, system proxy.  
+> Upstream remote: `upstream` → [throneproj/Throne](https://github.com/throneproj/Throne) (`dev` / tag `1.2.3`).  
+> Parity matrix: [docs/UPSTREAM_TRACKING.md](./docs/UPSTREAM_TRACKING.md) · Skill: [skills/throne-upstream-parity/SKILL.md](./skills/throne-upstream-parity/SKILL.md).
 
 ## Architecture
 
@@ -50,10 +50,10 @@ Legacy Qt/C++ GUI was removed on branch `rewrite/rust-gpui`. History remains on 
 ## Build & run
 
 ```bash
-# 1) Build Go core (required for Start to work)
-cd core/server
-go build -o ../../target/debug/ThroneCore .
-cd ../..
+# 1) Build Go core (required for Start / Auto Selector — 1.2.3 sources)
+./script/build-core                  # protoc + go build → target/debug/ThroneCore
+# or manually:
+#   cd core/server && protoc … && go build -o ../../target/debug/ThroneCore .
 
 # 2) GUI (binary is named `Throne` — required by ThroneCore parentcheck)
 cargo run -p throne

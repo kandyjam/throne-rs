@@ -529,6 +529,227 @@ fn decode_speed_test_item(data: &[u8]) -> Result<SpeedTestResult, CoreError> {
     Ok(r)
 }
 
+/// One member of a running auto-selector group (subset of `AutoSelectorMember`).
+#[derive(Debug, Clone, Default)]
+pub struct AutoSelectorMemberStatus {
+    pub tag: String,
+    pub rank: i32,
+    pub state: String,
+    pub selected: bool,
+    pub qualified: bool,
+    pub active: bool,
+    pub average_ms: i32,
+    pub failures: i32,
+    pub last_error: String,
+}
+
+/// Snapshot of one running auto-selector group (`AutoSelectorStatus`).
+#[derive(Debug, Clone, Default)]
+pub struct AutoSelectorGroupStatus {
+    pub tag: String,
+    pub phase: String,
+    pub selected: String,
+    pub pinned: String,
+    pub balance: bool,
+    pub balance_mode: String,
+    pub suspended: bool,
+    pub members_total: i32,
+    pub members_alive: i32,
+    pub members_qualified: i32,
+    pub last_switch_reason: String,
+    pub members: Vec<AutoSelectorMemberStatus>,
+}
+
+/// Encode `AutoSelectorActionRequest` (`tag`, `action`, `member`).
+pub fn encode_auto_selector_action(tag: &str, action: &str, member: &str) -> Vec<u8> {
+    let mut buf = Vec::new();
+    if !tag.is_empty() {
+        write_string(&mut buf, 1, tag);
+    }
+    if !action.is_empty() {
+        write_string(&mut buf, 2, action);
+    }
+    if !member.is_empty() {
+        write_string(&mut buf, 3, member);
+    }
+    buf
+}
+
+/// Decode `QueryAutoSelectorsResponse` (`repeated AutoSelectorStatus groups = 1`).
+pub fn decode_query_auto_selectors_resp(
+    data: &[u8],
+) -> Result<Vec<AutoSelectorGroupStatus>, CoreError> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        let (key, ni) = read_varint(data, i)?;
+        i = ni;
+        let field = (key >> 3) as u32;
+        let wire = (key & 0x7) as u8;
+        match (field, wire) {
+            (1, 2) => {
+                let (len, ni) = read_varint(data, i)?;
+                i = ni;
+                let len = len as usize;
+                if i + len > data.len() {
+                    return Err(CoreError::Rpc("truncated QueryAutoSelectorsResponse".into()));
+                }
+                out.push(decode_auto_selector_status(&data[i..i + len])?);
+                i += len;
+            }
+            _ => i = skip_field(data, i, wire)?,
+        }
+    }
+    Ok(out)
+}
+
+fn decode_auto_selector_status(data: &[u8]) -> Result<AutoSelectorGroupStatus, CoreError> {
+    let mut g = AutoSelectorGroupStatus::default();
+    let mut i = 0;
+    while i < data.len() {
+        let (key, ni) = read_varint(data, i)?;
+        i = ni;
+        let field = (key >> 3) as u32;
+        let wire = (key & 0x7) as u8;
+        match (field, wire) {
+            (1, 2) => {
+                let (s, ni) = read_string(data, i)?;
+                g.tag = s;
+                i = ni;
+            }
+            (2, 2) => {
+                let (s, ni) = read_string(data, i)?;
+                g.phase = s;
+                i = ni;
+            }
+            (3, 2) => {
+                let (s, ni) = read_string(data, i)?;
+                g.selected = s;
+                i = ni;
+            }
+            (4, 2) => {
+                let (s, ni) = read_string(data, i)?;
+                // selected_udp — ignore for now
+                let _ = s;
+                i = ni;
+            }
+            (5, 0) => {
+                let (v, ni) = read_varint(data, i)?;
+                g.balance = v != 0;
+                i = ni;
+            }
+            (6, 2) => {
+                let (s, ni) = read_string(data, i)?;
+                g.balance_mode = s;
+                i = ni;
+            }
+            (7, 0) => {
+                let (v, ni) = read_varint(data, i)?;
+                g.suspended = v != 0;
+                i = ni;
+            }
+            (9, 0) => {
+                let (v, ni) = read_varint(data, i)?;
+                g.members_total = v as i32;
+                i = ni;
+            }
+            (11, 0) => {
+                let (v, ni) = read_varint(data, i)?;
+                g.members_alive = v as i32;
+                i = ni;
+            }
+            (12, 0) => {
+                let (v, ni) = read_varint(data, i)?;
+                g.members_qualified = v as i32;
+                i = ni;
+            }
+            (19, 2) => {
+                let (s, ni) = read_string(data, i)?;
+                g.last_switch_reason = s;
+                i = ni;
+            }
+            (20, 2) => {
+                let (len, ni) = read_varint(data, i)?;
+                i = ni;
+                let len = len as usize;
+                if i + len > data.len() {
+                    return Err(CoreError::Rpc("truncated AutoSelectorMember".into()));
+                }
+                g.members
+                    .push(decode_auto_selector_member(&data[i..i + len])?);
+                i += len;
+            }
+            (21, 2) => {
+                let (s, ni) = read_string(data, i)?;
+                g.pinned = s;
+                i = ni;
+            }
+            _ => i = skip_field(data, i, wire)?,
+        }
+    }
+    Ok(g)
+}
+
+fn decode_auto_selector_member(data: &[u8]) -> Result<AutoSelectorMemberStatus, CoreError> {
+    let mut m = AutoSelectorMemberStatus::default();
+    let mut i = 0;
+    while i < data.len() {
+        let (key, ni) = read_varint(data, i)?;
+        i = ni;
+        let field = (key >> 3) as u32;
+        let wire = (key & 0x7) as u8;
+        match (field, wire) {
+            (1, 2) => {
+                let (s, ni) = read_string(data, i)?;
+                m.tag = s;
+                i = ni;
+            }
+            (2, 0) => {
+                let (v, ni) = read_varint(data, i)?;
+                m.rank = v as i32;
+                i = ni;
+            }
+            (3, 2) => {
+                let (s, ni) = read_string(data, i)?;
+                m.state = s;
+                i = ni;
+            }
+            (4, 0) => {
+                let (v, ni) = read_varint(data, i)?;
+                m.selected = v != 0;
+                i = ni;
+            }
+            (6, 0) => {
+                let (v, ni) = read_varint(data, i)?;
+                m.qualified = v != 0;
+                i = ni;
+            }
+            (7, 0) => {
+                let (v, ni) = read_varint(data, i)?;
+                m.active = v != 0;
+                i = ni;
+            }
+            (8, 0) => {
+                let (v, ni) = read_varint(data, i)?;
+                m.average_ms = v as i32;
+                i = ni;
+            }
+            (13, 0) => {
+                let (v, ni) = read_varint(data, i)?;
+                m.failures = v as i32;
+                i = ni;
+            }
+            (20, 2) => {
+                let (s, ni) = read_string(data, i)?;
+                m.last_error = s;
+                i = ni;
+            }
+            _ => i = skip_field(data, i, wire)?,
+        }
+    }
+    Ok(m)
+}
+
 /// Decode `ErrorResp.error` (field 1). Empty string means OK.
 pub fn decode_error_resp(data: &[u8]) -> Result<String, CoreError> {
     let mut i = 0;

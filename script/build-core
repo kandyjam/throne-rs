@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Build ThroneCore (Go) for the host and place it next to the debug GUI binary.
+# Requires: go 1.26+, protoc, protoc-gen-go, protoc-gen-go-grpc
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CORE_DIR="$ROOT/core/server"
+OUT_DIR="${1:-$ROOT/target/debug}"
+OUT_BIN="$OUT_DIR/ThroneCore"
+
+export PATH="${PATH}:$(go env GOPATH 2>/dev/null)/bin:${HOME}/go/bin:/opt/homebrew/bin"
+# Prefer a reachable module proxy (proxy.golang.org often times out in CN).
+export GOPROXY="${GOPROXY:-https://goproxy.cn,https://proxy.golang.org,direct}"
+
+if ! command -v go >/dev/null 2>&1; then
+  echo "error: go not found — install Go 1.26+ (brew install go)" >&2
+  exit 1
+fi
+if ! command -v protoc >/dev/null 2>&1; then
+  echo "error: protoc not found — brew install protobuf" >&2
+  exit 1
+fi
+
+# Ensure plugins
+if ! command -v protoc-gen-go >/dev/null 2>&1; then
+  go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+fi
+if ! command -v protoc-gen-go-grpc >/dev/null 2>&1; then
+  go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
+fi
+
+echo "==> generating gen/ from libcore.proto"
+(
+  cd "$CORE_DIR/gen"
+  protoc --go_out=. --go-grpc_out=. \
+    --go_opt=paths=source_relative \
+    --go-grpc_opt=paths=source_relative \
+    libcore.proto
+)
+
+mkdir -p "$OUT_DIR"
+echo "==> building ThroneCore → $OUT_BIN"
+(
+  cd "$CORE_DIR"
+  go build -trimpath -ldflags="-s -w" -o "$OUT_BIN" .
+)
+
+# macOS: clear quarantine so setuid / Gatekeeper don't block
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  xattr -d com.apple.quarantine "$OUT_BIN" 2>/dev/null || true
+fi
+
+echo "ok: $(ls -lh "$OUT_BIN" | awk '{print $5, $9}')"
+echo "note: Tun needs root setuid on the core binary (GUI elevates on first Tun enable)"

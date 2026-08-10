@@ -25,7 +25,8 @@ use gpui::{
 };
 
 use throne_core_client::{
-    ConnectionRow, CoreConfig, CoreSession, force_clear_system_proxy, set_system_proxy,
+    AutoSelectorGroupStatus, ConnectionRow, CoreConfig, CoreSession, force_clear_system_proxy,
+    set_system_proxy,
 };
 use throne_domain::{
     AppState, CoreStatus, GroupId, Profile, ProfileId, ProfileSortColumn, ProfileType,
@@ -36,7 +37,8 @@ use throne_import::{FetchOptions, fetch_url_with_options, import_subscription_re
 use crate::theme::{self, Theme, latency_color};
 use crate::ui::dialog_inputs::{DialogInputs, NestedInputs};
 use crate::ui::dialogs::{
-    Dialog, EditGroupView, HotkeyField, add_input_body, basic_settings_body, edit_group_body,
+    AutoSelectorGroupView, AutoSelectorMemberRow, Dialog, EditGroupView, HotkeyField,
+    add_input_body, auto_selector_stats_body, basic_settings_body, edit_group_body,
     edit_profile_body, hotkey_settings_body, manage_groups_body, subscription_diff_body,
     tun_settings_body,
 };
@@ -146,6 +148,52 @@ const FAILED_STOP_PROFILE_LOG: &str =
 
 fn runtime_profile_display(profile_type: ProfileType, profile_name: &str) -> String {
     format!("[{}] {profile_name}", profile_type.display_name())
+}
+
+fn auto_selector_group_view(g: AutoSelectorGroupStatus) -> AutoSelectorGroupView {
+    AutoSelectorGroupView {
+        tag: g.tag,
+        phase: g.phase,
+        selected: g.selected,
+        pinned: g.pinned,
+        balance: g.balance,
+        balance_mode: g.balance_mode,
+        suspended: g.suspended,
+        members_total: g.members_total,
+        members_alive: g.members_alive,
+        members_qualified: g.members_qualified,
+        last_switch_reason: g.last_switch_reason,
+        members: g
+            .members
+            .into_iter()
+            .map(|m| AutoSelectorMemberRow {
+                // Core tags are `p{id}`; display_name filled by enrich if known.
+                display_name: m.tag.clone(),
+                tag: m.tag,
+                rank: m.rank,
+                state: m.state,
+                selected: m.selected,
+                qualified: m.qualified,
+                active: m.active,
+                average_ms: m.average_ms,
+                failures: m.failures,
+                last_error: m.last_error,
+            })
+            .collect(),
+    }
+}
+
+/// Map core `p{id}` tags to profile display names when the id is still in the DB.
+fn enrich_auto_selector_names(state: &AppState, groups: &mut [AutoSelectorGroupView]) {
+    for g in groups {
+        for m in &mut g.members {
+            if let Some(id) = m.tag.strip_prefix('p').and_then(|s| s.parse::<i64>().ok()) {
+                if let Some(p) = state.profile(id) {
+                    m.display_name = p.name.clone();
+                }
+            }
+        }
+    }
 }
 
 fn resolve_stop_profile_display(
@@ -447,6 +495,8 @@ pub struct MainWindow {
     sort_asc: bool,
     /// Live connections from core (Connections tab).
     connections: Vec<ConnectionRow>,
+    /// Live Auto Selector snapshot while stats dialog is open (or last poll).
+    auto_selector_snapshot: Vec<AutoSelectorGroupView>,
     prev_traffic_at: Option<std::time::Instant>,
     /// Prevent an overdue core request from queuing another poll.
     runtime_poll_busy: bool,
@@ -535,6 +585,7 @@ impl MainWindow {
             sort_column: SortColumn::None,
             sort_asc: true,
             connections: Vec::new(),
+            auto_selector_snapshot: Vec::new(),
             prev_traffic_at: None,
             runtime_poll_busy: false,
             runtime_poll_failures: 0,
@@ -681,6 +732,7 @@ impl MainWindow {
             Dialog::ConfirmDeleteUnavailable { .. } => 7,
             Dialog::ConfirmUpdateAllSubscriptions => 8,
             Dialog::SubscriptionDiff { .. } => 9,
+            Dialog::AutoSelectorStats { .. } => 14,
             Dialog::RoutingSettings(d) => {
                 return (10, nested_kind(&d.nested));
             }
@@ -835,6 +887,105 @@ impl MainWindow {
         cx.notify();
     }
 
+    /// Upstream 1.2.3 Auto Selector: create a selector tracking the active group.
+    fn create_auto_selector(&mut self, cx: &mut Context<Self>) {
+        self.close_menus();
+        let home = self.state.active_group_id();
+        // Track the active group (subscription group is the common case).
+        let tracked = home;
+        match self.state.add_auto_selector(home, tracked, "") {
+            Ok(id) => {
+                let _ = self.state.select_profile(id);
+                let _ = self.persist_db();
+                if let Ok(plan) = self.state.plan_auto_selector_profile(id) {
+                    self.state.set_status_message(format!(
+                        "Auto Selector created · {}",
+                        plan.summary()
+                    ));
+                } else {
+                    self.state
+                        .set_status_message("Auto Selector created — URL Test the group, then Start");
+                }
+            }
+            Err(e) => {
+                self.state
+                    .set_status_message(format!("Could not create Auto Selector: {e}"));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Upstream 1.2.3 multi-file import: pick one or more files and import contents.
+    ///
+    /// Uses a native macOS/Linux file panel via `osascript` / `zenity` when available;
+    /// falls back to reading paths from the clipboard (newline-separated).
+    fn import_from_files(&mut self, cx: &mut Context<Self>) {
+        self.close_menus();
+        let paths = pick_import_files();
+        if paths.is_empty() {
+            // Fallback: clipboard may hold file paths (multi-line).
+            let text = cx
+                .read_from_clipboard()
+                .and_then(|item| item.text().map(|s| s.to_string()))
+                .or_else(read_os_clipboard)
+                .unwrap_or_default();
+            let clip_paths: Vec<_> = text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && std::path::Path::new(l).is_file())
+                .map(std::path::PathBuf::from)
+                .collect();
+            if clip_paths.is_empty() {
+                self.state.set_status_message(
+                    "No files selected. Tip: copy file paths to the clipboard, then retry.",
+                );
+                cx.notify();
+                return;
+            }
+            self.import_files_list(&clip_paths, cx);
+            return;
+        }
+        self.import_files_list(&paths, cx);
+    }
+
+    fn import_files_list(&mut self, paths: &[std::path::PathBuf], cx: &mut Context<Self>) {
+        let mut combined = String::new();
+        let mut ok = 0usize;
+        let mut err = 0usize;
+        for path in paths {
+            match std::fs::read_to_string(path) {
+                Ok(body) => {
+                    if !combined.is_empty() {
+                        combined.push('\n');
+                    }
+                    combined.push_str(body.trim());
+                    combined.push('\n');
+                    ok += 1;
+                }
+                Err(e) => {
+                    self.state
+                        .push_log(format!("Import file failed · {}: {e}", path.display()));
+                    err += 1;
+                }
+            }
+        }
+        if combined.trim().is_empty() {
+            self.state
+                .set_status_message(format!("No readable content ({ok} ok, {err} failed)"));
+            cx.notify();
+            return;
+        }
+        self.state.push_log(format!(
+            "Importing from {ok} file(s){}",
+            if err > 0 {
+                format!(" · {err} failed")
+            } else {
+                String::new()
+            }
+        ));
+        self.import_text(&combined, cx);
+    }
+
     fn open_routing_settings(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
         self.close_menus();
         self.dialog = Dialog::routing_from_state(&self.state);
@@ -922,6 +1073,165 @@ impl MainWindow {
                 cx.notify();
             }
         }
+    }
+
+    /// Upstream Tools → Auto Selector Stats (live while a selector is running).
+    fn open_auto_selector_stats(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_menus();
+        let running_is_selector = matches!(
+            self.state.core_status(),
+            CoreStatus::Running { profile_id, .. }
+                if self
+                    .state
+                    .profile(*profile_id)
+                    .is_some_and(|p| p.profile_type == ProfileType::AutoSelector)
+        );
+        let notice = if !self.state.core_status().is_running() {
+            "Core is not running — start an Auto Selector profile first.".into()
+        } else if !running_is_selector {
+            "Running profile is not an Auto Selector — stats may be empty.".into()
+        } else {
+            String::new()
+        };
+        self.dialog = Dialog::AutoSelectorStats {
+            only_problems: false,
+            selected_member: String::new(),
+            notice,
+        };
+        self.dialog_inputs = None;
+        self.present_gpui_dialog(window, cx);
+        // Kick an immediate snapshot.
+        self.refresh_auto_selector_stats(cx);
+        cx.notify();
+    }
+
+    fn refresh_auto_selector_stats(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.dialog, Dialog::AutoSelectorStats { .. }) {
+            return;
+        }
+        if !self.state.core_status().is_running() || self.core_op_busy {
+            return;
+        }
+        let core = Arc::clone(&self.core);
+        let poll_generation = self.runtime_generation;
+        cx.spawn(async move |this, cx| {
+            let snap = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut guard = core
+                        .lock()
+                        .map_err(|_| "core session lock poisoned".to_string())?;
+                    guard
+                        .query_auto_selectors()
+                        .map_err(|e| e.to_string())
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if !runtime_poll_is_current(poll_generation, this.runtime_generation) {
+                    return;
+                }
+                if !matches!(this.dialog, Dialog::AutoSelectorStats { .. }) {
+                    return;
+                }
+                match snap {
+                    Ok(groups) => {
+                        let mut views: Vec<_> = groups
+                            .into_iter()
+                            .map(auto_selector_group_view)
+                            .collect();
+                        enrich_auto_selector_names(&this.state, &mut views);
+                        this.auto_selector_snapshot = views;
+                        if let Dialog::AutoSelectorStats { notice, .. } = &mut this.dialog {
+                            if this.auto_selector_snapshot.is_empty() {
+                                *notice =
+                                    "Core reports no auto-selector groups (rebuild ThroneCore 1.2.3?)."
+                                        .into();
+                            } else if notice.contains("no auto-selector")
+                                || notice.contains("not running")
+                            {
+                                notice.clear();
+                            }
+                        }
+                        // Re-present so table text refreshes (gpui dialog content is snapshot).
+                        this.presented_dialog_stack = (0, NestedKind::None);
+                        this.request_gpui_dialog();
+                        cx.notify();
+                    }
+                    Err(e) => {
+                        if let Dialog::AutoSelectorStats { notice, .. } = &mut this.dialog {
+                            *notice = format!("QueryAutoSelectors failed: {e}");
+                        }
+                        this.presented_dialog_stack = (0, NestedKind::None);
+                        this.request_gpui_dialog();
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn auto_selector_action(&mut self, action: &str, member: &str, cx: &mut Context<Self>) {
+        if !self.state.core_status().is_running() {
+            if let Dialog::AutoSelectorStats { notice, .. } = &mut self.dialog {
+                *notice = "Core is not running".into();
+            }
+            cx.notify();
+            return;
+        }
+        let tag = self
+            .auto_selector_snapshot
+            .first()
+            .map(|g| g.tag.clone())
+            .unwrap_or_default();
+        let core = Arc::clone(&self.core);
+        let action = action.to_string();
+        let member = member.to_string();
+        let action_for_msg = action.clone();
+        let member_for_msg = member.clone();
+        let poll_generation = self.runtime_generation;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut guard = core
+                        .lock()
+                        .map_err(|_| "core session lock poisoned".to_string())?;
+                    guard
+                        .auto_selector_action(&tag, &action, &member)
+                        .map_err(|e| e.to_string())
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if !runtime_poll_is_current(poll_generation, this.runtime_generation) {
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        if let Dialog::AutoSelectorStats { notice, .. } = &mut this.dialog {
+                            *notice = match action_for_msg.as_str() {
+                                "recheck" => "Recheck requested".into(),
+                                "select" if member_for_msg.is_empty() => "Pin released".into(),
+                                "select" => format!("Pinned {member_for_msg}"),
+                                _ => "OK".into(),
+                            };
+                        }
+                        this.refresh_auto_selector_stats(cx);
+                    }
+                    Err(e) => {
+                        if let Dialog::AutoSelectorStats { notice, .. } = &mut this.dialog {
+                            *notice = format!("Action failed: {e}");
+                        }
+                        this.presented_dialog_stack = (0, NestedKind::None);
+                        this.request_gpui_dialog();
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn save_edit_profile(&mut self, cx: &mut Context<Self>) {
@@ -2106,6 +2416,47 @@ impl MainWindow {
             .map(|r| r.name.clone())
             .unwrap_or_else(|| "default".into());
 
+        // Upstream 1.2.3 Auto Selector: resolve members before Start.
+        let auto_build = if profile.profile_type == ProfileType::AutoSelector {
+            match self.state.resolve_auto_selector_members(profile_id) {
+                Ok((mut cfg, plan, members)) => {
+                    self.state.push_log(format!(
+                        "[Auto selector] {} · starting with {} member(s)",
+                        plan.summary(),
+                        members.len()
+                    ));
+                    cfg.last_built = plan.build.clone();
+                    cfg.last_built_at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    cfg.pool = plan.pool.clone();
+                    // Persist ranking / last_built into the selector profile.
+                    let _ = self.state.update_profile_outbound_json(
+                        profile_id,
+                        cfg.to_outbound_json(),
+                    );
+                    Some(throne_core_client::AutoSelectorBuild {
+                        config: cfg,
+                        members,
+                    })
+                }
+                Err(e) => {
+                    self.core_op_busy = false;
+                    self.running_profile_display = None;
+                    self.state.set_core_status(CoreStatus::Error(e.to_string()));
+                    self.state
+                        .set_status_message_only(format!("Auto Selector: {e}"));
+                    self.state
+                        .push_log(failed_start_profile_log(&profile_display));
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
@@ -2115,7 +2466,13 @@ impl MainWindow {
                     // Always pass apply_system_proxy=false here; we apply from
                     // live settings after Start so mid-start toggles win.
                     guard
-                        .start_profile(&profile, &settings, route.as_ref(), false)
+                        .start_profile_ex(
+                            &profile,
+                            &settings,
+                            route.as_ref(),
+                            auto_build.as_ref(),
+                            false,
+                        )
                         .map_err(|e| e.to_string())
                 })
                 .await;
@@ -2925,6 +3282,7 @@ impl MainWindow {
         let poll_generation = self.runtime_generation;
         let core = Arc::clone(&self.core);
         let want_conn = self.bottom_tab == 1;
+        let want_auto = matches!(self.dialog, Dialog::AutoSelectorStats { .. });
         cx.spawn(async move |this, cx| {
             let snap = cx
                 .background_executor()
@@ -2940,7 +3298,12 @@ impl MainWindow {
                     } else {
                         Vec::new()
                     };
-                    Ok::<_, String>((stats, conns, core_logs))
+                    let auto = if want_auto {
+                        guard.query_auto_selectors().unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    Ok::<_, String>((stats, conns, core_logs, auto))
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -2952,7 +3315,7 @@ impl MainWindow {
                     runtime_poll_health(this.runtime_poll_failures, snap.is_ok());
                 this.runtime_poll_failures = failures;
                 match snap {
-                    Ok((cum, conns, core_logs)) => {
+                    Ok((cum, conns, core_logs, auto)) => {
                         let mut logs_changed = false;
                         for line in core_logs {
                             this.state.push_log_only(line);
@@ -2980,7 +3343,22 @@ impl MainWindow {
                         if want_conn {
                             this.connections = conns;
                         }
-                        if traffic_changed || want_conn || logs_changed {
+                        let mut auto_changed = false;
+                        if want_auto && matches!(this.dialog, Dialog::AutoSelectorStats { .. }) {
+                            let mut next: Vec<_> = auto
+                                .into_iter()
+                                .map(auto_selector_group_view)
+                                .collect();
+                            enrich_auto_selector_names(&this.state, &mut next);
+                            if next != this.auto_selector_snapshot {
+                                this.auto_selector_snapshot = next;
+                                auto_changed = true;
+                                // Refresh dialog body with new rows.
+                                this.presented_dialog_stack = (0, NestedKind::None);
+                                this.request_gpui_dialog();
+                            }
+                        }
+                        if traffic_changed || want_conn || logs_changed || auto_changed {
                             cx.notify();
                         }
                     }
@@ -3414,7 +3792,8 @@ impl MainWindow {
             Dialog::ManageGroups
             | Dialog::ConfirmRemoveGroup { .. }
             | Dialog::ConfirmUpdateAllSubscriptions
-            | Dialog::SubscriptionDiff { .. } => None,
+            | Dialog::SubscriptionDiff { .. }
+            | Dialog::AutoSelectorStats { .. } => None,
             Dialog::EditGroup { .. } => None,
             Dialog::AddFromInput { text } => Some((text, true)),
             Dialog::RoutingSettings(draft) => {
@@ -3764,11 +4143,18 @@ impl MainWindow {
         match menu {
             OpenMenu::Program => {
                 panel = panel.child(menu_label("Program"));
+                // Upstream 1.2.3: Program → New Profile (+ Auto Selector)
+                item!("prog-new-auto", "New Auto Selector", |t, _w, cx| {
+                    t.create_auto_selector(cx);
+                });
                 item!("prog-input", "Add profile from input", |t, w, cx| {
                     t.open_add_from_input(w, cx);
                 });
                 item!("prog-clip", "Add profile from clipboard", |t, _w, cx| {
                     t.import_clipboard(cx);
+                });
+                item!("prog-files", "Import from file(s)…", |t, _w, cx| {
+                    t.import_from_files(cx);
                 });
                 item!("prog-start", "Start", |t, _w, cx| t.toggle_proxy(cx));
                 item!("prog-stop", "Stop", |t, _w, cx| {
@@ -3905,6 +4291,9 @@ impl MainWindow {
                     t.state.set_status_message(
                         "Connections tab shows live sessions while core is running",
                     );
+                });
+                item!("t-auto-sel", "Auto Selector Stats", |t, w, cx| {
+                    t.open_auto_selector_stats(w, cx);
                 });
                 item!("t-traffic", "Traffic Stats", |t, _w, cx| {
                     let label = t.state.speed_label();
@@ -4277,6 +4666,13 @@ impl MainWindow {
         };
         let entity = cx.entity().clone();
         let show_sec = self.state.settings().show_config_security;
+        // Resolve Auto Selector → tracked group name for the Address column.
+        let group_names: std::collections::HashMap<GroupId, String> = self
+            .state
+            .all_groups()
+            .into_iter()
+            .map(|g| (g.id, g.name.clone()))
+            .collect();
 
         div().flex_1().min_h(px(120.)).bg(Theme::bg_elevated()).child(
             uniform_list(
@@ -4297,7 +4693,14 @@ impl MainWindow {
                             (ix + 1).to_string()
                         };
                         let ty = profile.display_type();
-                        let addr = profile.display_address();
+                        let addr = if profile.profile_type == ProfileType::AutoSelector {
+                            throne_domain::profile_auto_selector(profile)
+                                .and_then(|c| group_names.get(&c.gid).cloned())
+                                .map(|n| format!("group · {n}"))
+                                .unwrap_or_else(|| profile.display_address())
+                        } else {
+                            profile.display_address()
+                        };
                         let name = profile.name.clone();
                         let test = profile.display_test_result();
                         let traffic = profile.display_traffic();
@@ -4685,6 +5088,58 @@ fn fetch_route_from_body(body: &str) -> Result<throne_domain::RouteProfile, Stri
     } else {
         errs.join("; ")
     })
+}
+
+/// Native multi-file picker (upstream 1.2.3 "import from file" multi-select).
+fn pick_import_files() -> Vec<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        // AppleScript choose file with multiple selections enabled.
+        let script = r#"
+set theFiles to choose file with prompt "Import profiles" with multiple selections allowed
+set out to ""
+repeat with f in theFiles
+    set out to out & (POSIX path of f) & linefeed
+end repeat
+return out
+"#;
+        let out = Command::new("osascript").args(["-e", script]).output();
+        if let Ok(out) = out {
+            if out.status.success() {
+                return String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(std::path::PathBuf::from)
+                    .collect();
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::process::Command;
+        // zenity / kdialog multi-select when present.
+        if let Ok(out) = Command::new("zenity")
+            .args([
+                "--file-selection",
+                "--multiple",
+                "--separator=\n",
+                "--title=Import profiles",
+            ])
+            .output()
+        {
+            if out.status.success() {
+                return String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(std::path::PathBuf::from)
+                    .collect();
+            }
+        }
+    }
+    Vec::new()
 }
 
 fn read_os_clipboard() -> Option<String> {
@@ -5614,6 +6069,111 @@ fn build_gpui_dialog(
                 })
                 .on_close(move |_, _, _| {})
                 .child(subscription_diff_body(&body))
+        }
+        Dialog::AutoSelectorStats {
+            only_problems,
+            selected_member,
+            notice,
+        } => {
+            let only_problems = *only_problems;
+            let selected_member = selected_member.clone();
+            let notice = notice.clone();
+            let groups = this.auto_selector_snapshot.clone();
+            let e_toggle = entity.clone();
+            let e_select = entity.clone();
+            let e_recheck = entity.clone();
+            let e_pin = entity.clone();
+            let e_release = entity.clone();
+            let e_close = entity.clone();
+            let max_h = (window.viewport_size().height * 0.82).max(px(360.));
+            dialog
+                .title("Auto Selector")
+                .w(px(720.))
+                .max_h(max_h)
+                .overlay_closable(true)
+                .on_cancel({
+                    let entity = entity.clone();
+                    move |_, _, cx| {
+                        entity.update(cx, |t, cx| {
+                            t.close_dialog();
+                            cx.notify();
+                        });
+                        true
+                    }
+                })
+                .on_close(on_dismiss)
+                .child(auto_selector_stats_body(
+                    &groups,
+                    only_problems,
+                    &selected_member,
+                    &notice,
+                    move |_, cx| {
+                        e_toggle.update(cx, |t, cx| {
+                            if let Dialog::AutoSelectorStats {
+                                only_problems, ..
+                            } = &mut t.dialog
+                            {
+                                *only_problems = !*only_problems;
+                            }
+                            t.presented_dialog_stack = (0, NestedKind::None);
+                            t.request_gpui_dialog();
+                            cx.notify();
+                        });
+                    },
+                    move |tag, _, cx| {
+                        e_select.update(cx, |t, cx| {
+                            if let Dialog::AutoSelectorStats {
+                                selected_member, ..
+                            } = &mut t.dialog
+                            {
+                                *selected_member = if *selected_member == tag {
+                                    String::new()
+                                } else {
+                                    tag
+                                };
+                            }
+                            t.presented_dialog_stack = (0, NestedKind::None);
+                            t.request_gpui_dialog();
+                            cx.notify();
+                        });
+                    },
+                    move |_, cx| {
+                        e_recheck.update(cx, |t, cx| {
+                            t.auto_selector_action("recheck", "", cx);
+                        });
+                    },
+                    move |_, cx| {
+                        e_pin.update(cx, |t, cx| {
+                            let member = match &t.dialog {
+                                Dialog::AutoSelectorStats {
+                                    selected_member, ..
+                                } => selected_member.clone(),
+                                _ => String::new(),
+                            };
+                            if member.is_empty() {
+                                if let Dialog::AutoSelectorStats { notice, .. } = &mut t.dialog {
+                                    *notice = "Select a member row first".into();
+                                }
+                                t.presented_dialog_stack = (0, NestedKind::None);
+                                t.request_gpui_dialog();
+                                cx.notify();
+                            } else {
+                                t.auto_selector_action("select", &member, cx);
+                            }
+                        });
+                    },
+                    move |_, cx| {
+                        e_release.update(cx, |t, cx| {
+                            t.auto_selector_action("select", "", cx);
+                        });
+                    },
+                    move |window, cx| {
+                        e_close.update(cx, |t, cx| {
+                            t.close_dialog_with_window(window, cx);
+                            cx.notify();
+                        });
+                    },
+                ))
         }
         Dialog::RoutingSettings(draft) => {
             let entity_ev = entity.clone();

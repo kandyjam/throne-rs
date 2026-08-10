@@ -128,6 +128,13 @@ pub enum Dialog {
         title: String,
         body: String,
     },
+    /// Upstream DialogAutoSelector — live view while an Auto Selector is running.
+    AutoSelectorStats {
+        only_problems: bool,
+        /// Highlighted member tag for Pin (empty = none).
+        selected_member: String,
+        notice: String,
+    },
 }
 
 impl Dialog {
@@ -620,6 +627,291 @@ pub fn subscription_diff_body(body: &str) -> impl IntoElement {
         .text_sm()
         .text_color(Theme::text())
         .child(body.to_string())
+}
+
+/// One row in the Auto Selector stats table (core `AutoSelectorMember` subset).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AutoSelectorMemberRow {
+    pub tag: String,
+    pub display_name: String,
+    pub rank: i32,
+    pub state: String,
+    pub selected: bool,
+    pub qualified: bool,
+    pub active: bool,
+    pub average_ms: i32,
+    pub failures: i32,
+    pub last_error: String,
+}
+
+/// Snapshot of one running auto-selector group for the stats dialog.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AutoSelectorGroupView {
+    pub tag: String,
+    pub phase: String,
+    pub selected: String,
+    pub pinned: String,
+    pub balance: bool,
+    pub balance_mode: String,
+    pub suspended: bool,
+    pub members_total: i32,
+    pub members_alive: i32,
+    pub members_qualified: i32,
+    pub last_switch_reason: String,
+    pub members: Vec<AutoSelectorMemberRow>,
+}
+
+/// Live Auto Selector monitor (upstream `DialogAutoSelector`).
+pub fn auto_selector_stats_body(
+    groups: &[AutoSelectorGroupView],
+    only_problems: bool,
+    selected_member: &str,
+    notice: &str,
+    on_toggle_problems: impl Fn(&mut Window, &mut App) + 'static + Clone,
+    on_select_member: impl Fn(String, &mut Window, &mut App) + 'static + Clone,
+    on_recheck: impl Fn(&mut Window, &mut App) + 'static,
+    on_pin: impl Fn(&mut Window, &mut App) + 'static,
+    on_release: impl Fn(&mut Window, &mut App) + 'static,
+    on_close: impl Fn(&mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    // Callbacks below adapt to Button/Switch's ClickEvent signature.
+    let group = groups.first();
+    let headline = match group {
+        Some(g) if g.suspended => format!("Suspended · local network down · {}", g.tag),
+        Some(g) => {
+            let sel = if g.selected.is_empty() {
+                "—".into()
+            } else {
+                g.selected.clone()
+            };
+            format!(
+                "{} · phase {} · selected {sel}",
+                if g.tag.is_empty() { "proxy" } else { &g.tag },
+                if g.phase.is_empty() {
+                    "—"
+                } else {
+                    &g.phase
+                }
+            )
+        }
+        None => "No auto-selector is running".into(),
+    };
+    let detail = match group {
+        Some(g) => {
+            let pin = if g.pinned.is_empty() {
+                "automatic".into()
+            } else {
+                format!("pinned {}", g.pinned)
+            };
+            let bal = if g.balance {
+                format!(" · balance {}", g.balance_mode)
+            } else {
+                String::new()
+            };
+            let reason = if g.last_switch_reason.is_empty() {
+                String::new()
+            } else {
+                format!(" · last switch: {}", g.last_switch_reason)
+            };
+            format!(
+                "members {} total · {} alive · {} qualified · {pin}{bal}{reason}",
+                g.members_total, g.members_alive, g.members_qualified
+            )
+        }
+        None => {
+            "Start an Auto Selector profile, then open this window again.".into()
+        }
+    };
+
+    let mut rows: Vec<AutoSelectorMemberRow> = groups
+        .iter()
+        .flat_map(|g| g.members.iter().cloned())
+        .collect();
+    if only_problems {
+        rows.retain(|m| {
+            m.state != "ok"
+                || m.failures > 0
+                || !m.last_error.is_empty()
+                || m.state == "dead"
+                || m.state == "degraded"
+                || m.state == "cooldown"
+        });
+    }
+    rows.sort_by(|a, b| {
+        a.rank
+            .cmp(&b.rank)
+            .then_with(|| a.average_ms.cmp(&b.average_ms))
+            .then_with(|| a.tag.cmp(&b.tag))
+    });
+
+    let mut table = div()
+        .id("as-table")
+        .w_full()
+        .max_h(px(320.))
+        .overflow_y_scroll()
+        .border_1()
+        .border_color(Theme::border_light())
+        .rounded_sm()
+        .child(
+            div()
+                .flex()
+                .px_2()
+                .py_1()
+                .bg(Theme::bg_app())
+                .text_xs()
+                .text_color(Theme::text_muted())
+                .child(div().w(px(36.)).child("#"))
+                .child(div().w(px(72.)).child("State"))
+                .child(div().w(px(64.)).child("Avg"))
+                .child(div().w(px(40.)).child("Fail"))
+                .child(div().flex_1().child("Member"))
+                .child(div().w(px(48.)).child("Flags")),
+        );
+
+    if rows.is_empty() {
+        table = table.child(
+            div()
+                .p_3()
+                .text_sm()
+                .text_color(Theme::text_muted())
+                .child(if groups.is_empty() {
+                    "Waiting for core snapshot…"
+                } else if only_problems {
+                    "No problem members right now."
+                } else {
+                    "No members reported."
+                }),
+        );
+    } else {
+        for (i, m) in rows.into_iter().enumerate() {
+            let tag = m.tag.clone();
+            let is_sel = selected_member == m.tag;
+            let name = if m.display_name.is_empty() {
+                m.tag.clone()
+            } else {
+                m.display_name.clone()
+            };
+            let avg = if m.average_ms > 0 {
+                format!("{} ms", m.average_ms)
+            } else {
+                "—".into()
+            };
+            let flags = {
+                let mut f = Vec::new();
+                if m.selected {
+                    f.push("sel");
+                }
+                if m.qualified {
+                    f.push("ok");
+                }
+                if m.active {
+                    f.push("act");
+                }
+                if f.is_empty() {
+                    "—".into()
+                } else {
+                    f.join(" ")
+                }
+            };
+            let err = if m.last_error.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", m.last_error)
+            };
+            let on_row = on_select_member.clone();
+            let bg = if is_sel {
+                Theme::bg_selected()
+            } else if i % 2 == 1 {
+                Theme::bg_app()
+            } else {
+                Theme::bg_elevated()
+            };
+            let fg = if is_sel {
+                Theme::text_on_selected()
+            } else {
+                Theme::text()
+            };
+            table = table.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .px_2()
+                    .py_1()
+                    .bg(bg)
+                    .text_sm()
+                    .text_color(fg)
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        move |_, window, cx| {
+                            on_row(tag.clone(), window, cx);
+                        },
+                    )
+                    .child(div().w(px(36.)).child(format!("{}", m.rank.max(0))))
+                    .child(div().w(px(72.)).child(m.state.clone()))
+                    .child(div().w(px(64.)).child(avg))
+                    .child(div().w(px(40.)).child(format!("{}", m.failures)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(format!("{name}{err}")),
+                    )
+                    .child(div().w(px(48.)).text_xs().child(flags)),
+            );
+        }
+    }
+
+    let notice = notice.to_string();
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .w_full()
+        .child(section_hint(&headline))
+        .child(
+            div()
+                .text_xs()
+                .text_color(Theme::text_muted())
+                .child(detail),
+        )
+        .child(mode_switch(
+            "as-only-problems",
+            "Only problems",
+            only_problems,
+            move |_, window, cx| on_toggle_problems(window, cx),
+        ))
+        .child(table)
+        .child(
+            div()
+                .text_xs()
+                .text_color(Theme::text_muted())
+                .child(if notice.is_empty() {
+                    "Click a row, then Pin. Recheck forces a full sweep.".into()
+                } else {
+                    notice
+                }),
+        )
+        .child(
+            div()
+                .flex()
+                .justify_end()
+                .gap_2()
+                .mt_2()
+                .child(secondary_btn("as-recheck", "Recheck", move |_, w, cx| {
+                    on_recheck(w, cx)
+                }))
+                .child(secondary_btn("as-pin", "Pin", move |_, w, cx| on_pin(w, cx)))
+                .child(secondary_btn("as-release", "Release pin", move |_, w, cx| {
+                    on_release(w, cx)
+                }))
+                .child(primary_btn("as-close", "Close", move |_, w, cx| {
+                    on_close(w, cx)
+                })),
+        )
 }
 
 pub fn add_input_body(

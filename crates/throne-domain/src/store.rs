@@ -2,6 +2,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use thiserror::Error;
 
+use crate::auto_selector::{
+    AutoSelectorConfig, AutoSelectorPlan, plan_auto_selector, profile_auto_selector,
+    rerank_auto_selector_pool,
+};
 use crate::models::{
     AppSettings, CoreStatus, Group, GroupId, ParsedOutbound, Profile, ProfileId, ProfileType,
     RouteProfile, SystemMode, TrafficSnapshot,
@@ -535,6 +539,135 @@ impl AppState {
             g.profile_ids.push(id);
         }
         id
+    }
+
+    /// Create an upstream-style Auto Selector profile that tracks `tracked_group_id`.
+    ///
+    /// The profile is stored in `home_group_id` (usually the active group). The
+    /// selector draws members from `tracked_group_id` (often the same group).
+    pub fn add_auto_selector(
+        &mut self,
+        home_group_id: GroupId,
+        tracked_group_id: GroupId,
+        name: impl Into<String>,
+    ) -> Result<ProfileId, StoreError> {
+        if !self.groups.contains_key(&home_group_id) {
+            return Err(StoreError::GroupNotFound(home_group_id));
+        }
+        if !self.groups.contains_key(&tracked_group_id) {
+            return Err(StoreError::GroupNotFound(tracked_group_id));
+        }
+        let name = name.into();
+        let name = if name.trim().is_empty() {
+            let gname = self
+                .groups
+                .get(&tracked_group_id)
+                .map(|g| g.name.as_str())
+                .unwrap_or("group");
+            format!("Auto · {gname}")
+        } else {
+            name.trim().to_string()
+        };
+        let mut cfg = AutoSelectorConfig::new_for_group(tracked_group_id, &name);
+        cfg.normalize();
+        let id = self.add_profile(home_group_id, name, ProfileType::AutoSelector);
+        if let Some(p) = self.profiles.get_mut(&id) {
+            p.outbound_json = cfg.to_outbound_json();
+            p.outbound = ParsedOutbound {
+                tag: Some(cfg.name.clone()),
+                raw_json: Some(p.outbound_json.clone()),
+                ..Default::default()
+            };
+        }
+        self.push_log(format!("Created Auto Selector · {}", cfg.name));
+        Ok(id)
+    }
+
+    /// Plan membership for an Auto Selector profile.
+    pub fn plan_auto_selector_profile(&self, profile_id: ProfileId) -> Result<AutoSelectorPlan, StoreError> {
+        let profile = self
+            .profiles
+            .get(&profile_id)
+            .ok_or(StoreError::ProfileNotFound(profile_id))?;
+        let cfg = profile_auto_selector(profile).ok_or_else(|| {
+            StoreError::Msg("Profile is not an Auto Selector".into())
+        })?;
+        let group = self.groups.get(&cfg.gid);
+        Ok(plan_auto_selector(profile, &cfg, group, |id| {
+            self.profiles.get(&id).cloned()
+        }))
+    }
+
+    /// Persist ranked pool after URL testing members of an Auto Selector.
+    pub fn rerank_auto_selector(&mut self, profile_id: ProfileId) -> Result<Vec<ProfileId>, StoreError> {
+        let profile = self
+            .profiles
+            .get(&profile_id)
+            .ok_or(StoreError::ProfileNotFound(profile_id))?
+            .clone();
+        let mut cfg = profile_auto_selector(&profile).ok_or_else(|| {
+            StoreError::Msg("Profile is not an Auto Selector".into())
+        })?;
+        let group = self.groups.get(&cfg.gid).cloned();
+        let ranked = rerank_auto_selector_pool(
+            &mut cfg,
+            profile_id,
+            group.as_ref(),
+            |id| self.profiles.get(&id).cloned(),
+        );
+        if let Some(p) = self.profiles.get_mut(&profile_id) {
+            p.outbound_json = cfg.to_outbound_json();
+            p.outbound.raw_json = Some(p.outbound_json.clone());
+        }
+        Ok(ranked)
+    }
+
+    /// Replace a profile's outbound_json (used after Auto Selector re-rank / last_built).
+    pub fn update_profile_outbound_json(
+        &mut self,
+        profile_id: ProfileId,
+        outbound_json: String,
+    ) -> Result<(), StoreError> {
+        let p = self
+            .profiles
+            .get_mut(&profile_id)
+            .ok_or(StoreError::ProfileNotFound(profile_id))?;
+        p.outbound_json = outbound_json.clone();
+        p.outbound.raw_json = Some(outbound_json);
+        Ok(())
+    }
+
+    /// Resolve Auto Selector build members (profiles) for core config generation.
+    pub fn resolve_auto_selector_members(
+        &self,
+        profile_id: ProfileId,
+    ) -> Result<(AutoSelectorConfig, AutoSelectorPlan, Vec<Profile>), StoreError> {
+        let profile = self
+            .profiles
+            .get(&profile_id)
+            .ok_or(StoreError::ProfileNotFound(profile_id))?;
+        let cfg = profile_auto_selector(profile).ok_or_else(|| {
+            StoreError::Msg("Profile is not an Auto Selector".into())
+        })?;
+        let group = self.groups.get(&cfg.gid);
+        let plan = plan_auto_selector(profile, &cfg, group, |id| {
+            self.profiles.get(&id).cloned()
+        });
+        if let Some(err) = &plan.error {
+            return Err(StoreError::Msg(err.clone()));
+        }
+        let mut members = Vec::new();
+        for id in &plan.build {
+            if let Some(p) = self.profiles.get(id) {
+                members.push(p.clone());
+            }
+        }
+        if members.is_empty() {
+            return Err(StoreError::Msg(
+                "Auto selector produced no usable members".into(),
+            ));
+        }
+        Ok((cfg, plan, members))
     }
 
     /// Toggle start/stop for the selected profile (domain-only; core client hooks later).
@@ -1742,6 +1875,7 @@ fn profile_is_structurally_invalid(profile: &Profile) -> bool {
     !matches!(
         profile.profile_type,
         ProfileType::Chain
+            | ProfileType::AutoSelector
             | ProfileType::Custom
             | ProfileType::Direct
             | ProfileType::Tailscale

@@ -5,8 +5,8 @@
 
 use serde_json::{Map, Value, json};
 use throne_domain::{
-    AppSettings, DefaultOutbound, ParsedOutbound, Profile, ProfileType, RouteProfile, RouteRule,
-    RulesetMirror,
+    AppSettings, AutoSelectorConfig, DefaultOutbound, ParsedOutbound, Profile, ProfileType,
+    RouteProfile, RouteRule, RulesetMirror,
 };
 
 use crate::CoreError;
@@ -22,6 +22,16 @@ pub struct BuiltConfig {
     pub tun_ipv4_cidr: String,
 }
 
+/// Optional Auto Selector expansion for Start.
+///
+/// When set, `members` are emitted as `p{id}` outbounds and a group outbound
+/// tagged `proxy` selects among them (urltest, or sticky best when only one).
+#[derive(Debug, Clone)]
+pub struct AutoSelectorBuild {
+    pub config: AutoSelectorConfig,
+    pub members: Vec<Profile>,
+}
+
 /// Build sing-box JSON for starting `profile` with the given settings.
 ///
 /// When `route_profile` is set (e.g. "Bypass China"), its rules and remote
@@ -31,7 +41,29 @@ pub fn build_load_config(
     settings: &AppSettings,
     route_profile: Option<&RouteProfile>,
 ) -> Result<BuiltConfig, CoreError> {
-    let outbound = build_proxy_outbound(profile)?;
+    build_load_config_ex(profile, settings, route_profile, None)
+}
+
+/// Like [`build_load_config`], with optional Auto Selector member expansion.
+pub fn build_load_config_ex(
+    profile: &Profile,
+    settings: &AppSettings,
+    route_profile: Option<&RouteProfile>,
+    auto_selector: Option<&AutoSelectorBuild>,
+) -> Result<BuiltConfig, CoreError> {
+    let (proxy_outbound, extra_outbounds, proxy_direct_domains) =
+        if let Some(auto) = auto_selector {
+            build_auto_selector_outbounds(auto, settings)?
+        } else if profile.profile_type == ProfileType::AutoSelector {
+            return Err(CoreError::Config(
+                "Auto Selector requires resolved members — call resolve_auto_selector_members first"
+                    .into(),
+            ));
+        } else {
+            let outbound = build_proxy_outbound(profile)?;
+            let domains = collect_outbound_server_domains(profile);
+            (outbound, Vec::new(), domains)
+        };
     // Upstream `buildInboundSection`: mixed inbound listen = settings.inbound_address
     // as-is. Tray "Allow other devices to connect" sets `::` (or user sets
     // `0.0.0.0`); system-proxy *clients* still use loopback via `proxy_client_host`.
@@ -54,8 +86,7 @@ pub fn build_load_config(
     // TUN inbound when toolbar Tun is on (needs privileges on macOS/Linux).
     // Mirrors upstream `buildInboundSection` (generate.cpp).
     let mut tun_ipv4_cidr = String::new();
-    // Upstream `CalculatePrerequisities`: proxy server hostnames → dns-direct.
-    let proxy_direct_domains = collect_outbound_server_domains(profile);
+    let outbound = proxy_outbound;
     if settings.tun_mode_enabled {
         // Upstream buildDNSSection: Darwin Tun requires core_box_underlying_dns.
         validate_darwin_tun_underlying_dns(settings)?;
@@ -152,14 +183,15 @@ pub fn build_load_config(
             .insert("auto_detect_interface".into(), json!(true));
     }
 
+    let mut outbounds = extra_outbounds;
+    outbounds.push(outbound);
+    outbounds.push(json!({ "type": "direct", "tag": "direct" }));
+
     let config = json!({
         "log": { "level": log_level, "timestamp": true },
         "dns": dns,
         "inbounds": inbounds,
-        "outbounds": [
-            outbound,
-            { "type": "direct", "tag": "direct" }
-        ],
+        "outbounds": outbounds,
         "route": route,
         // clash_api enables TrafficManager used by QueryStats / QueryConnections.
         // Upstream cache_file also sets store_fakeip / store_rdrc when applicable.
@@ -693,7 +725,109 @@ fn normalize_listen_address(addr: &str) -> String {
     }
 }
 
+/// Build member outbounds + upstream `auto-selector` group tagged `proxy`.
+///
+/// Matches Throne 1.2.3 `buildAutoSelectorGroup` (generate.cpp). Requires
+/// ThroneCore built against the Throneproj/sing-box fork that registers the
+/// `auto-selector` outbound type (core ≥ 1.2.3).
+fn build_auto_selector_outbounds(
+    auto: &AutoSelectorBuild,
+    settings: &AppSettings,
+) -> Result<(Value, Vec<Value>, Vec<String>), CoreError> {
+    if auto.members.is_empty() {
+        return Err(CoreError::Config(
+            "Auto selector produced no usable members".into(),
+        ));
+    }
+
+    let mut domains = Vec::new();
+    let mut member_outbounds = Vec::new();
+    let mut tags = Vec::new();
+    let mut warm = Vec::new();
+    let mut pinned_tag = None;
+    let validity_mins = auto.config.result_validity_mins.max(0) as i64;
+
+    for member in &auto.members {
+        let mut ob = build_proxy_outbound(member)?;
+        let tag = format!("p{}", member.id);
+        if let Some(obj) = ob.as_object_mut() {
+            obj.insert("tag".into(), json!(tag.clone()));
+        }
+        member_outbounds.push(ob);
+        // Warm prior: known-good (or known-bad rtt=0) results seed the core.
+        if member.latency_ms != 0 && validity_mins > 0 {
+            warm.push(json!({
+                "tag": tag,
+                "rtt": if member.latency_ms > 0 { member.latency_ms } else { 0 },
+                "age": 0
+            }));
+        }
+        if auto.config.pinned_id >= 0 && member.id == auto.config.pinned_id {
+            pinned_tag = Some(tag.clone());
+        }
+        tags.push(json!(tag));
+        domains.extend(collect_outbound_server_domains(member));
+    }
+
+    let test_url = if auto.config.test_url.trim().is_empty() {
+        settings.test_latency_url.clone()
+    } else {
+        auto.config.test_url.clone()
+    };
+    let connectivity_url = if auto.config.connectivity_url.trim().is_empty() {
+        test_url.clone()
+    } else {
+        auto.config.connectivity_url.clone()
+    };
+
+    let mut group = json!({
+        "type": "auto-selector",
+        "tag": "proxy",
+        "outbounds": tags,
+        "url": test_url,
+        "interval": format!("{}s", auto.config.interval_sec.max(10)),
+        "bench_interval": format!("{}s", auto.config.bench_interval_sec.max(auto.config.interval_sec)),
+        "watch_interval": format!("{}s", auto.config.watch_interval_sec.max(5)),
+        "active_size": auto.config.active_size.max(1),
+        "sampling": auto.config.sampling.clamp(2, 60),
+        "tolerance": auto.config.tolerance_ms.max(0),
+        "expected": auto.config.expected.max(1),
+        "dial_retries": auto.config.dial_retries.clamp(0, 5),
+        "interrupt_exist_connections": auto.config.interrupt_on_switch,
+        "connectivity_url": connectivity_url,
+    });
+    if let Some(obj) = group.as_object_mut() {
+        if !warm.is_empty() {
+            obj.insert("warm".into(), json!(warm));
+        }
+        if let Some(pin) = pinned_tag {
+            obj.insert("pinned".into(), json!(pin));
+        }
+        if auto.config.max_rtt_ms > 0 {
+            obj.insert(
+                "max_rtt".into(),
+                json!(format!("{}ms", auto.config.max_rtt_ms)),
+            );
+        }
+        if auto.config.balance {
+            obj.insert("balance".into(), json!(true));
+            obj.insert("balance_mode".into(), json!(auto.config.balance_mode));
+            obj.insert(
+                "balance_interval".into(),
+                json!(format!("{}s", auto.config.balance_interval_sec.max(5))),
+            );
+        }
+    }
+
+    Ok((group, member_outbounds, domains))
+}
+
 fn build_proxy_outbound(profile: &Profile) -> Result<Value, CoreError> {
+    if profile.profile_type == ProfileType::AutoSelector {
+        return Err(CoreError::Config(
+            "cannot build a leaf outbound from an Auto Selector".into(),
+        ));
+    }
     // Prefer a ready-made sing-box outbound object when outbound_json already has type.
     if let Ok(v) = serde_json::from_str::<Value>(&profile.outbound_json) {
         if let Some(out) = take_singbox_outbound(v) {
@@ -764,6 +898,7 @@ fn is_singbox_outbound_type(ty: &str) -> bool {
             | "block"
             | "selector"
             | "urltest"
+            | "auto-selector"
     )
 }
 
@@ -1347,6 +1482,47 @@ mod tests {
         settings.direct_dns = "223.5.5.5".into();
         settings.remote_dns = "8.8.8.8".into();
         settings
+    }
+
+    #[test]
+    fn auto_selector_emits_native_group_with_members() {
+        use throne_domain::AutoSelectorConfig;
+        let selector = Profile::new(99, 1, "auto", ProfileType::AutoSelector);
+        let mut a = Profile::new(1, 1, "a", ProfileType::Vless);
+        a.outbound = ParsedOutbound {
+            server: Some("a.example.com".into()),
+            server_port: Some(443),
+            uuid: Some("11111111-1111-1111-1111-111111111111".into()),
+            ..Default::default()
+        };
+        a.latency_ms = 40;
+        let mut b = Profile::new(2, 1, "b", ProfileType::Vless);
+        b.outbound = ParsedOutbound {
+            server: Some("b.example.com".into()),
+            server_port: Some(443),
+            uuid: Some("22222222-2222-2222-2222-222222222222".into()),
+            ..Default::default()
+        };
+        b.latency_ms = 90;
+        let mut cfg = AutoSelectorConfig::new_for_group(1, "auto");
+        cfg.interval_sec = 60;
+        let auto = AutoSelectorBuild {
+            config: cfg,
+            members: vec![a, b],
+        };
+        let built =
+            build_load_config_ex(&selector, &AppSettings::default(), None, Some(&auto)).unwrap();
+        let v: Value = serde_json::from_str(&built.core_config_json).unwrap();
+        let outs = v["outbounds"].as_array().unwrap();
+        assert!(outs.iter().any(|o| o["tag"] == "p1"));
+        assert!(outs.iter().any(|o| o["tag"] == "p2"));
+        let proxy = outs.iter().find(|o| o["tag"] == "proxy").expect("proxy");
+        assert_eq!(proxy["type"], "auto-selector");
+        assert_eq!(proxy["outbounds"].as_array().unwrap().len(), 2);
+        assert!(proxy.get("url").is_some());
+        assert!(proxy.get("connectivity_url").is_some());
+        assert!(proxy.get("warm").is_some()); // latency_ms set on members
+        assert_eq!(proxy["active_size"], 8);
     }
 
     #[test]

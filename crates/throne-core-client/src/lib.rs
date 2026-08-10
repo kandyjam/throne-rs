@@ -14,7 +14,8 @@ mod rule_set_list;
 mod sys_proxy;
 
 pub use config_build::{
-    BuiltConfig, apply_ruleset_mirror, build_load_config, build_url_test_config,
+    AutoSelectorBuild, BuiltConfig, apply_ruleset_mirror, build_load_config, build_load_config_ex,
+    build_url_test_config,
 };
 pub use rule_set_list::{RULE_SET_LIST, lookup_rule_set_url};
 pub use privilege::{
@@ -22,7 +23,10 @@ pub use privilege::{
     core_path_beside_gui, find_core_real_path, is_setuid_set, path_on_nosuid_volume,
     reexec_off_nosuid_volume, request_core_privileges,
 };
-pub use proto_wire::{ConnectionRow, IpTestResult, SpeedTestResult, UrlTestResult};
+pub use proto_wire::{
+    AutoSelectorGroupStatus, AutoSelectorMemberStatus, ConnectionRow, IpTestResult,
+    SpeedTestResult, UrlTestResult,
+};
 pub use sys_proxy::{
     force_clear_system_proxy, proxy_client_host, set_system_proxy, set_tun_system_dns,
     tun_dns_address,
@@ -429,7 +433,19 @@ impl CoreSession {
         route_profile: Option<&throne_domain::RouteProfile>,
         apply_system_proxy: bool,
     ) -> Result<(), CoreError> {
-        let built = build_load_config(profile, settings, route_profile)?;
+        self.start_profile_ex(profile, settings, route_profile, None, apply_system_proxy)
+    }
+
+    /// Start a profile, optionally expanding an Auto Selector into members.
+    pub fn start_profile_ex(
+        &mut self,
+        profile: &Profile,
+        settings: &AppSettings,
+        route_profile: Option<&throne_domain::RouteProfile>,
+        auto_selector: Option<&AutoSelectorBuild>,
+        apply_system_proxy: bool,
+    ) -> Result<(), CoreError> {
+        let built = build_load_config_ex(profile, settings, route_profile, auto_selector)?;
 
         // Tun needs a privileged core (setuid root). Check/request before Start.
         if settings.tun_mode_enabled {
@@ -816,6 +832,39 @@ impl CoreSession {
         )?;
         let (active, _closed) = proto_wire::decode_query_connections_resp(&resp)?;
         Ok(active)
+    }
+
+    /// Idempotent snapshot of every running auto-selector group (core ≥ 1.2.3).
+    pub fn query_auto_selectors(&mut self) -> Result<Vec<AutoSelectorGroupStatus>, CoreError> {
+        if !self.connected || self.running_profile.is_none() {
+            return Err(CoreError::NotRunning);
+        }
+        let resp = self.call(
+            "QueryAutoSelectors",
+            &proto_wire::encode_empty_req(),
+            Duration::from_secs(5),
+        )?;
+        proto_wire::decode_query_auto_selectors_resp(&resp)
+    }
+
+    /// `recheck` = force a sweep; `select` + member tag pins (empty member = unpin).
+    pub fn auto_selector_action(
+        &mut self,
+        tag: &str,
+        action: &str,
+        member: &str,
+    ) -> Result<(), CoreError> {
+        if !self.connected || self.running_profile.is_none() {
+            return Err(CoreError::NotRunning);
+        }
+        let payload = proto_wire::encode_auto_selector_action(tag, action, member);
+        let resp = self.call("AutoSelectorAction", &payload, Duration::from_secs(8))?;
+        let err = proto_wire::decode_error_resp(&resp)?;
+        if err.is_empty() {
+            Ok(())
+        } else {
+            Err(CoreError::Rpc(format_core_error(&err)))
+        }
     }
 
     /// IP / country lookup for profiles (temporary box) or empty tags = default outbound of config.
