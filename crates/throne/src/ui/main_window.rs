@@ -7,7 +7,7 @@
 //! ┌ Type │ Address │ Name │ Test Result │ Traffic ──────────────────┐
 //! │ …                                                               │
 //! └─────────────────────────────────────────────────────────────────┘
-//! [Logs] [Connections]
+//! [Logs] [Connections] [Traffic Graph]
 //! running | inbound | speed | version
 //! ```
 //!
@@ -46,6 +46,7 @@ use crate::ui::routing::{
     RouteEditorTab, RoutingEvent, RoutingNested, RoutingSideEffect, routing_nested_title_owned,
     routing_nested_view, routing_nested_width, routing_settings_view,
 };
+use crate::ui::speed_graph::{SpeedGraph, speed_graph_element};
 use crate::ui::widgets::{
     TOOLBAR_BTN_GAP, TOOLBAR_BTN_W, TOOLBAR_MENU_TOP, TOOLBAR_PAD_X, icon_btn, menu_item,
     menu_item_checked, menu_label, menu_panel, menu_separator, mode_switch, start_stop_btn,
@@ -466,7 +467,7 @@ pub struct MainWindow {
     search_draft: String,
     db_path_label: String,
     open_menu: OpenMenu,
-    /// Bottom panel tab: 0 Logs, 1 Connections
+    /// Bottom panel tab: 0 Logs, 1 Connections, 2 Traffic Graph
     bottom_tab: usize,
     log_scroll_handle: ScrollHandle,
     rendered_log_text: String,
@@ -510,6 +511,8 @@ pub struct MainWindow {
     /// Live Auto Selector snapshot while stats dialog is open (or last poll).
     auto_selector_snapshot: Vec<AutoSelectorGroupView>,
     prev_traffic_at: Option<std::time::Instant>,
+    /// Live rate ring for the Traffic Graph tab (upstream SpeedWidget).
+    speed_graph: SpeedGraph,
     /// Prevent an overdue core request from queuing another poll.
     runtime_poll_busy: bool,
     /// Consecutive QueryStats failures; three means the local proxy is unhealthy.
@@ -599,6 +602,7 @@ impl MainWindow {
             connections: Vec::new(),
             auto_selector_snapshot: Vec::new(),
             prev_traffic_at: None,
+            speed_graph: SpeedGraph::default(),
             runtime_poll_busy: false,
             runtime_poll_failures: 0,
             runtime_generation: 0,
@@ -2654,6 +2658,10 @@ impl MainWindow {
                 let switch_target = this.pending_profile_switch.take();
                 // Always mark stopped locally — stop_profile force-kills core.
                 this.state.set_core_status(CoreStatus::Stopped);
+                this.prev_traffic_at = None;
+                // Keep graph history after stop so user can still inspect it;
+                // clear only on health-fail recovery. (Upstream SpeedWidget keeps
+                // history until Clear is called.)
                 match result {
                     Ok(()) => this.state.set_status_message_only("Core stopped"),
                     Err(e) => {
@@ -3334,6 +3342,7 @@ impl MainWindow {
                             logs_changed = true;
                         }
                         let now = std::time::Instant::now();
+                        let had_prev_sample = this.prev_traffic_at.is_some();
                         let rates = if let Some(prev_at) = this.prev_traffic_at {
                             let dt = now.duration_since(prev_at).as_secs_f64().max(0.4);
                             let rate = |bytes: i64| (bytes.max(0) as f64 / dt) as i64;
@@ -3347,6 +3356,10 @@ impl MainWindow {
                             TrafficSnapshot::default()
                         };
                         this.prev_traffic_at = Some(now);
+                        // Upstream SpeedWidget: push one point per poll after the first baseline.
+                        if had_prev_sample {
+                            this.speed_graph.push(rates.clone());
+                        }
                         let traffic_changed = this.state.update_live_traffic(rates);
                         if let CoreStatus::Running { profile_id, .. } = this.state.core_status() {
                             this.state
@@ -3370,7 +3383,9 @@ impl MainWindow {
                                 this.request_gpui_dialog();
                             }
                         }
-                        if traffic_changed || want_conn || logs_changed || auto_changed {
+                        let graph_tab = this.bottom_tab == 2;
+                        if traffic_changed || want_conn || logs_changed || auto_changed || graph_tab
+                        {
                             cx.notify();
                         }
                     }
@@ -3380,6 +3395,7 @@ impl MainWindow {
                         this.core_op_busy = true;
                         this.network_recovery_busy = true;
                         this.prev_traffic_at = None;
+                        this.speed_graph.clear();
                         this.connections.clear();
                         this.state.set_core_status(CoreStatus::Error(format!(
                             "Core health check failed: {error}"
@@ -4864,6 +4880,7 @@ impl MainWindow {
                             [
                                 SharedString::from("Logs"),
                                 SharedString::from("Connections"),
+                                SharedString::from("Traffic Graph"),
                             ],
                             move |ix, _, cx| {
                                 e.update(cx, |t, cx| {
@@ -4883,6 +4900,16 @@ impl MainWindow {
                         .child(icon_btn("log-clear", "icons/trash.svg", move |_, _, cx| {
                             e_clear.update(cx, |t, cx| {
                                 t.state.clear_logs();
+                                cx.notify();
+                            });
+                        }))
+                    })
+                    .when(tab == 2, |row| {
+                        let e_clear = entity.clone();
+                        row.child(icon_btn("graph-clear", "icons/trash.svg", move |_, _, cx| {
+                            e_clear.update(cx, |t, cx| {
+                                t.speed_graph.clear();
+                                t.state.set_status_message_only("Traffic Graph cleared");
                                 cx.notify();
                             });
                         }))
@@ -4961,6 +4988,10 @@ impl MainWindow {
                             lines.join("\n")
                         };
                         el.child(div().text_color(Theme::text()).child(body))
+                    })
+                    .when(tab == 2, |el| {
+                        el.overflow_hidden()
+                            .child(speed_graph_element(&self.speed_graph))
                     }),
             )
     }
