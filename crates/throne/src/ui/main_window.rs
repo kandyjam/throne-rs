@@ -46,6 +46,7 @@ use crate::ui::routing::{
     RouteEditorTab, RoutingEvent, RoutingNested, RoutingSideEffect, routing_nested_title_owned,
     routing_nested_view, routing_nested_width, routing_settings_view,
 };
+use crate::ui::connections::{ConnectionSpeedTracker, connections_panel};
 use crate::ui::speed_graph::{SpeedGraph, speed_graph_element};
 use crate::ui::widgets::{
     TOOLBAR_BTN_GAP, TOOLBAR_BTN_W, TOOLBAR_MENU_TOP, TOOLBAR_PAD_X, icon_btn, menu_item,
@@ -508,6 +509,8 @@ pub struct MainWindow {
     sort_asc: bool,
     /// Live connections from core (Connections tab).
     connections: Vec<ConnectionRow>,
+    /// Per-connection speed samples for the Connections Speed column.
+    connection_speeds: ConnectionSpeedTracker,
     /// Live Auto Selector snapshot while stats dialog is open (or last poll).
     auto_selector_snapshot: Vec<AutoSelectorGroupView>,
     prev_traffic_at: Option<std::time::Instant>,
@@ -603,6 +606,7 @@ impl MainWindow {
             sort_column: SortColumn::None,
             sort_asc: true,
             connections: Vec::new(),
+            connection_speeds: ConnectionSpeedTracker::default(),
             auto_selector_snapshot: Vec::new(),
             prev_traffic_at: None,
             speed_graph: SpeedGraph::default(),
@@ -2902,6 +2906,8 @@ impl MainWindow {
                 // Always mark stopped locally — stop_profile force-kills core.
                 this.state.set_core_status(CoreStatus::Stopped);
                 this.prev_traffic_at = None;
+                this.connections.clear();
+                this.connection_speeds.clear();
                 if let Some(db) = this.traffic_stats_db.clone() {
                     let _ = this.traffic_stats_mgr.flush(&db);
                 }
@@ -3637,6 +3643,7 @@ impl MainWindow {
                             }
                         }
                         if want_conn {
+                            this.connection_speeds.update(&conns);
                             this.connections = conns;
                         }
                         let mut auto_changed = false;
@@ -3668,6 +3675,7 @@ impl MainWindow {
                         this.prev_traffic_at = None;
                         this.speed_graph.clear();
                         this.connections.clear();
+                        this.connection_speeds.clear();
                         this.state.set_core_status(CoreStatus::Error(format!(
                             "Core health check failed: {error}"
                         )));
@@ -5221,40 +5229,11 @@ impl MainWindow {
                         }
                     })
                     .when(tab == 1, |el| {
-                        let body = if !self.state.core_status().is_running() {
-                            "Connections — start a profile to see live sessions".to_string()
-                        } else if self.connections.is_empty() {
-                            "Connections — none active (traffic will appear when apps use the proxy)"
-                                .to_string()
-                        } else {
-                            let mut lines = vec![format!(
-                                "{:<6} {:<8} {:<22} {:<10} {}",
-                                "net", "proto", "dest", "outbound", "process"
-                            )];
-                            for c in self.connections.iter().take(40) {
-                                let dest = if c.domain.is_empty() {
-                                    c.dest.chars().take(22).collect::<String>()
-                                } else {
-                                    c.domain.chars().take(22).collect::<String>()
-                                };
-                                lines.push(format!(
-                                    "{:<6} {:<8} {:<22} {:<10} {}",
-                                    c.network.chars().take(6).collect::<String>(),
-                                    c.protocol.chars().take(8).collect::<String>(),
-                                    dest,
-                                    c.outbound.chars().take(10).collect::<String>(),
-                                    c.process.chars().take(16).collect::<String>(),
-                                ));
-                            }
-                            if self.connections.len() > 40 {
-                                lines.push(format!(
-                                    "… +{} more",
-                                    self.connections.len() - 40
-                                ));
-                            }
-                            lines.join("\n")
-                        };
-                        el.child(div().text_color(Theme::text()).child(body))
+                        el.p_0().child(connections_panel(
+                            self.state.core_status().is_running(),
+                            &self.connections,
+                            &self.connection_speeds,
+                        ))
                     })
                     .when(tab == 2, |el| {
                         el.overflow_hidden()

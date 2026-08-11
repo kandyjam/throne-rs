@@ -1,4 +1,5 @@
 mod app_shell;
+mod connections;
 mod dialog_inputs;
 mod dialogs;
 mod main_window;
