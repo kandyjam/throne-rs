@@ -166,10 +166,409 @@ pub struct ParsedOutbound {
 }
 
 impl ParsedOutbound {
-    pub fn to_db_json(&self) -> String {
-        self.raw_json
-            .clone()
-            .unwrap_or_else(|| serde_json::to_string(self).unwrap_or_else(|_| "{}".into()))
+    /// Wire-compatible `outbound_json` for SQLite (upstream `ExportToJson` shape).
+    ///
+    /// Must include a real protocol `"type"` so Qt Throne's `ParseFromJson`
+    /// (e.g. `hysteria::ParseFromJson`) can fill `server` / `name` for the
+    /// Address and Name columns. Never dump this struct via serde (null fields,
+    /// no `type`) — that is what broke original Throne display.
+    pub fn to_db_json(&self, profile_type: ProfileType) -> String {
+        normalize_outbound_json(
+            profile_type,
+            self.tag.as_deref().unwrap_or(""),
+            self,
+            None,
+        )
+    }
+}
+
+impl Profile {
+    /// Persist-ready outbound JSON (prefer structured fields + profile type).
+    pub fn export_outbound_json(&self) -> String {
+        normalize_outbound_json(
+            self.profile_type,
+            &self.name,
+            &self.outbound,
+            Some(self.outbound_json.as_str()).filter(|s| !s.is_empty()),
+        )
+    }
+}
+
+/// True when `v` already looks like upstream bean ExportToJson / sing-box outbound.
+pub fn is_upstream_shaped_outbound(v: &serde_json::Value) -> bool {
+    let Some(obj) = v.as_object() else {
+        return false;
+    };
+    // Our mistaken serde dump of ParsedOutbound always includes this key.
+    if obj.contains_key("raw_json") {
+        return false;
+    }
+    // Clash import wrapper (has type + clash payload).
+    if obj.contains_key("clash") {
+        return obj
+            .get("type")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| !t.is_empty());
+    }
+    // Custom full-config beans.
+    if let Some(sub) = obj.get("subtype").and_then(|t| t.as_str()) {
+        if matches!(sub, "xrayfullconfig" | "fullconfig" | "internal") {
+            return true;
+        }
+    }
+    if let Some(t) = obj.get("type").and_then(|t| t.as_str()) {
+        if !t.is_empty() {
+            return true;
+        }
+    }
+    if obj
+        .get("protocol")
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| !t.is_empty())
+    {
+        return true;
+    }
+    false
+}
+
+/// Normalize / synthesize outbound JSON for DB wire-compat with Qt Throne.
+pub fn normalize_outbound_json(
+    profile_type: ProfileType,
+    name: &str,
+    outbound: &ParsedOutbound,
+    existing: Option<&str>,
+) -> String {
+    for candidate in [existing, outbound.raw_json.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter(|s| !s.is_empty())
+    {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(candidate) {
+            if is_upstream_shaped_outbound(&v) {
+                return serde_json::to_string(&v).unwrap_or_else(|_| "{}".into());
+            }
+        }
+    }
+
+    let mut fields = outbound.clone();
+    fields.raw_json = None;
+    if let Some(ex) = existing {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(ex) {
+            merge_outbound_fields_from_value(&mut fields, &v);
+        }
+    }
+    if fields.tag.as_ref().is_none_or(|t| t.is_empty()) && !name.is_empty() {
+        fields.tag = Some(name.to_string());
+    }
+    synthesize_upstream_outbound(profile_type, name, &fields)
+}
+
+fn merge_outbound_fields_from_value(fields: &mut ParsedOutbound, v: &serde_json::Value) {
+    let Some(obj) = v.as_object() else {
+        return;
+    };
+    let take_str = |k: &str| obj.get(k).and_then(|x| x.as_str()).map(|s| s.to_string());
+    if fields.tag.is_none() {
+        fields.tag = take_str("tag");
+    }
+    if fields.server.is_none() {
+        fields.server = take_str("server");
+    }
+    if fields.server_port.is_none() {
+        fields.server_port = obj
+            .get("server_port")
+            .and_then(|x| x.as_u64().map(|n| n as u16));
+    }
+    if fields.uuid.is_none() {
+        fields.uuid = take_str("uuid");
+    }
+    if fields.password.is_none() {
+        fields.password = take_str("password");
+    }
+    if fields.username.is_none() {
+        fields.username = take_str("username");
+    }
+    if fields.method.is_none() {
+        fields.method = take_str("method");
+    }
+    if fields.flow.is_none() {
+        fields.flow = take_str("flow");
+    }
+    if fields.obfs.is_none() {
+        fields.obfs = take_str("obfs")
+            .or_else(|| {
+                obj.get("obfs")
+                    .and_then(|o| o.as_object())
+                    .and_then(|o| o.get("password"))
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string())
+            })
+            .or_else(|| take_str("obfsPassword"));
+    }
+    if fields.sni.is_none() {
+        fields.sni = take_str("sni").or_else(|| {
+            obj.get("tls")
+                .and_then(|t| t.as_object())
+                .and_then(|t| t.get("server_name"))
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string())
+        });
+    }
+    if fields.insecure.is_none() {
+        fields.insecure = obj
+            .get("tls")
+            .and_then(|t| t.as_object())
+            .and_then(|t| t.get("insecure"))
+            .and_then(|x| x.as_bool())
+            .or_else(|| obj.get("insecure").and_then(|x| x.as_bool()));
+    }
+    if fields.tls.is_none() {
+        fields.tls = obj
+            .get("tls")
+            .and_then(|t| match t {
+                serde_json::Value::Bool(b) => Some(*b),
+                serde_json::Value::Object(o) => o.get("enabled").and_then(|x| x.as_bool()).or(Some(true)),
+                _ => None,
+            })
+            .or_else(|| obj.get("tls").and_then(|x| x.as_bool()));
+    }
+    if fields.up_mbps.is_none() {
+        fields.up_mbps = obj
+            .get("up_mbps")
+            .and_then(|x| x.as_u64().map(|n| n as u32));
+    }
+    if fields.down_mbps.is_none() {
+        fields.down_mbps = obj
+            .get("down_mbps")
+            .and_then(|x| x.as_u64().map(|n| n as u32));
+    }
+}
+
+fn synthesize_upstream_outbound(
+    profile_type: ProfileType,
+    name: &str,
+    o: &ParsedOutbound,
+) -> String {
+    use serde_json::{Map, Value, json};
+
+    let mut map = Map::new();
+    map.insert(
+        "type".into(),
+        Value::String(profile_type.as_str().to_string()),
+    );
+
+    let tag = o
+        .tag
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(name);
+    if !tag.is_empty() {
+        map.insert("tag".into(), Value::String(tag.to_string()));
+    }
+    if let Some(s) = o.server.as_ref().filter(|s| !s.is_empty()) {
+        map.insert("server".into(), Value::String(s.clone()));
+    }
+    if let Some(p) = o.server_port.filter(|p| *p > 0) {
+        map.insert("server_port".into(), json!(p));
+    }
+    if let Some(u) = o.uuid.as_ref().filter(|s| !s.is_empty()) {
+        map.insert("uuid".into(), Value::String(u.clone()));
+    }
+    if let Some(pw) = o.password.as_ref().filter(|s| !s.is_empty()) {
+        // Hysteria v1 uses auth_str; export as password for hy2 and also auth_str for hy1.
+        if profile_type == ProfileType::Hysteria {
+            map.insert("auth_str".into(), Value::String(pw.clone()));
+        } else {
+            map.insert("password".into(), Value::String(pw.clone()));
+        }
+    }
+    if let Some(u) = o.username.as_ref().filter(|s| !s.is_empty()) {
+        map.insert("username".into(), Value::String(u.clone()));
+    }
+    if let Some(m) = o.method.as_ref().filter(|s| !s.is_empty()) {
+        map.insert("method".into(), Value::String(m.clone()));
+    }
+    if let Some(f) = o.flow.as_ref().filter(|s| !s.is_empty()) {
+        map.insert("flow".into(), Value::String(f.clone()));
+    }
+    if let Some(plugin) = o.plugin.as_ref().filter(|s| !s.is_empty()) {
+        map.insert("plugin".into(), Value::String(plugin.clone()));
+    }
+    if let Some(opts) = o.plugin_opts.as_ref().filter(|s| !s.is_empty()) {
+        map.insert("plugin_opts".into(), Value::String(opts.clone()));
+    }
+    if let Some(up) = o.up_mbps.filter(|n| *n > 0) {
+        map.insert("up_mbps".into(), json!(up));
+    }
+    if let Some(down) = o.down_mbps.filter(|n| *n > 0) {
+        map.insert("down_mbps".into(), json!(down));
+    }
+    if let Some(cc) = o.congestion_control.as_ref().filter(|s| !s.is_empty()) {
+        map.insert("congestion_control".into(), Value::String(cc.clone()));
+    }
+    if let Some(mode) = o.udp_relay_mode.as_ref().filter(|s| !s.is_empty()) {
+        map.insert("udp_relay_mode".into(), Value::String(mode.clone()));
+    }
+    if let Some(pe) = o.packet_encoding.as_ref().filter(|s| !s.is_empty()) {
+        map.insert("packet_encoding".into(), Value::String(pe.clone()));
+    }
+
+    if let Some(obfs) = o.obfs.as_ref().filter(|s| !s.is_empty()) {
+        match profile_type {
+            ProfileType::Hysteria2 => {
+                map.insert(
+                    "obfs".into(),
+                    json!({
+                        "type": "salamander",
+                        "password": obfs,
+                    }),
+                );
+            }
+            _ => {
+                map.insert("obfs".into(), Value::String(obfs.clone()));
+            }
+        }
+    }
+
+    let needs_tls = matches!(
+        profile_type,
+        ProfileType::Hysteria
+            | ProfileType::Hysteria2
+            | ProfileType::Trojan
+            | ProfileType::Tuic
+            | ProfileType::AnyTls
+            | ProfileType::Vless
+            | ProfileType::Vmess
+            | ProfileType::XrayVless
+    ) || o.tls == Some(true)
+        || o.sni.as_ref().is_some_and(|s| !s.is_empty())
+        || o.insecure == Some(true)
+        || o.security
+            .as_ref()
+            .is_some_and(|s| s.eq_ignore_ascii_case("tls") || s.eq_ignore_ascii_case("reality"));
+
+    // Hysteria beans always emit a tls object upstream.
+    let force_tls_obj = matches!(profile_type, ProfileType::Hysteria | ProfileType::Hysteria2);
+
+    if needs_tls || force_tls_obj {
+        let mut tls = Map::new();
+        let enabled = o.tls.unwrap_or(true) || force_tls_obj;
+        tls.insert("enabled".into(), json!(enabled));
+        if let Some(sni) = o.sni.as_ref().filter(|s| !s.is_empty()) {
+            tls.insert("server_name".into(), Value::String(sni.clone()));
+        }
+        if o.insecure == Some(true) {
+            tls.insert("insecure".into(), json!(true));
+        }
+        if let Some(alpn) = o.alpn.as_ref().filter(|s| !s.is_empty()) {
+            // Upstream often uses array; a single string is also accepted by many paths.
+            tls.insert(
+                "alpn".into(),
+                json!(alpn.split(',').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>()),
+            );
+        }
+        if let Some(fp) = o.fp.as_ref().filter(|s| !s.is_empty()) {
+            tls.insert(
+                "utls".into(),
+                json!({ "enabled": true, "fingerprint": fp }),
+            );
+        }
+        if o.security
+            .as_ref()
+            .is_some_and(|s| s.eq_ignore_ascii_case("reality"))
+            || o.pbk.as_ref().is_some_and(|s| !s.is_empty())
+        {
+            let mut reality = Map::new();
+            reality.insert("enabled".into(), json!(true));
+            if let Some(pbk) = o.pbk.as_ref().filter(|s| !s.is_empty()) {
+                reality.insert("public_key".into(), Value::String(pbk.clone()));
+            }
+            if let Some(sid) = o.sid.as_ref().filter(|s| !s.is_empty()) {
+                reality.insert("short_id".into(), Value::String(sid.clone()));
+            }
+            tls.insert("reality".into(), Value::Object(reality));
+        }
+        map.insert("tls".into(), Value::Object(tls));
+    }
+
+    if let Some(transport) = o.transport.as_ref().filter(|s| !s.is_empty()) {
+        let mut tr = Map::new();
+        tr.insert("type".into(), Value::String(transport.clone()));
+        if let Some(host) = o.host.as_ref().filter(|s| !s.is_empty()) {
+            tr.insert("host".into(), Value::String(host.clone()));
+        }
+        if let Some(path) = o.path.as_ref().filter(|s| !s.is_empty()) {
+            tr.insert("path".into(), Value::String(path.clone()));
+        }
+        if let Some(svc) = o.service_name.as_ref().filter(|s| !s.is_empty()) {
+            tr.insert("service_name".into(), Value::String(svc.clone()));
+        }
+        map.insert("transport".into(), Value::Object(tr));
+    }
+
+    serde_json::to_string(&Value::Object(map)).unwrap_or_else(|_| "{}".into())
+}
+
+#[cfg(test)]
+mod outbound_export_tests {
+    use super::*;
+
+    #[test]
+    fn export_hysteria2_includes_type_tag_server_tls() {
+        let o = ParsedOutbound {
+            tag: Some("新加坡01".into()),
+            server: Some("sg01.example.com".into()),
+            server_port: Some(8443),
+            password: Some("secret".into()),
+            tls: Some(true),
+            sni: Some("localhost".into()),
+            insecure: Some(true),
+            ..Default::default()
+        };
+        let json = o.to_db_json(ProfileType::Hysteria2);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "hysteria2");
+        assert_eq!(v["tag"], "新加坡01");
+        assert_eq!(v["server"], "sg01.example.com");
+        assert_eq!(v["server_port"], 8443);
+        assert_eq!(v["password"], "secret");
+        assert_eq!(v["tls"]["enabled"], true);
+        assert_eq!(v["tls"]["server_name"], "localhost");
+        assert_eq!(v["tls"]["insecure"], true);
+        // Must not look like a ParsedOutbound serde dump.
+        assert!(v.get("raw_json").is_none());
+        assert!(v.get("uuid").is_none());
+    }
+
+    #[test]
+    fn normalize_repairs_parsed_outbound_dump_without_type() {
+        let dump = r#"{"tag":"node","server":"1.2.3.4","server_port":443,"uuid":null,"password":"x","username":null,"method":null,"flow":null,"security":null,"alter_id":null,"transport":null,"host":null,"path":null,"service_name":null,"tls":true,"sni":"localhost","alpn":null,"fp":null,"pbk":null,"sid":null,"spx":null,"insecure":true,"plugin":null,"plugin_opts":null,"obfs":null,"up_mbps":null,"down_mbps":null,"congestion_control":null,"udp_relay_mode":null,"packet_encoding":null,"raw_json":null}"#;
+        let fixed = normalize_outbound_json(
+            ProfileType::Hysteria2,
+            "node",
+            &ParsedOutbound::default(),
+            Some(dump),
+        );
+        let v: serde_json::Value = serde_json::from_str(&fixed).unwrap();
+        assert_eq!(v["type"], "hysteria2");
+        assert_eq!(v["server"], "1.2.3.4");
+        assert_eq!(v["tag"], "node");
+        assert_eq!(v["password"], "x");
+        assert!(is_upstream_shaped_outbound(&v));
+    }
+
+    #[test]
+    fn keeps_already_upstream_shaped_json() {
+        let good = r#"{"type":"vless","tag":"HK","server":"1.2.3.4","server_port":443,"uuid":"u"}"#;
+        let out = normalize_outbound_json(
+            ProfileType::Vless,
+            "HK",
+            &ParsedOutbound::default(),
+            Some(good),
+        );
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["type"], "vless");
+        assert_eq!(v["uuid"], "u");
     }
 }
 

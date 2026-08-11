@@ -135,6 +135,7 @@ fn proxy_from_yaml(v: &serde_yaml::Value) -> Option<ImportedProfile> {
     }
 
     // Keep a JSON snapshot of the clash node for later full conversion.
+    // Always include `"type"` so Qt Throne ParseFromJson can load Address/Name.
     if let Ok(json_v) = serde_yaml::from_value::<serde_json::Value>(v.clone()) {
         outbound.raw_json = Some(
             json!({
@@ -145,7 +146,7 @@ fn proxy_from_yaml(v: &serde_yaml::Value) -> Option<ImportedProfile> {
             .to_string(),
         );
     } else {
-        outbound.raw_json = serde_json::to_string(&outbound).ok();
+        outbound.raw_json = Some(outbound.to_db_json(profile_type));
     }
 
     Some(ImportedProfile {

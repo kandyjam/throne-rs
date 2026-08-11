@@ -530,51 +530,11 @@ fn insert_route_rule(
 }
 
 /// Write outbound_json the way upstream does: compact ExportToJson object.
+///
+/// Always goes through domain normalization so Qt Throne can ParseFromJson
+/// (requires `"type"`, no ParsedOutbound null dumps).
 fn outbound_json_for_db(p: &Profile) -> String {
-    // Prefer original upstream JSON if present and looks like an outbound object.
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&p.outbound_json) {
-        if v.get("type").is_some() || v.get("protocol").is_some() || v.get("server").is_some() {
-            if let Ok(s) = serde_json::to_string(&v) {
-                return s;
-            }
-        }
-        // Our importer sometimes wraps as { "clash": … }
-        if v.get("clash").is_some() {
-            return p.outbound_json.clone();
-        }
-    }
-    if let Some(raw) = &p.outbound.raw_json {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
-            if v.get("type").is_some() || v.get("protocol").is_some() {
-                if let Ok(s) = serde_json::to_string(&v) {
-                    return s;
-                }
-            }
-        }
-    }
-    // Synthesize a minimal sing-box-like outbound.
-    let mut map = serde_json::Map::new();
-    map.insert(
-        "type".into(),
-        serde_json::Value::String(p.profile_type.as_str().into()),
-    );
-    map.insert("tag".into(), serde_json::Value::String(p.name.clone()));
-    if let Some(s) = &p.outbound.server {
-        map.insert("server".into(), serde_json::Value::String(s.clone()));
-    }
-    if let Some(port) = p.outbound.server_port {
-        map.insert("server_port".into(), serde_json::json!(port));
-    }
-    if let Some(u) = &p.outbound.uuid {
-        map.insert("uuid".into(), serde_json::Value::String(u.clone()));
-    }
-    if let Some(pw) = &p.outbound.password {
-        map.insert("password".into(), serde_json::Value::String(pw.clone()));
-    }
-    if let Some(m) = &p.outbound.method {
-        map.insert("method".into(), serde_json::Value::String(m.clone()));
-    }
-    serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_else(|_| "{}".into())
+    p.export_outbound_json()
 }
 
 /// Parse upstream outbound_json → ParsedOutbound + optional tag name.
@@ -1017,6 +977,52 @@ mod tests {
         assert_eq!(p.name, "HK"); // recovered from tag
         assert_eq!(p.outbound.server.as_deref(), Some("1.2.3.4"));
         assert_eq!(p.profile_type, ProfileType::Vless);
+    }
+
+    #[test]
+    fn save_repairs_parsed_outbound_dump_missing_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("throne.db");
+        let db = Database::open(&path).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO groups (id, name, profiles_json) VALUES (1, 'g', '[1]')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO groups_order (group_id, display_order) VALUES (1, 0)",
+                [],
+            )
+            .unwrap();
+        // Legacy throne-rs dump: has server/tag but no type — breaks Qt ParseFromJson.
+        let dump = r#"{"tag":"新加坡01","server":"sg01.example.com","server_port":8443,"uuid":null,"password":"secret","username":null,"method":null,"flow":null,"security":null,"alter_id":null,"transport":null,"host":null,"path":null,"service_name":null,"tls":true,"sni":"localhost","alpn":null,"fp":null,"pbk":null,"sid":null,"spx":null,"insecure":true,"plugin":null,"plugin_opts":null,"obfs":null,"up_mbps":null,"down_mbps":null,"congestion_control":null,"udp_relay_mode":null,"packet_encoding":null,"raw_json":null}"#;
+        db.conn
+            .execute(
+                "INSERT INTO profiles (id, type, name, gid, outbound_json) VALUES (1, 'hysteria2', '新加坡01', 1, ?1)",
+                params![dump],
+            )
+            .unwrap();
+        let state = db.load_state().unwrap();
+        db.save_state(&state).unwrap();
+        let fixed: String = db
+            .conn
+            .query_row(
+                "SELECT outbound_json FROM profiles WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&fixed).unwrap();
+        assert_eq!(v["type"], "hysteria2");
+        assert_eq!(v["tag"], "新加坡01");
+        assert_eq!(v["server"], "sg01.example.com");
+        assert_eq!(v["server_port"], 8443);
+        assert_eq!(v["password"], "secret");
+        assert_eq!(v["tls"]["enabled"], true);
+        assert!(v.get("raw_json").is_none());
+        assert!(v.get("uuid").is_none());
     }
 
     #[test]

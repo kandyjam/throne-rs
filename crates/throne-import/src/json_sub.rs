@@ -219,7 +219,7 @@ fn import_sip008(doc: &Value) -> Vec<ImportedProfile> {
             tag: Some(name.clone()),
             ..Default::default()
         };
-        outbound.raw_json = serde_json::to_string(&outbound).ok();
+        outbound.raw_json = Some(outbound.to_db_json(ProfileType::Shadowsocks));
         out.push(ImportedProfile {
             name,
             profile_type: ProfileType::Shadowsocks,

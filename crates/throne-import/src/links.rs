@@ -449,8 +449,8 @@ fn finish(
     source: &str,
 ) -> ImportedProfile {
     outbound.tag = Some(name.clone());
-    // Keep a compact JSON snapshot for DB `outbound_json` (sing-box-ish).
-    outbound.raw_json = serde_json::to_string(&outbound).ok();
+    // Upstream ExportToJson shape (must include `"type"` for Qt ParseFromJson).
+    outbound.raw_json = Some(outbound.to_db_json(profile_type));
     ImportedProfile {
         name,
         profile_type,

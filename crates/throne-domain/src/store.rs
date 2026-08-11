@@ -1334,7 +1334,7 @@ impl AppState {
         for (name, ty, outbound, insecure) in items {
             let id = self.next_profile_id;
             self.next_profile_id += 1;
-            let outbound_json = outbound.to_db_json();
+            let outbound_json = outbound.to_db_json(ty);
             let mut profile = Profile::new(id, gid, name, ty);
             profile.outbound = outbound;
             profile.outbound_json = outbound_json;
@@ -1556,7 +1556,7 @@ impl AppState {
         for (name, ty, outbound, insecure) in new_items {
             let id = self.next_profile_id;
             self.next_profile_id += 1;
-            let outbound_json = outbound.to_db_json();
+            let outbound_json = outbound.to_db_json(ty);
             let mut profile = Profile::new(id, group_id, name, ty);
             profile.outbound = outbound;
             profile.outbound_json = outbound_json;
@@ -1681,7 +1681,7 @@ impl AppState {
                 if changed {
                     profile.name = name;
                     profile.profile_type = profile_type;
-                    profile.outbound_json = outbound.to_db_json();
+                    profile.outbound_json = outbound.to_db_json(profile_type);
                     profile.outbound = outbound;
                     profile.insecure = insecure;
                     report.updated.push(subscription_change(profile));
@@ -1693,7 +1693,7 @@ impl AppState {
                 let id = self.next_profile_id;
                 self.next_profile_id += 1;
                 let mut profile = Profile::new(id, group_id, name, profile_type);
-                profile.outbound_json = outbound.to_db_json();
+                profile.outbound_json = outbound.to_db_json(profile_type);
                 profile.outbound = outbound;
                 profile.insecure = insecure;
                 report.added.push(subscription_change(&profile));
