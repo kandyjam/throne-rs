@@ -7,7 +7,6 @@ use std::time::Instant;
 
 use gpui::{SharedString, div, prelude::*, px};
 use throne_core_client::ConnectionRow;
-use throne_domain::human_bytes;
 
 use crate::theme::Theme;
 
@@ -315,9 +314,4 @@ mod tests {
         assert!(down > 0);
     }
 
-    #[test]
-    fn human_bytes_still_available() {
-        // ensure we didn't break domain re-export usage accidentally
-        let _ = human_bytes(1024);
-    }
 }
