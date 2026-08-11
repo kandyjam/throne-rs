@@ -1310,7 +1310,8 @@ impl RouteProfile {
     }
 }
 
-fn human_bytes(n: i64) -> String {
+/// Human-readable byte size (binary KiB units) — used by Traffic / stats UI.
+pub fn human_bytes(n: i64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = n.max(0) as f64;
     let mut i = 0usize;

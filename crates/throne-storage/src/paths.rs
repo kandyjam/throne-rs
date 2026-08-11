@@ -153,7 +153,6 @@ fn app_config_bases() -> Vec<PathBuf> {
 }
 
 /// Sibling stats DB path (upstream `throne_stats.db`).
-#[allow(dead_code)]
 pub fn stats_db_path(main_db: &Path) -> PathBuf {
     main_db
         .parent()

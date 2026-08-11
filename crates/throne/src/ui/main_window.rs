@@ -40,7 +40,7 @@ use crate::ui::dialogs::{
     AutoSelectorGroupView, AutoSelectorMemberRow, Dialog, EditGroupView, HotkeyField,
     add_input_body, auto_selector_stats_body, basic_settings_body, edit_group_body,
     edit_profile_body, hotkey_settings_body, manage_groups_body, subscription_diff_body,
-    tun_settings_body,
+    traffic_stats_body, tun_settings_body,
 };
 use crate::ui::routing::{
     RouteEditorTab, RoutingEvent, RoutingNested, RoutingSideEffect, routing_nested_title_owned,
@@ -513,6 +513,9 @@ pub struct MainWindow {
     prev_traffic_at: Option<std::time::Instant>,
     /// Live rate ring for the Traffic Graph tab (upstream SpeedWidget).
     speed_graph: SpeedGraph,
+    /// Historical traffic stats (`throne_stats.db` + minute accumulator).
+    traffic_stats_db: Option<std::sync::Arc<throne_storage::TrafficStatsDb>>,
+    traffic_stats_mgr: throne_storage::TrafficStatsManager,
     /// Prevent an overdue core request from queuing another poll.
     runtime_poll_busy: bool,
     /// Consecutive QueryStats failures; three means the local proxy is unhealthy.
@@ -575,7 +578,7 @@ impl MainWindow {
             state,
             focus_handle: cx.focus_handle(),
             search_draft: String::new(),
-            db_path_label,
+            db_path_label: db_path_label.clone(),
             open_menu: OpenMenu::None,
             bottom_tab: 0,
             log_scroll_handle: ScrollHandle::new(),
@@ -603,6 +606,26 @@ impl MainWindow {
             auto_selector_snapshot: Vec::new(),
             prev_traffic_at: None,
             speed_graph: SpeedGraph::default(),
+            traffic_stats_db: {
+                let main = if db_path_label.is_empty() {
+                    throne_storage::default_db_path()
+                } else {
+                    std::path::PathBuf::from(&db_path_label)
+                };
+                let stats = throne_storage::stats_db_path(&main);
+                match throne_storage::TrafficStatsDb::open(&stats) {
+                    Ok(db) => {
+                        let now = chrono::Local::now().timestamp();
+                        let _ = throne_storage::TrafficStatsManager::run_rollup(&db, now, 90);
+                        Some(std::sync::Arc::new(db))
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "open throne_stats.db failed");
+                        None
+                    }
+                }
+            },
+            traffic_stats_mgr: throne_storage::TrafficStatsManager::default(),
             runtime_poll_busy: false,
             runtime_poll_failures: 0,
             runtime_generation: 0,
@@ -749,6 +772,7 @@ impl MainWindow {
             Dialog::ConfirmUpdateAllSubscriptions => 8,
             Dialog::SubscriptionDiff { .. } => 9,
             Dialog::AutoSelectorStats { .. } => 14,
+            Dialog::TrafficStats { .. } => 15,
             Dialog::RoutingSettings(d) => {
                 return (10, nested_kind(&d.nested));
             }
@@ -1088,6 +1112,224 @@ impl MainWindow {
                     .set_status_message("Select a profile to edit");
                 cx.notify();
             }
+        }
+    }
+
+    /// Snapshot running profile into config_meta so history survives rename/delete.
+    fn snapshot_running_profile_traffic_meta(&mut self, profile_id: ProfileId) {
+        let Some(db) = self.traffic_stats_db.as_ref() else {
+            return;
+        };
+        let now = chrono::Local::now().timestamp();
+        let (name, group_name, type_name, server) =
+            if let Some(p) = self.state.profile(profile_id) {
+                let gname = self
+                    .state
+                    .all_groups()
+                    .into_iter()
+                    .find(|g| g.id == p.group_id)
+                    .map(|g| g.name.clone())
+                    .unwrap_or_default();
+                (
+                    p.name.clone(),
+                    gname,
+                    p.profile_type.as_str().to_string(),
+                    p.display_address(),
+                )
+            } else {
+                (format!("Profile #{profile_id}"), String::new(), String::new(), String::new())
+            };
+        let _ = db.upsert_config_meta(&throne_storage::ConfigMetaRow {
+            profile_id,
+            name,
+            group_name,
+            type_name,
+            server_address: server,
+            first_seen: now,
+            last_seen: now,
+        });
+        let _ = db.upsert_config_meta(&throne_storage::ConfigMetaRow {
+            profile_id: throne_storage::DIRECT_STAT_PROFILE_ID,
+            name: "Direct".into(),
+            group_name: String::new(),
+            type_name: "direct".into(),
+            server_address: String::new(),
+            first_seen: now,
+            last_seen: now,
+        });
+    }
+
+    fn open_traffic_stats(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_menu = OpenMenu::None;
+        // Flush in-progress minute so the dialog is up to date.
+        if let Some(db) = self.traffic_stats_db.clone() {
+            let _ = self.traffic_stats_mgr.flush(&db);
+        }
+        self.dialog = Dialog::TrafficStats {
+            period: 0,
+            tab: 0,
+            summary: String::new(),
+            breakdown_lines: Vec::new(),
+            bars: Vec::new(),
+            notice: String::new(),
+        };
+        self.refresh_traffic_stats_dialog();
+        self.dialog_inputs = None;
+        self.present_gpui_dialog(window, cx);
+        cx.notify();
+    }
+
+    /// Rebuild summary / bars / breakdown for the open Traffic Stats dialog.
+    fn refresh_traffic_stats_dialog(&mut self) {
+        let (period, tab) = match &self.dialog {
+            Dialog::TrafficStats { period, tab, .. } => (*period, *tab),
+            _ => return,
+        };
+        let Some(db) = self.traffic_stats_db.clone() else {
+            if let Dialog::TrafficStats { notice, .. } = &mut self.dialog {
+                *notice = "throne_stats.db unavailable".into();
+            }
+            return;
+        };
+        let _ = self.traffic_stats_mgr.flush(&db);
+
+        let now = chrono::Local::now().timestamp();
+        let window_secs = match period {
+            1 => 7 * 86400,
+            2 => 30 * 86400,
+            3 => 90 * 86400,
+            _ => 24 * 3600,
+        };
+        let bucket_secs = if period == 0 { 3600 } else { 86400 };
+        let from = now - window_secs;
+        let tz_offset = chrono::Local::now().offset().local_minus_utc() as i64;
+
+        let series = if tab == 1 {
+            db.query_app_series(from, now, bucket_secs, tz_offset)
+        } else {
+            db.query_config_series(from, now, bucket_secs, tz_offset)
+        };
+        let series = series.unwrap_or_default();
+
+        let mut by_bucket: std::collections::HashMap<i64, (i64, i64)> =
+            std::collections::HashMap::new();
+        let mut total_up = 0i64;
+        let mut total_down = 0i64;
+        for pt in &series {
+            by_bucket.insert(pt.bucket_start, (pt.up, pt.down));
+            total_up = total_up.saturating_add(pt.up);
+            total_down = total_down.saturating_add(pt.down);
+        }
+        let aligned_from = ((from + tz_offset) / bucket_secs) * bucket_secs - tz_offset;
+        let mut bars = Vec::new();
+        let mut b = aligned_from;
+        while b < now {
+            let (up, down) = by_bucket.get(&b).copied().unwrap_or((0, 0));
+            let label = if bucket_secs >= 86400 {
+                chrono::DateTime::from_timestamp(b, 0)
+                    .map(|dt| dt.with_timezone(&chrono::Local).format("%m/%d").to_string())
+                    .unwrap_or_default()
+            } else {
+                chrono::DateTime::from_timestamp(b, 0)
+                    .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
+                    .unwrap_or_default()
+            };
+            bars.push((label, down, up));
+            b += bucket_secs;
+        }
+
+        let summary = format!(
+            "Download: {}     Upload: {}     Total: {}",
+            throne_domain::human_bytes(total_down),
+            throne_domain::human_bytes(total_up),
+            throne_domain::human_bytes(total_down.saturating_add(total_up)),
+        );
+
+        let mut breakdown_lines = Vec::new();
+        const MAX_ROWS: usize = 9;
+        if tab == 1 {
+            let mut usage = db.query_app_usage(from, now).unwrap_or_default();
+            usage.sort_by_key(|u| std::cmp::Reverse(u.down.saturating_add(u.up)));
+            let shown = usage.len().min(MAX_ROWS);
+            for u in usage.iter().take(shown) {
+                let name = if u.process_name.is_empty() {
+                    "Unknown"
+                } else {
+                    u.process_name.as_str()
+                };
+                breakdown_lines.push(format!(
+                    "{name}  ↓{}  ↑{}  Σ{}",
+                    throne_domain::human_bytes(u.down),
+                    throne_domain::human_bytes(u.up),
+                    throne_domain::human_bytes(u.down.saturating_add(u.up)),
+                ));
+            }
+            if usage.len() > MAX_ROWS {
+                let (od, ou) = usage[MAX_ROWS..].iter().fold((0i64, 0i64), |(d, u), row| {
+                    (d + row.down, u + row.up)
+                });
+                breakdown_lines.push(format!(
+                    "Other  ↓{}  ↑{}  Σ{}",
+                    throne_domain::human_bytes(od),
+                    throne_domain::human_bytes(ou),
+                    throne_domain::human_bytes(od + ou),
+                ));
+            }
+        } else {
+            let mut usage = db.query_config_usage(from, now).unwrap_or_default();
+            usage.sort_by_key(|u| std::cmp::Reverse(u.down.saturating_add(u.up)));
+            let meta = db.all_config_meta().unwrap_or_default();
+            let meta_map: std::collections::HashMap<i64, _> =
+                meta.into_iter().map(|m| (m.profile_id, m)).collect();
+            let shown = usage.len().min(MAX_ROWS);
+            for u in usage.iter().take(shown) {
+                let name = if let Some(m) = meta_map.get(&u.profile_id) {
+                    if m.name.is_empty() {
+                        format!("Profile #{}", u.profile_id)
+                    } else if m.group_name.is_empty() {
+                        m.name.clone()
+                    } else {
+                        format!("{} · {}", m.name, m.group_name)
+                    }
+                } else if u.profile_id == throne_storage::DIRECT_STAT_PROFILE_ID {
+                    "Direct".into()
+                } else if let Some(p) = self.state.profile(u.profile_id) {
+                    p.name.clone()
+                } else {
+                    format!("Profile #{} (deleted)", u.profile_id)
+                };
+                breakdown_lines.push(format!(
+                    "{name}  ↓{}  ↑{}  Σ{}",
+                    throne_domain::human_bytes(u.down),
+                    throne_domain::human_bytes(u.up),
+                    throne_domain::human_bytes(u.down.saturating_add(u.up)),
+                ));
+            }
+            if usage.len() > MAX_ROWS {
+                let (od, ou) = usage[MAX_ROWS..].iter().fold((0i64, 0i64), |(d, u), row| {
+                    (d + row.down, u + row.up)
+                });
+                breakdown_lines.push(format!(
+                    "Other  ↓{}  ↑{}  Σ{}",
+                    throne_domain::human_bytes(od),
+                    throne_domain::human_bytes(ou),
+                    throne_domain::human_bytes(od + ou),
+                ));
+            }
+        }
+
+        if let Dialog::TrafficStats {
+            summary: s,
+            breakdown_lines: lines,
+            bars: b,
+            notice,
+            ..
+        } = &mut self.dialog
+        {
+            *s = summary;
+            *lines = breakdown_lines;
+            *b = bars;
+            *notice = String::new();
         }
     }
 
@@ -2574,6 +2816,7 @@ impl MainWindow {
                             msg.push_str(marker);
                         }
                         this.state.set_status_message_only(msg);
+                        this.snapshot_running_profile_traffic_meta(profile_id);
                         let _ = this.persist_db();
                         // Flush any Start-time core lines (sing-box boot + first dials).
                         let _ = this.drain_core_logs_into_ui();
@@ -2659,6 +2902,9 @@ impl MainWindow {
                 // Always mark stopped locally — stop_profile force-kills core.
                 this.state.set_core_status(CoreStatus::Stopped);
                 this.prev_traffic_at = None;
+                if let Some(db) = this.traffic_stats_db.clone() {
+                    let _ = this.traffic_stats_mgr.flush(&db);
+                }
                 // Keep graph history after stop so user can still inspect it;
                 // clear only on health-fail recovery. (Upstream SpeedWidget keeps
                 // history until Clear is called.)
@@ -3361,9 +3607,34 @@ impl MainWindow {
                             this.speed_graph.push(rates.clone());
                         }
                         let traffic_changed = this.state.update_live_traffic(rates);
-                        if let CoreStatus::Running { profile_id, .. } = this.state.core_status() {
-                            this.state
-                                .set_profile_traffic(*profile_id, cum.proxy_down, cum.proxy_up);
+                        let running_id = match this.state.core_status() {
+                            CoreStatus::Running { profile_id, .. } => Some(*profile_id),
+                            _ => None,
+                        };
+                        if let Some(profile_id) = running_id {
+                            this.state.set_profile_traffic(
+                                profile_id,
+                                cum.proxy_down,
+                                cum.proxy_up,
+                            );
+                            // Historical stats: QueryStats values are per-interval deltas.
+                            if let Some(db) = this.traffic_stats_db.clone() {
+                                let now_secs = chrono::Local::now().timestamp();
+                                let _ = this.traffic_stats_mgr.add_config_delta(
+                                    &db,
+                                    profile_id,
+                                    cum.proxy_up,
+                                    cum.proxy_down,
+                                    now_secs,
+                                );
+                                let _ = this.traffic_stats_mgr.add_config_delta(
+                                    &db,
+                                    throne_storage::DIRECT_STAT_PROFILE_ID,
+                                    cum.direct_up,
+                                    cum.direct_down,
+                                    now_secs,
+                                );
+                            }
                         }
                         if want_conn {
                             this.connections = conns;
@@ -3821,7 +4092,8 @@ impl MainWindow {
             | Dialog::ConfirmRemoveGroup { .. }
             | Dialog::ConfirmUpdateAllSubscriptions
             | Dialog::SubscriptionDiff { .. }
-            | Dialog::AutoSelectorStats { .. } => None,
+            | Dialog::AutoSelectorStats { .. }
+            | Dialog::TrafficStats { .. } => None,
             Dialog::EditGroup { .. } => None,
             Dialog::AddFromInput { text } => Some((text, true)),
             Dialog::RoutingSettings(draft) => {
@@ -4323,13 +4595,8 @@ impl MainWindow {
                 item!("t-auto-sel", "Auto Selector Stats", |t, w, cx| {
                     t.open_auto_selector_stats(w, cx);
                 });
-                item!("t-traffic", "Traffic Stats", |t, _w, cx| {
-                    let label = t.state.speed_label();
-                    t.state.set_status_message(if label.is_empty() {
-                        "Traffic Stats — start a profile to see live rates".into()
-                    } else {
-                        label.replace('\n', " · ")
-                    });
+                item!("t-traffic", "Traffic Stats", |t, w, cx| {
+                    t.open_traffic_stats(w, cx);
                 });
                 item!("t-update", "Check For Update", |t, _w, cx| {
                     t.state.set_status_message(format!(
@@ -6118,6 +6385,86 @@ fn build_gpui_dialog(
                 })
                 .on_close(move |_, _, _| {})
                 .child(subscription_diff_body(&body))
+        }
+        Dialog::TrafficStats {
+            period,
+            tab,
+            summary,
+            breakdown_lines,
+            bars,
+            notice,
+        } => {
+            let period = *period;
+            let tab = *tab;
+            let summary = summary.clone();
+            let breakdown_lines = breakdown_lines.clone();
+            let bars = bars.clone();
+            let notice = notice.clone();
+            let e_period = entity.clone();
+            let e_tab = entity.clone();
+            let e_refresh = entity.clone();
+            let e_close = entity.clone();
+            let max_h = (window.viewport_size().height * 0.82).max(px(360.));
+            dialog
+                .title("Traffic Stats")
+                .w(px(640.))
+                .max_h(max_h)
+                .overlay_closable(true)
+                .on_cancel({
+                    let entity = entity.clone();
+                    move |_, _, cx| {
+                        entity.update(cx, |t, cx| {
+                            t.close_dialog();
+                            cx.notify();
+                        });
+                        true
+                    }
+                })
+                .on_close(on_dismiss)
+                .child(traffic_stats_body(
+                    period,
+                    tab,
+                    &summary,
+                    &breakdown_lines,
+                    &bars,
+                    &notice,
+                    move |p, _, cx| {
+                        e_period.update(cx, |t, cx| {
+                            if let Dialog::TrafficStats { period, .. } = &mut t.dialog {
+                                *period = p;
+                            }
+                            t.refresh_traffic_stats_dialog();
+                            t.presented_dialog_stack = (0, NestedKind::None);
+                            t.request_gpui_dialog();
+                            cx.notify();
+                        });
+                    },
+                    move |tb, _, cx| {
+                        e_tab.update(cx, |t, cx| {
+                            if let Dialog::TrafficStats { tab, .. } = &mut t.dialog {
+                                *tab = tb;
+                            }
+                            t.refresh_traffic_stats_dialog();
+                            t.presented_dialog_stack = (0, NestedKind::None);
+                            t.request_gpui_dialog();
+                            cx.notify();
+                        });
+                    },
+                    move |_, cx| {
+                        e_refresh.update(cx, |t, cx| {
+                            t.refresh_traffic_stats_dialog();
+                            t.presented_dialog_stack = (0, NestedKind::None);
+                            t.request_gpui_dialog();
+                            cx.notify();
+                        });
+                    },
+                    move |window, cx| {
+                        e_close.update(cx, |t, cx| {
+                            t.close_dialog_with_window(window, cx);
+                            cx.notify();
+                        });
+                    },
+                ))
         }
         Dialog::AutoSelectorStats {
             only_problems,

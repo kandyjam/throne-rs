@@ -4,10 +4,11 @@
 //! Original DB layout (see `main.cpp`):
 //! - Portable: `<appDir>/config/throne.db`
 //! - AppData (`-appdata` / packaged macOS): `<AppConfigLocation>/config/throne.db`
-//! - Stats sibling: `throne_stats.db` (not loaded here)
+//! - Stats sibling: `throne_stats.db` ([`traffic_stats`])
 
 mod paths;
 mod schema;
+mod traffic_stats;
 
 use std::path::{Path, PathBuf};
 
@@ -20,7 +21,11 @@ use throne_domain::{
     ProfileType, RouteProfile, RouteRule,
 };
 
-pub use paths::{default_db_path, discover_throne_databases, resolve_db_path};
+pub use paths::{default_db_path, discover_throne_databases, resolve_db_path, stats_db_path};
+pub use traffic_stats::{
+    AppTrafficRow, AppUsage, ConfigMetaRow, ConfigTrafficRow, ConfigUsage, DIRECT_STAT_PROFILE_ID,
+    TrafficSeriesPoint, TrafficStatsDb, TrafficStatsError, TrafficStatsManager,
+};
 
 #[derive(Debug, Error)]
 pub enum StorageError {

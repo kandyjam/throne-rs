@@ -41,7 +41,7 @@ Status legend: ✅ done · 🧩 partial · ⏳ planned · ❌ out of scope (Go c
 | TUN private-range bypass flag | `3c344f78`, `e37e472a` | ✅ Tun Settings + `route_exclude_address` | `throne-domain` |
 | **macOS Tun DNS exclude hole (#1738)** | `f97019d2` `subtractPrefix` | ✅ Darwin punches Tun CIDR out of private excludes | `throne-core-client` |
 | Runtime stats UI | `bac76b83` | 🧩 live rates + Connections + **Traffic Graph** (SpeedWidget) | `throne` |
-| Traffic stats aggregation | `ff3d3c10`, `11373611` | 🧩 QueryStats rates + live graph; historical `throne_stats.db` / Traffic Stats dialog later | `throne-core-client`, `throne` |
+| Traffic stats aggregation | `ff3d3c10`, `11373611` | ✅ QueryStats → minute/hour `throne_stats.db` + Tools → **Traffic Stats** dialog | `throne-storage`, `throne` |
 | URL / speed / IP / country tests | core RPC + menus | 🧩 URL/IP/simple Speedtest; full multi-thread speed later | `throne-core-client` |
 | **Auto Selector (1.2.3)** | `6697ceaf`+ · plan · core · DialogAutoSelector | ✅ create + plan + Start · core RPC · Tools stats | `throne-domain`, `throne-core-client`, `throne`, `core/server` |
 | **Auto Selector Xray full (1.2.4)** | `f97019d2` allow `xrayfullconfig`, socks bridge, `xray_full_configs` | ✅ plan + build + LoadConfig 16/17 · core gates | same |

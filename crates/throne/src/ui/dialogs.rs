@@ -135,6 +135,19 @@ pub enum Dialog {
         selected_member: String,
         notice: String,
     },
+    /// Upstream DialogTrafficStats — historical series + breakdown.
+    TrafficStats {
+        /// 0=24h, 1=7d, 2=30d, 3=90d
+        period: usize,
+        /// 0=by profile, 1=by app
+        tab: usize,
+        summary: String,
+        /// Preformatted breakdown lines (top-N).
+        breakdown_lines: Vec<String>,
+        /// Chart bars: (label, down, up)
+        bars: Vec<(String, i64, i64)>,
+        notice: String,
+    },
 }
 
 impl Dialog {
@@ -1098,6 +1111,241 @@ pub fn hotkey_settings_body(
             on_cancel,
             on_save,
         ))
+}
+
+/// Historical Traffic Stats dashboard body (upstream DialogTrafficStats).
+pub fn traffic_stats_body(
+    period: usize,
+    tab: usize,
+    summary: &str,
+    breakdown_lines: &[String],
+    bars: &[(String, i64, i64)],
+    notice: &str,
+    on_period: impl Fn(usize, &mut Window, &mut App) + 'static + Clone,
+    on_tab: impl Fn(usize, &mut Window, &mut App) + 'static + Clone,
+    on_refresh: impl Fn(&mut Window, &mut App) + 'static,
+    on_close: impl Fn(&mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    use crate::theme::Theme;
+    use gpui::{PathBuilder, canvas, point, px};
+
+    let period_labels = ["24 hours", "7 days", "30 days", "90 days"];
+    let bars = bars.to_vec();
+    let max_total = bars
+        .iter()
+        .map(|(_, d, u)| d.saturating_add(*u))
+        .max()
+        .unwrap_or(0)
+        .max(1) as f32;
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .w_full()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .children(period_labels.iter().enumerate().map(|(i, label)| {
+                    let on = on_period.clone();
+                    let selected = period == i;
+                    div()
+                        .id(SharedString::from(format!("ts-period-{i}")))
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .text_xs()
+                        .cursor_pointer()
+                        .bg(if selected {
+                            Theme::accent_soft()
+                        } else {
+                            Theme::bg_elevated()
+                        })
+                        .text_color(if selected {
+                            Theme::accent()
+                        } else {
+                            Theme::text()
+                        })
+                        .border_1()
+                        .border_color(if selected {
+                            Theme::accent()
+                        } else {
+                            Theme::border_light()
+                        })
+                        .child(*label)
+                        .on_click(move |_, w, cx| on(i, w, cx))
+                }))
+                .child(div().flex_1())
+                .child({
+                    let on = on_refresh;
+                    div()
+                        .id("ts-refresh")
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .text_xs()
+                        .cursor_pointer()
+                        .border_1()
+                        .border_color(Theme::border_light())
+                        .child("Refresh")
+                        .on_click(move |_, w, cx| on(w, cx))
+                }),
+        )
+        .child(
+            div()
+                .flex()
+                .gap_2()
+                .children(["By profile", "By app"].iter().enumerate().map(|(i, label)| {
+                    let on = on_tab.clone();
+                    let selected = tab == i;
+                    div()
+                        .id(SharedString::from(format!("ts-tab-{i}")))
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .text_xs()
+                        .cursor_pointer()
+                        .bg(if selected {
+                            Theme::bg_selected()
+                        } else {
+                            Theme::bg_elevated()
+                        })
+                        .text_color(if selected {
+                            Theme::text_on_selected()
+                        } else {
+                            Theme::text()
+                        })
+                        .child(*label)
+                        .on_click(move |_, w, cx| on(i, w, cx))
+                })),
+        )
+        .child(
+            div()
+                .h(px(140.))
+                .w_full()
+                .border_1()
+                .border_color(Theme::border_light())
+                .bg(Theme::bg_elevated())
+                .child(
+                    canvas(
+                        move |_, _, _| {},
+                        move |bounds, _, window, _| {
+                            if bars.is_empty() {
+                                return;
+                            }
+                            let n = bars.len();
+                            let w = f32::from(bounds.size.width).max(1.0);
+                            let h = f32::from(bounds.size.height).max(1.0);
+                            let pad = 8.0_f32;
+                            let plot_w = (w - pad * 2.0).max(1.0);
+                            let plot_h = (h - pad * 2.0).max(1.0);
+                            let bar_w = (plot_w / n as f32) * 0.7;
+                            let gap = (plot_w / n as f32) * 0.3;
+                            for (i, (_, down, up)) in bars.iter().enumerate() {
+                                let total = down.saturating_add(*up) as f32;
+                                let bh = (total / max_total) * plot_h;
+                                let x = bounds.origin.x + px(pad + i as f32 * (bar_w + gap));
+                                let y = bounds.origin.y + px(pad + plot_h - bh);
+                                // Stacked: down (bottom, blue) + up (top, green)
+                                let down_h = if total > 0.0 {
+                                    (*down as f32 / total) * bh
+                                } else {
+                                    0.0
+                                };
+                                let up_h = bh - down_h;
+                                // Down bar
+                                if down_h > 0.5 {
+                                    let mut b = PathBuilder::fill();
+                                    let y0 = y + px(up_h);
+                                    b.move_to(point(x, y0));
+                                    b.line_to(point(x + px(bar_w), y0));
+                                    b.line_to(point(x + px(bar_w), y0 + px(down_h)));
+                                    b.line_to(point(x, y0 + px(down_h)));
+                                    b.close();
+                                    if let Ok(path) = b.build() {
+                                        window.paint_path(path, gpui::rgb(0x3299ff));
+                                    }
+                                }
+                                // Up bar
+                                if up_h > 0.5 {
+                                    let mut b = PathBuilder::fill();
+                                    b.move_to(point(x, y));
+                                    b.line_to(point(x + px(bar_w), y));
+                                    b.line_to(point(x + px(bar_w), y + px(up_h)));
+                                    b.line_to(point(x, y + px(up_h)));
+                                    b.close();
+                                    if let Ok(path) = b.build() {
+                                        window.paint_path(path, gpui::rgb(0x86c43f));
+                                    }
+                                }
+                            }
+                        },
+                    )
+                    .size_full(),
+                ),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(Theme::text())
+                .child(summary.to_string()),
+        )
+        .when(!notice.is_empty(), |el| {
+            el.child(
+                div()
+                    .text_xs()
+                    .text_color(Theme::warning())
+                    .child(notice.to_string()),
+            )
+        })
+        .child({
+            let mut list = div()
+                .id("ts-breakdown")
+                .flex()
+                .flex_col()
+                .gap_1()
+                .max_h(px(180.))
+                .overflow_y_scroll();
+            if breakdown_lines.is_empty() {
+                list = list.child(
+                    div()
+                        .text_xs()
+                        .text_color(Theme::text_muted())
+                        .child("No traffic recorded in this period yet.".to_string()),
+                );
+            } else {
+                for line in breakdown_lines {
+                    list = list.child(
+                        div()
+                            .text_xs()
+                            .text_color(Theme::text())
+                            .child(line.clone()),
+                    );
+                }
+            }
+            list
+        })
+        .child(
+            div()
+                .flex()
+                .justify_end()
+                .child({
+                    let on = on_close;
+                    div()
+                        .id("ts-close")
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .text_xs()
+                        .cursor_pointer()
+                        .bg(Theme::accent())
+                        .text_color(Theme::text_on_selected())
+                        .child("Close")
+                        .on_click(move |_, w, cx| on(w, cx))
+                }),
+        )
 }
 
 #[cfg(test)]
