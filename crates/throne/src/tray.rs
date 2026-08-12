@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use tray_icon::{
     menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
-    Icon, TrayIcon, TrayIconBuilder,
+    Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
 
 use crate::theme::ColorScheme;
@@ -272,11 +272,37 @@ pub fn apply_scheme(scheme: ColorScheme) {
 }
 
 pub fn next_command() -> Option<TrayCommand> {
-    loop {
-        let event = MenuEvent::receiver().try_recv().ok()?;
+    // Drain menu events first (explicit user actions).
+    while let Ok(event) = MenuEvent::receiver().try_recv() {
         if let Some(command) = command_from_menu_id(event.id.as_ref()) {
             return Some(command);
         }
+    }
+
+    // Left-click / double-click the tray glyph → Show Window (reopen after close).
+    // Menu still opens on left click when menu_on_left_click is enabled.
+    while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+        if tray_event_shows_window(&event) {
+            return Some(TrayCommand::ShowWindow);
+        }
+    }
+
+    None
+}
+
+/// Whether a tray icon pointer event should bring the main window forward.
+pub fn tray_event_shows_window(event: &TrayIconEvent) -> bool {
+    match event {
+        TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            ..
+        } => true,
+        TrayIconEvent::DoubleClick {
+            button: MouseButton::Left,
+            ..
+        } => true,
+        _ => false,
     }
 }
 
@@ -377,6 +403,52 @@ mod tests {
         assert!(!allow_lan_from_address("127.0.0.1"));
         assert_eq!(inbound_address_for_allow_lan(true), "::");
         assert_eq!(inbound_address_for_allow_lan(false), "127.0.0.1");
+    }
+
+    #[test]
+    fn left_click_and_double_click_show_window() {
+        use tray_icon::{MouseButton, MouseButtonState, Rect, TrayIconEvent, TrayIconId};
+        use tray_icon::dpi::PhysicalPosition;
+
+        let id = TrayIconId::new("throne");
+        let rect = Rect {
+            position: PhysicalPosition::new(0.0, 0.0),
+            size: tray_icon::dpi::PhysicalSize::new(1, 1),
+        };
+        let pos = PhysicalPosition::new(0.0, 0.0);
+
+        assert!(tray_event_shows_window(&TrayIconEvent::Click {
+            id: id.clone(),
+            position: pos,
+            rect,
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+        }));
+        assert!(!tray_event_shows_window(&TrayIconEvent::Click {
+            id: id.clone(),
+            position: pos,
+            rect,
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Down,
+        }));
+        assert!(!tray_event_shows_window(&TrayIconEvent::Click {
+            id: id.clone(),
+            position: pos,
+            rect,
+            button: MouseButton::Right,
+            button_state: MouseButtonState::Up,
+        }));
+        assert!(tray_event_shows_window(&TrayIconEvent::DoubleClick {
+            id: id.clone(),
+            position: pos,
+            rect,
+            button: MouseButton::Left,
+        }));
+        assert!(!tray_event_shows_window(&TrayIconEvent::Enter {
+            id,
+            position: pos,
+            rect,
+        }));
     }
 
     #[test]

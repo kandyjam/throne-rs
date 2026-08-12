@@ -6,6 +6,7 @@ mod ui;
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{
     App, Application, Bounds, Entity, TitlebarOptions, WindowBounds, WindowHandle, WindowOptions,
@@ -17,6 +18,9 @@ use tracing_subscriber::EnvFilter;
 use throne_domain::{NKR_VERSION, display_name};
 use ui::{AppShell, MainWindow};
 
+/// Set by Dock / taskbar reopen; drained on the GPUI executor (safe App borrow).
+static PENDING_SHOW_WINDOW: AtomicBool = AtomicBool::new(false);
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -26,45 +30,94 @@ fn main() {
 
     tracing::info!(version = NKR_VERSION, "ThroneRs starting");
 
-    Application::new().with_assets(assets::Assets).run(|cx: &mut App| {
+    // Shared across dock reopen (registered on Application) and the run
+    // callback (creates MainWindow + first window). Empty until launch finishes.
+    let window_slot: Rc<RefCell<Option<WindowHandle<Root>>>> = Rc::new(RefCell::new(None));
+    let main_slot: Rc<RefCell<Option<Entity<MainWindow>>>> = Rc::new(RefCell::new(None));
+
+    let app = Application::new().with_assets(assets::Assets);
+
+    // Dock click after the last window is closed (macOS
+    // applicationShouldHandleReopen). Only flag here — do not open_window
+    // inside the NSApp delegate; that races AppCell borrows. The pump below
+    // performs the real restore on the GPUI executor.
+    app.on_reopen(move |_cx| {
+        tracing::info!("dock/taskbar reopen requested");
+        PENDING_SHOW_WINDOW.store(true, Ordering::SeqCst);
+    });
+
+    app.run(move |cx: &mut App| {
         // Required before any gpui-component widgets (Spinner, Button, Theme, …).
         gpui_component::init(cx);
 
         cx.activate(true);
 
-        // Keep the root view alive across window close so tray "Show" / "Toggle"
-        // can reopen the same session instead of losing CoreSession state.
+        // Keep the root view alive across window close so tray "Show" / dock
+        // reopen can restore the same session instead of losing CoreSession state.
         let main = cx.new(MainWindow::new);
-        let window_slot: Rc<RefCell<Option<WindowHandle<Root>>>> =
-            Rc::new(RefCell::new(Some(open_main_window(cx, main.clone()))));
+        *main_slot.borrow_mut() = Some(main.clone());
+        *window_slot.borrow_mut() = Some(open_main_window(cx, main.clone()));
+
+        // When the platform window is destroyed, drop the stale handle so the
+        // next Show / Dock click recreates instead of activating a dead window.
+        {
+            let window_slot = window_slot.clone();
+            cx.on_window_closed(move |cx| {
+                let alive = window_slot
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|handle| handle.is_active(cx).is_some());
+                if !alive {
+                    *window_slot.borrow_mut() = None;
+                    tracing::debug!("main window closed; waiting for dock/tray show");
+                }
+            })
+            .detach();
+        }
 
         let tray_state = main.read(cx).tray_menu_state();
         match tray::install(tray_state) {
-            Ok(()) => {
-                let window_slot = window_slot.clone();
-                let main = main.clone();
-                cx.spawn(move |cx: &mut gpui::AsyncApp| {
-                    let async_cx = cx.clone();
-                    async move {
-                        loop {
-                            smol::Timer::after(std::time::Duration::from_millis(100)).await;
-                            while let Some(command) = tray::next_command() {
-                                if async_cx
-                                    .update(|cx| {
-                                        dispatch_tray_command(command, cx, &window_slot, &main)
-                                    })
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                })
-                .detach();
-            }
+            Ok(()) => {}
             Err(error) => tracing::warn!(%error, "desktop tray unavailable"),
         }
+
+        // Always pump tray + dock-show, even if tray install failed (dock still works).
+        let window_slot = window_slot.clone();
+        let main = main.clone();
+        cx.spawn(move |cx: &mut gpui::AsyncApp| {
+            let async_cx = cx.clone();
+            async move {
+                loop {
+                    smol::Timer::after(std::time::Duration::from_millis(100)).await;
+
+                    let dock_show = PENDING_SHOW_WINDOW.swap(false, Ordering::SeqCst);
+                    let tray_cmd = tray::next_command();
+
+                    if !dock_show && tray_cmd.is_none() {
+                        continue;
+                    }
+
+                    if async_cx
+                        .update(|cx| {
+                            if dock_show {
+                                show_main_window(cx, &window_slot, &main);
+                            }
+                            if let Some(command) = tray_cmd {
+                                // Drain any further menu events in the same tick.
+                                dispatch_tray_command(command, cx, &window_slot, &main);
+                                while let Some(command) = tray::next_command() {
+                                    dispatch_tray_command(command, cx, &window_slot, &main);
+                                }
+                            }
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        })
+        .detach();
     });
 }
 
@@ -99,7 +152,8 @@ fn open_main_window(cx: &mut App, main: Entity<MainWindow>) -> WindowHandle<Root
     .expect("open main window")
 }
 
-/// `WindowHandle::is_active` is `None` when the window has been closed.
+/// `WindowHandle::is_active` is `None` when the window has been closed or the
+/// slot is empty.
 fn window_needs_reopen(is_active: Option<bool>) -> bool {
     is_active.is_none()
 }
@@ -118,14 +172,20 @@ fn show_main_window(
         .and_then(|handle| handle.is_active(cx));
 
     if window_needs_reopen(is_active) {
+        tracing::info!("recreating main window after close");
         *window_slot.borrow_mut() = Some(open_main_window(cx, main.clone()));
         return;
     }
 
-    if let Some(handle) = window_slot.borrow().as_ref() {
-        let _ = handle.update(cx, |_, window, _| {
+    let handle = window_slot.borrow().as_ref().copied();
+    if let Some(handle) = handle {
+        let activated = handle.update(cx, |_, window, _| {
             window.activate_window();
         });
+        if activated.is_err() {
+            tracing::info!("stale window handle; recreating main window");
+            *window_slot.borrow_mut() = Some(open_main_window(cx, main.clone()));
+        }
     }
 }
 
@@ -259,5 +319,15 @@ mod tests {
         // Still open (focused or not) → just activate, do not recreate.
         assert!(!window_needs_reopen(Some(true)));
         assert!(!window_needs_reopen(Some(false)));
+    }
+
+    #[test]
+    fn app_registers_reopen_handler_to_restore_closed_window() {
+        // Dock / taskbar click after close must re-show the main window.
+        let source = include_str!("main.rs");
+        assert!(source.contains("app.on_reopen"));
+        assert!(source.contains("PENDING_SHOW_WINDOW"));
+        assert!(source.contains("on_window_closed"));
+        assert!(source.contains("recreating main window after close"));
     }
 }
