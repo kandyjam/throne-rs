@@ -1192,8 +1192,33 @@ fn take_singbox_outbound(mut v: Value) -> Option<Value> {
     for k in STRIP {
         obj.remove(*k);
     }
+    // Repair legacy / share-link exports that wrote `transport: { type: "tcp" }`.
+    // sing-box rejects that; plain TCP is the default when transport is omitted.
+    sanitize_outbound_transport(obj);
     obj.insert("tag".into(), json!("proxy"));
     Some(v)
+}
+
+/// Drop or normalize `transport` so the core never sees invalid types like `tcp`.
+fn sanitize_outbound_transport(obj: &mut serde_json::Map<String, Value>) {
+    let Some(tr) = obj.get("transport").and_then(|t| t.as_object()) else {
+        return;
+    };
+    let Some(raw) = tr.get("type").and_then(|t| t.as_str()) else {
+        obj.remove("transport");
+        return;
+    };
+    match throne_domain::normalize_singbox_transport_type(raw) {
+        None => {
+            obj.remove("transport");
+        }
+        Some(canonical) if canonical != raw => {
+            if let Some(tr) = obj.get_mut("transport").and_then(|t| t.as_object_mut()) {
+                tr.insert("type".into(), json!(canonical));
+            }
+        }
+        Some(_) => {}
+    }
 }
 
 fn is_singbox_outbound_type(ty: &str) -> bool {
@@ -1410,9 +1435,14 @@ fn apply_transport(v: &mut Value, o: &ParsedOutbound) {
     let Some(obj) = v.as_object_mut() else {
         return;
     };
-    let transport = o.transport.as_deref().unwrap_or("tcp");
+    let Some(transport) =
+        throne_domain::normalize_singbox_transport_type(o.transport.as_deref().unwrap_or("tcp"))
+    else {
+        // Plain TCP / unknown → omit transport (sing-box default).
+        return;
+    };
     match transport {
-        "ws" | "websocket" => {
+        "ws" => {
             let mut t = json!({ "type": "ws" });
             if let Some(path) = &o.path {
                 t.as_object_mut()
@@ -1435,7 +1465,7 @@ fn apply_transport(v: &mut Value, o: &ParsedOutbound) {
             }
             obj.insert("transport".into(), t);
         }
-        "http" | "h2" => {
+        "http" => {
             let mut t = json!({ "type": "http" });
             if let Some(path) = &o.path {
                 t.as_object_mut()
@@ -1451,6 +1481,20 @@ fn apply_transport(v: &mut Value, o: &ParsedOutbound) {
         }
         "quic" => {
             obj.insert("transport".into(), json!({ "type": "quic" }));
+        }
+        "httpupgrade" => {
+            let mut t = json!({ "type": "httpupgrade" });
+            if let Some(path) = &o.path {
+                t.as_object_mut()
+                    .unwrap()
+                    .insert("path".into(), json!(path));
+            }
+            if let Some(host) = &o.host {
+                t.as_object_mut()
+                    .unwrap()
+                    .insert("host".into(), json!(host));
+            }
+            obj.insert("transport".into(), t);
         }
         _ => {}
     }
@@ -2318,5 +2362,79 @@ mod tests {
         assert_eq!(v["outbounds"][0]["tag"], "proxy");
         assert_eq!(v["outbounds"][0]["tls"]["server_name"], "localhost");
         assert!(v["inbounds"][0].get("sniff").is_none());
+    }
+
+    #[test]
+    fn url_test_strips_legacy_tcp_transport() {
+        // Repro: group URL test failed with
+        // `outbounds[1].transport: unknown transport type: tcp`
+        // when stored trojan beans included transport.type=tcp from share links.
+        let mut trojan = Profile::new(56213, 1, "trojan-tcp", ProfileType::Trojan);
+        trojan.outbound_json = r#"{
+            "type":"trojan",
+            "server":"1.1.1.1",
+            "server_port":8080,
+            "password":"secret",
+            "tls":{"enabled":true,"server_name":"1.1.1.1"},
+            "transport":{"type":"tcp"}
+        }"#
+        .into();
+        let mut hy2 = Profile::new(56206, 1, "hy2", ProfileType::Hysteria2);
+        hy2.outbound_json = r#"{
+            "type":"hysteria2",
+            "server":"tw.example.com",
+            "server_port":8080,
+            "password":"secret",
+            "tls":{"enabled":true,"server_name":"localhost","insecure":true}
+        }"#
+        .into();
+        let (cfg, tags) =
+            build_url_test_config(&[&trojan, &hy2], &AppSettings::default()).unwrap();
+        let v: Value = serde_json::from_str(&cfg).unwrap();
+        assert_eq!(tags, vec!["p56213".to_string(), "p56206".to_string()]);
+        let outs = v["outbounds"].as_array().unwrap();
+        let t = outs.iter().find(|o| o["tag"] == "p56213").unwrap();
+        assert_eq!(t["type"], "trojan");
+        assert!(
+            t.get("transport").is_none(),
+            "tcp transport must be stripped for core decode: {t}"
+        );
+    }
+
+    #[test]
+    fn from_parsed_trojan_tcp_omits_transport() {
+        let mut p = Profile::new(1, 1, "t", ProfileType::Trojan);
+        p.outbound = ParsedOutbound {
+            server: Some("1.1.1.1".into()),
+            server_port: Some(443),
+            password: Some("pw".into()),
+            transport: Some("tcp".into()),
+            tls: Some(true),
+            sni: Some("1.1.1.1".into()),
+            ..Default::default()
+        };
+        // Empty outbound_json forces from_parsed path.
+        p.outbound_json = String::new();
+        let built = build_load_config(&p, &AppSettings::default(), None).unwrap();
+        let v: Value = serde_json::from_str(&built.core_config_json).unwrap();
+        let proxy = &v["outbounds"][0];
+        assert_eq!(proxy["type"], "trojan");
+        assert!(proxy.get("transport").is_none(), "{proxy}");
+    }
+
+    #[test]
+    fn take_singbox_normalizes_websocket_transport_type() {
+        let mut p = Profile::new(1, 1, "v", ProfileType::Vmess);
+        p.outbound_json = r#"{
+            "type":"vmess",
+            "server":"1.2.3.4",
+            "server_port":443,
+            "uuid":"u",
+            "transport":{"type":"websocket","path":"/ray"}
+        }"#
+        .into();
+        let built = build_load_config(&p, &AppSettings::default(), None).unwrap();
+        let v: Value = serde_json::from_str(&built.core_config_json).unwrap();
+        assert_eq!(v["outbounds"][0]["transport"]["type"], "ws");
     }
 }

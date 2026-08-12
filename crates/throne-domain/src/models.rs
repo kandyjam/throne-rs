@@ -344,6 +344,24 @@ fn merge_outbound_fields_from_value(fields: &mut ParsedOutbound, v: &serde_json:
     }
 }
 
+/// Map a share-link / Clash network name to a sing-box `transport.type`.
+///
+/// Returns `None` for plain TCP (or empty / unknown aliases that mean "no
+/// multiplex transport") so callers omit the `transport` object entirely.
+pub fn normalize_singbox_transport_type(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "tcp" | "raw" | "none" | "plain" => None,
+        "ws" | "websocket" => Some("ws"),
+        "http" | "h2" | "http2" => Some("http"),
+        "grpc" => Some("grpc"),
+        "quic" => Some("quic"),
+        "httpupgrade" | "http_upgrade" | "http-upgrade" => Some("httpupgrade"),
+        // Keep unknown non-tcp values out of export rather than inventing types.
+        // (apply_transport / take_singbox_outbound also gate on known types.)
+        _ => None,
+    }
+}
+
 fn synthesize_upstream_outbound(
     profile_type: ProfileType,
     name: &str,
@@ -491,19 +509,25 @@ fn synthesize_upstream_outbound(
         map.insert("tls".into(), Value::Object(tls));
     }
 
+    // sing-box has no transport type "tcp" (plain TCP is the default when
+    // `transport` is omitted). Emitting `{"type":"tcp"}` fails core decode:
+    // `outbounds[N].transport: unknown transport type: tcp`.
     if let Some(transport) = o.transport.as_ref().filter(|s| !s.is_empty()) {
-        let mut tr = Map::new();
-        tr.insert("type".into(), Value::String(transport.clone()));
-        if let Some(host) = o.host.as_ref().filter(|s| !s.is_empty()) {
-            tr.insert("host".into(), Value::String(host.clone()));
+        let ty = normalize_singbox_transport_type(transport);
+        if let Some(ty) = ty {
+            let mut tr = Map::new();
+            tr.insert("type".into(), Value::String(ty.to_string()));
+            if let Some(host) = o.host.as_ref().filter(|s| !s.is_empty()) {
+                tr.insert("host".into(), Value::String(host.clone()));
+            }
+            if let Some(path) = o.path.as_ref().filter(|s| !s.is_empty()) {
+                tr.insert("path".into(), Value::String(path.clone()));
+            }
+            if let Some(svc) = o.service_name.as_ref().filter(|s| !s.is_empty()) {
+                tr.insert("service_name".into(), Value::String(svc.clone()));
+            }
+            map.insert("transport".into(), Value::Object(tr));
         }
-        if let Some(path) = o.path.as_ref().filter(|s| !s.is_empty()) {
-            tr.insert("path".into(), Value::String(path.clone()));
-        }
-        if let Some(svc) = o.service_name.as_ref().filter(|s| !s.is_empty()) {
-            tr.insert("service_name".into(), Value::String(svc.clone()));
-        }
-        map.insert("transport".into(), Value::Object(tr));
     }
 
     serde_json::to_string(&Value::Object(map)).unwrap_or_else(|_| "{}".into())
@@ -569,6 +593,56 @@ mod outbound_export_tests {
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["type"], "vless");
         assert_eq!(v["uuid"], "u");
+    }
+
+    #[test]
+    fn export_omits_tcp_transport_object() {
+        let o = ParsedOutbound {
+            tag: Some("trojan-tcp".into()),
+            server: Some("1.1.1.1".into()),
+            server_port: Some(8080),
+            password: Some("secret".into()),
+            transport: Some("tcp".into()),
+            tls: Some(true),
+            sni: Some("1.1.1.1".into()),
+            ..Default::default()
+        };
+        let json = o.to_db_json(ProfileType::Trojan);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "trojan");
+        assert!(
+            v.get("transport").is_none(),
+            "tcp must not be serialized as transport: {v}"
+        );
+    }
+
+    #[test]
+    fn export_maps_websocket_to_ws() {
+        let o = ParsedOutbound {
+            tag: Some("vmess-ws".into()),
+            server: Some("1.2.3.4".into()),
+            server_port: Some(443),
+            uuid: Some("u".into()),
+            transport: Some("websocket".into()),
+            path: Some("/ray".into()),
+            host: Some("example.com".into()),
+            tls: Some(true),
+            ..Default::default()
+        };
+        let json = o.to_db_json(ProfileType::Vmess);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["transport"]["type"], "ws");
+        assert_eq!(v["transport"]["path"], "/ray");
+    }
+
+    #[test]
+    fn normalize_singbox_transport_type_table() {
+        assert_eq!(normalize_singbox_transport_type("tcp"), None);
+        assert_eq!(normalize_singbox_transport_type("TCP"), None);
+        assert_eq!(normalize_singbox_transport_type("ws"), Some("ws"));
+        assert_eq!(normalize_singbox_transport_type("websocket"), Some("ws"));
+        assert_eq!(normalize_singbox_transport_type("h2"), Some("http"));
+        assert_eq!(normalize_singbox_transport_type("grpc"), Some("grpc"));
     }
 }
 
