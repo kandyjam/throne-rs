@@ -234,6 +234,26 @@ fn should_update_rendered_log_text(logs_tab_active: bool) -> bool {
     logs_tab_active
 }
 
+/// Fingerprint of the active connection set (ids only — traffic churn must not force scroll).
+fn connections_ids_fingerprint(rows: &[ConnectionRow]) -> String {
+    let mut ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+    // Stable order so reordering from the core alone does not thrash scroll.
+    ids.sort_unstable();
+    ids.join("\n")
+}
+
+fn should_scroll_connections_to_bottom(
+    connections_tab_active: bool,
+    previous: &str,
+    current: &str,
+) -> bool {
+    connections_tab_active && !current.is_empty() && previous != current
+}
+
+fn should_update_rendered_connection_ids(connections_tab_active: bool) -> bool {
+    connections_tab_active
+}
+
 fn runtime_poll_health(current_failures: u8, succeeded: bool) -> (u8, bool) {
     if succeeded {
         (0, false)
@@ -470,8 +490,11 @@ pub struct MainWindow {
     open_menu: OpenMenu,
     /// Bottom panel tab: 0 Logs, 1 Connections, 2 Traffic Graph
     bottom_tab: usize,
+    /// Shared vertical scroll for Logs / Connections bottom panel body.
     log_scroll_handle: ScrollHandle,
     rendered_log_text: String,
+    /// Last rendered Connections id set (for auto-scroll-to-last).
+    rendered_connection_ids: String,
     ctx_menu_at: Option<(f32, f32)>,
     /// Target group for [`OpenMenu::GroupTabCtx`] (`None` = empty tab-bar area).
     ctx_group_id: Option<GroupId>,
@@ -586,6 +609,7 @@ impl MainWindow {
             bottom_tab: 0,
             log_scroll_handle: ScrollHandle::new(),
             rendered_log_text: String::new(),
+            rendered_connection_ids: String::new(),
             ctx_menu_at: None,
             ctx_group_id: None,
             dialog: Dialog::None,
@@ -5124,6 +5148,16 @@ impl MainWindow {
         if should_update_rendered_log_text(tab == 0) {
             self.rendered_log_text = logs.clone();
         }
+        let conn_fp = connections_ids_fingerprint(&self.connections);
+        if should_scroll_connections_to_bottom(tab == 1, &self.rendered_connection_ids, &conn_fp) {
+            self.log_scroll_handle.scroll_to_bottom();
+        }
+        if should_update_rendered_connection_ids(tab == 1) {
+            self.rendered_connection_ids = conn_fp;
+        } else {
+            // Leaving Connections: reset so re-entry always lands on the last row.
+            self.rendered_connection_ids.clear();
+        }
         let log_preview = if logs.is_empty() {
             "(no log lines yet)".to_string()
         } else {
@@ -6644,11 +6678,13 @@ mod tests {
         eligible_subscription_ids, failed_start_profile_log, next_core_action,
         next_runtime_generation, next_sort_state, resolve_stop_profile_display,
         running_mode_marker, runtime_poll_health, runtime_poll_is_current,
-        runtime_profile_display, should_queue_recovery_restart, should_scroll_logs_to_bottom,
+        runtime_profile_display, should_queue_recovery_restart, should_scroll_connections_to_bottom,
+        should_scroll_logs_to_bottom, connections_ids_fingerprint,
         should_show_subscription_diff, should_update_rendered_log_text, start_profile_log,
         stop_profile_log, subscription_fetch_options, test_progress_bar, test_progress_lines,
         test_progress_percent,
     };
+    use throne_core_client::ConnectionRow;
     use throne_domain::{AppSettings, CoreStatus, Group, ProfileType};
 
     #[test]
@@ -6809,6 +6845,33 @@ mod tests {
         ));
         assert!(!should_scroll_logs_to_bottom(true, "same", "same"));
         assert!(!should_scroll_logs_to_bottom(true, "old log", ""));
+    }
+
+    #[test]
+    fn connections_scroll_to_last_on_id_set_change() {
+        assert!(!should_scroll_connections_to_bottom(false, "", "a\nb"));
+        assert!(should_scroll_connections_to_bottom(true, "", "a\nb"));
+        assert!(should_scroll_connections_to_bottom(true, "a", "a\nb"));
+        assert!(!should_scroll_connections_to_bottom(true, "a\nb", "a\nb"));
+        assert!(!should_scroll_connections_to_bottom(true, "a", ""));
+        // Traffic-only churn shares the same id fingerprint → no scroll.
+        let rows = [
+            ConnectionRow {
+                id: "b".into(),
+                ..Default::default()
+            },
+            ConnectionRow {
+                id: "a".into(),
+                upload: 99,
+                ..Default::default()
+            },
+        ];
+        let fp1 = connections_ids_fingerprint(&rows);
+        let mut rows2 = rows;
+        rows2[0].upload = 1_000;
+        let fp2 = connections_ids_fingerprint(&rows2);
+        assert_eq!(fp1, fp2);
+        assert!(!should_scroll_connections_to_bottom(true, &fp1, &fp2));
     }
 
     #[test]
