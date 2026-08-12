@@ -2,15 +2,19 @@
 
 use gpui::{App, Entity, SharedString, Window, div, prelude::*, px};
 use chrono::{Local, TimeZone};
-use gpui_component::input::InputState;
+use gpui_component::{
+    input::InputState,
+    scroll::ScrollableElement as _,
+};
 
 use throne_domain::{AppState, GroupId, ProfileId, RulesetMirror};
 
 use crate::theme::Theme;
 use crate::ui::routing::RoutingDraft;
 use crate::ui::widgets::{
-    dialog_actions, group_panel, hotkey_capture_row, input_area, input_field_row, mode_switch,
-    primary_btn, secondary_btn, section_hint,
+    dialog_actions, form_enable_interval_row, form_input_row, form_row, group_panel,
+    hotkey_capture_row, input_area, input_field_row, mode_switch, primary_btn, secondary_btn,
+    section_hint, settings_switch_row, tab_bar,
 };
 
 pub fn format_subscription_info(info: &str) -> Option<String> {
@@ -58,6 +62,33 @@ fn readable_size(bytes: u64) -> String {
     }
 }
 
+/// Upstream `DialogBasicSettings` tab bar (subset of Qt tabs we currently ship).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BasicSettingsTab {
+    #[default]
+    Common,
+    Subscription,
+}
+
+impl BasicSettingsTab {
+    pub const ALL: [Self; 2] = [Self::Common, Self::Subscription];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Common => "Common",
+            Self::Subscription => "Subscription",
+        }
+    }
+
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|&t| t == self).unwrap_or(0)
+    }
+
+    pub fn from_index(ix: usize) -> Self {
+        Self::ALL.get(ix).copied().unwrap_or_default()
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub enum Dialog {
     #[default]
@@ -71,6 +102,17 @@ pub enum Dialog {
         log_level: String,
         ruleset_mirror: RulesetMirror,
         adblock_enable: bool,
+        // ── Subscription (upstream DialogBasicSettings Subscription tab) ──
+        net_use_proxy: bool,
+        allow_stopping_active_profile: bool,
+        sub_clear: bool,
+        sub_show_change_popup: bool,
+        net_insecure: bool,
+        sub_send_hwid: bool,
+        sub_auto_update_enable: bool,
+        route_auto_update_enable: bool,
+        /// Active tab (Common / Subscription).
+        tab: BasicSettingsTab,
         /// Which field is focused for keyboard edit: 0 addr 1 port 2 test 3 rdns 4 ddns 5 log
         focus: usize,
     },
@@ -162,6 +204,15 @@ impl Dialog {
             log_level: s.log_level.clone(),
             ruleset_mirror: s.ruleset_mirror,
             adblock_enable: s.adblock_enable,
+            net_use_proxy: s.net_use_proxy,
+            allow_stopping_active_profile: s.allow_stopping_active_profile,
+            sub_clear: s.sub_clear,
+            sub_show_change_popup: s.sub_show_change_popup,
+            net_insecure: s.net_insecure,
+            sub_send_hwid: s.sub_send_hwid,
+            sub_auto_update_enable: s.sub_auto_update_enabled(),
+            route_auto_update_enable: s.route_auto_update_enabled(),
+            tab: BasicSettingsTab::Common,
             focus: 0,
         }
     }
@@ -265,7 +316,25 @@ pub fn edit_profile_body(
         ))
 }
 
+/// Toggle ids for Basic Settings → Subscription checkboxes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BasicSubToggle {
+    NetUseProxy,
+    AllowStoppingActive,
+    SubClear,
+    SubShowChangePopup,
+    NetInsecure,
+    SubSendHwid,
+    SubAutoUpdate,
+    RouteAutoUpdate,
+}
+
 /// Build basic settings body with real gpui-component Inputs.
+///
+/// Layout mirrors upstream `DialogBasicSettings` `QTabWidget` + form grids:
+/// Common (Inbound / Testing group boxes) · Subscription (2-col grid order).
+///
+/// `content_max_h` is the scrollable form area height (tabs + footer stay fixed).
 pub fn basic_settings_body(
     inbound_address: &Entity<InputState>,
     inbound_port: &Entity<InputState>,
@@ -273,60 +342,218 @@ pub fn basic_settings_body(
     remote_dns: &Entity<InputState>,
     direct_dns: &Entity<InputState>,
     log_level: &Entity<InputState>,
+    user_agent: &Entity<InputState>,
+    sub_custom_hwid: &Entity<InputState>,
+    sub_auto_minutes: &Entity<InputState>,
+    route_auto_minutes: &Entity<InputState>,
+    tab: BasicSettingsTab,
+    content_max_h: f32,
     ruleset_mirror: RulesetMirror,
     adblock_enable: bool,
+    net_use_proxy: bool,
+    allow_stopping_active_profile: bool,
+    sub_clear: bool,
+    sub_show_change_popup: bool,
+    net_insecure: bool,
+    sub_send_hwid: bool,
+    sub_auto_update_enable: bool,
+    route_auto_update_enable: bool,
+    on_set_tab: impl Fn(BasicSettingsTab, &mut Window, &mut App) + 'static,
     on_cycle_mirror: impl Fn(&mut Window, &mut App) + 'static,
     on_toggle_adblock: impl Fn(&mut Window, &mut App) + 'static,
+    on_toggle_sub: impl Fn(BasicSubToggle, &mut Window, &mut App) + Clone + 'static,
     on_save: impl Fn(&mut Window, &mut App) + 'static,
     on_cancel: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
+    let toggle = |id: &'static str, label: &'static str, checked: bool, kind: BasicSubToggle| {
+        let on_toggle_sub = on_toggle_sub.clone();
+        settings_switch_row(id, label, checked, move |_, w, cx| {
+            on_toggle_sub(kind, w, cx);
+        })
+    };
+
+    let labels: Vec<SharedString> = BasicSettingsTab::ALL
+        .iter()
+        .map(|t| SharedString::from(t.label()))
+        .collect();
+    let tabs = tab_bar("bs-tabs", tab.index(), labels, move |ix, w, cx| {
+        on_set_tab(BasicSettingsTab::from_index(*ix), w, cx);
+    });
+
+    let content = match tab {
+        // Upstream Common: QVBoxLayout → Inbound Settings groupBox + Testing groupBox.
+        BasicSettingsTab::Common => {
+            let inbound = div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .child(section_hint(
+                    "Allow LAN: set Listen Address to :: or 0.0.0.0 (or tray toggle), then restart",
+                ))
+                .child(form_input_row("Listen Address", inbound_address))
+                .child(form_input_row("Listen Port", inbound_port));
+
+            let testing = div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .child(form_input_row("Latency Test URL", test_url));
+
+            // Extra fields we ship on Common until dedicated Logging / Routing tabs land.
+            let extras = div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .child(form_input_row("Remote DNS", remote_dns))
+                .child(form_input_row("Direct DNS", direct_dns))
+                .child(form_input_row("Log level", log_level))
+                .child(form_row(
+                    "Rule-set mirror",
+                    secondary_btn(
+                        "bs-mirror",
+                        ruleset_mirror.label(),
+                        move |_, w, cx| on_cycle_mirror(w, cx),
+                    ),
+                ))
+                .child(settings_switch_row(
+                    "bs-adblock",
+                    "Adblock rule-set (Start)",
+                    adblock_enable,
+                    move |_, w, cx| on_toggle_adblock(w, cx),
+                ));
+
+            div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .child(group_panel("Inbound Settings", inbound))
+                .child(group_panel("Testing", testing))
+                .child(group_panel("Other", extras))
+                .into_any_element()
+        }
+        // Upstream Subscription tab grid order (dialog_basic_settings.ui tab_3).
+        BasicSettingsTab::Subscription => {
+            let on_route_auto = on_toggle_sub.clone();
+            let on_sub_auto = on_toggle_sub.clone();
+            div()
+                .flex()
+                .flex_col()
+                .w_full()
+                // row 0 — Routing profiles auto update | Enable + Interval
+                .child(form_enable_interval_row(
+                    "bs-route-auto",
+                    "Routing profiles auto update",
+                    route_auto_update_enable,
+                    route_auto_minutes,
+                    move |_, w, cx| on_route_auto(BasicSubToggle::RouteAutoUpdate, w, cx),
+                ))
+                // row 1 — Subscription auto update | Enable + Interval
+                .child(form_enable_interval_row(
+                    "bs-sub-auto",
+                    "Subscription auto update",
+                    sub_auto_update_enable,
+                    sub_auto_minutes,
+                    move |_, w, cx| on_sub_auto(BasicSubToggle::SubAutoUpdate, w, cx),
+                ))
+                // row 2 — User Agent | input
+                .child(form_input_row("User Agent", user_agent))
+                // row 3 — allow stopping
+                .child(toggle(
+                    "bs-allow-stop",
+                    "Allow stopping the active profile",
+                    allow_stopping_active_profile,
+                    BasicSubToggle::AllowStoppingActive,
+                ))
+                // row 4 — clear servers
+                .child(toggle(
+                    "bs-sub-clear",
+                    "Clear servers before updating subscription",
+                    sub_clear,
+                    BasicSubToggle::SubClear,
+                ))
+                // row 5 — change popup
+                .child(toggle(
+                    "bs-sub-diff",
+                    "Show the changes window after a manual subscription update",
+                    sub_show_change_popup,
+                    BasicSubToggle::SubShowChangePopup,
+                ))
+                // row 8 — HWID
+                .child(toggle(
+                    "bs-sub-hwid",
+                    "Enable sending HWID, device model, and OS version when updating subscription",
+                    sub_send_hwid,
+                    BasicSubToggle::SubSendHwid,
+                ))
+                // row 9 — Custom System Parameters | input
+                .child(form_input_row(
+                    "Custom System Parameters (optional)",
+                    sub_custom_hwid,
+                ))
+                .child(section_hint(
+                    "Format: hwid=value,os=value,osVersion=value,model=value · leave empty for defaults",
+                ))
+                // Upstream places these on the Miscellaneous tab; keep here until that tab lands.
+                .child(div().h(px(8.)))
+                .child(section_hint("Network (upstream: Miscellaneous)"))
+                .child(toggle(
+                    "bs-net-proxy",
+                    "Use proxy",
+                    net_use_proxy,
+                    BasicSubToggle::NetUseProxy,
+                ))
+                .child(toggle(
+                    "bs-net-insecure",
+                    "Ignore TLS errors",
+                    net_insecure,
+                    BasicSubToggle::NetInsecure,
+                ))
+                .into_any_element()
+        }
+    };
+
+    let scroll_h = content_max_h.max(200.);
     div()
         .flex()
         .flex_col()
-        .child(section_hint(
-            "Basic Settings · Allow LAN: set Inbound to :: or 0.0.0.0 (or tray toggle), then restart · no auth",
-        ))
-        .child(input_field_row("Inbound address", inbound_address, 150.))
-        .child(input_field_row("Mixed / SOCKS port", inbound_port, 150.))
-        .child(input_field_row("Test URL", test_url, 150.))
-        .child(input_field_row("Remote DNS", remote_dns, 150.))
-        .child(input_field_row("Direct DNS", direct_dns, 150.))
-        .child(input_field_row("Log level", log_level, 150.))
+        .w_full()
+        // Tabs stay pinned above the scroll region.
+        .child(div().flex_shrink_0().w_full().child(tabs))
         .child(
+            // Fixed height is required for scrolling; without it the dialog grows past
+            // the viewport and is clipped with no wheel target. Prefer gpui-component's
+            // Scrollable (visible bar + reliable wheel) over bare overflow_y_scroll.
             div()
-                .flex()
-                .items_center()
-                .gap_3()
-                .mb_2()
+                .id("bs-scroll")
+                .w_full()
+                .mt_2()
+                .h(px(scroll_h))
+                .max_h(px(scroll_h))
+                .overflow_y_scrollbar()
                 .child(
                     div()
-                        .w(px(150.))
-                        .text_xs()
-                        .text_color(Theme::text_muted())
-                        .child("Rule-set mirror"),
-                )
-                .child(secondary_btn(
-                    "bs-mirror",
-                    ruleset_mirror.label(),
-                    move |_, w, cx| on_cycle_mirror(w, cx),
-                )),
+                        .flex()
+                        .flex_col()
+                        .w_full()
+                        // Extra bottom pad so the last field isn't flush against the footer.
+                        .pb_3()
+                        .child(content),
+                ),
         )
         .child(
-            div().mb_2().child(mode_switch(
-                "bs-adblock",
-                "Adblock rule-set (Start)",
-                adblock_enable,
-                move |_, w, cx| on_toggle_adblock(w, cx),
-            )),
+            div()
+                .flex_shrink_0()
+                .w_full()
+                .pt_1()
+                .child(dialog_actions(
+                    "bs-cancel",
+                    "Cancel",
+                    "bs-save",
+                    "Save",
+                    on_cancel,
+                    on_save,
+                )),
         )
-        .child(dialog_actions(
-            "bs-cancel",
-            "Cancel",
-            "bs-save",
-            "Save",
-            on_cancel,
-            on_save,
-        ))
 }
 
 /// Upstream DialogManageGroups: list of GroupItems + New group / Update all.

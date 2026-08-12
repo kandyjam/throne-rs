@@ -20,8 +20,8 @@ use std::sync::{Arc, Mutex};
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, EntityInputHandler, FocusHandle, Focusable, KeyDownEvent,
-    Pixels, ScrollHandle, SharedString, Subscription, UTF16Selection, Window, actions, div,
-    prelude::*, px, uniform_list,
+    Pixels, ScrollHandle, ScrollStrategy, SharedString, Subscription, UTF16Selection,
+    UniformListScrollHandle, Window, actions, div, prelude::*, px, uniform_list,
 };
 
 use throne_core_client::{
@@ -29,16 +29,16 @@ use throne_core_client::{
     set_system_proxy,
 };
 use throne_domain::{
-    AppState, CoreStatus, GroupId, Profile, ProfileId, ProfileSortColumn, ProfileType,
-    TrafficSnapshot,
+    AppSettings, AppState, CoreStatus, GroupId, Profile, ProfileId, ProfileSortColumn,
+    ProfileType, TrafficSnapshot,
 };
 use throne_import::{FetchOptions, fetch_url_with_options, import_subscription_response};
 
 use crate::theme::{self, Theme, latency_color};
 use crate::ui::dialog_inputs::{DialogInputs, NestedInputs};
 use crate::ui::dialogs::{
-    AutoSelectorGroupView, AutoSelectorMemberRow, Dialog, EditGroupView, HotkeyField,
-    add_input_body, auto_selector_stats_body, basic_settings_body, edit_group_body,
+    AutoSelectorGroupView, AutoSelectorMemberRow, BasicSubToggle, Dialog, EditGroupView,
+    HotkeyField, add_input_body, auto_selector_stats_body, basic_settings_body, edit_group_body,
     edit_profile_body, hotkey_settings_body, manage_groups_body, subscription_diff_body,
     traffic_stats_body, tun_settings_body,
 };
@@ -67,6 +67,10 @@ actions!(
         SaveDb,
         SelectAll,
         DeleteSelected,
+        /// Move selection one row up in the profile table (↑).
+        SelectPrevProfile,
+        /// Move selection one row down in the profile table (↓).
+        SelectNextProfile,
         UrlTestSelected,
         UrlTestGroup,
         DeleteUnavailable,
@@ -378,18 +382,72 @@ impl PendingProfileSwitch {
 enum UpdateOrigin {
     Manual,
     UpdateAll,
+    /// PeriodicRunner auto sweep — no confirmation, no change popup.
+    Auto,
 }
 
 fn should_show_subscription_diff(origin: UpdateOrigin, enabled: bool) -> bool {
     enabled && origin == UpdateOrigin::Manual
 }
 
+fn is_batch_subscription_origin(origin: UpdateOrigin) -> bool {
+    matches!(origin, UpdateOrigin::UpdateAll | UpdateOrigin::Auto)
+}
+
 fn eligible_subscription_ids<'a>(
     groups: impl IntoIterator<Item = &'a throne_domain::Group>,
 ) -> Vec<GroupId> {
+    eligible_subscription_ids_filtered(groups, false)
+}
+
+/// Pick the next/previous profile id in the visible list (arrow-key navigation).
+///
+/// - Empty list → `None`
+/// - No / stale selection + down → first; + up → last
+/// - At ends → clamp (no wrap), matching QTableView default movement
+fn adjacent_profile_id(
+    visible_ids: &[ProfileId],
+    selected: Option<ProfileId>,
+    delta: i32,
+) -> Option<ProfileId> {
+    if visible_ids.is_empty() || delta == 0 {
+        return None;
+    }
+    let Some(cur) = selected else {
+        return if delta > 0 {
+            visible_ids.first().copied()
+        } else {
+            visible_ids.last().copied()
+        };
+    };
+    let Some(idx) = visible_ids.iter().position(|id| *id == cur) else {
+        return if delta > 0 {
+            visible_ids.first().copied()
+        } else {
+            visible_ids.last().copied()
+        };
+    };
+    let next = if delta > 0 {
+        (idx + 1).min(visible_ids.len() - 1)
+    } else {
+        idx.saturating_sub(1)
+    };
+    visible_ids.get(next).copied()
+}
+
+/// Upstream `UI_update_all_groups(onlyAllowed)` — when `only_allowed`, skip groups with
+/// `skip_auto_update` (used by PeriodicRunner).
+fn eligible_subscription_ids_filtered<'a>(
+    groups: impl IntoIterator<Item = &'a throne_domain::Group>,
+    only_allowed: bool,
+) -> Vec<GroupId> {
     groups
         .into_iter()
-        .filter(|group| !group.url.trim().is_empty() && !group.archive)
+        .filter(|group| {
+            !group.url.trim().is_empty()
+                && !group.archive
+                && !(only_allowed && group.skip_auto_update)
+        })
         .map(|group| group.id)
         .collect()
 }
@@ -398,13 +456,7 @@ fn subscription_fetch_options(
     settings: &throne_domain::AppSettings,
     core_status: &CoreStatus,
 ) -> Result<FetchOptions, String> {
-    if !settings.system_proxy_enabled {
-        return Ok(FetchOptions::default());
-    }
-    if !core_status.is_running() {
-        return Err("Request with proxy but no profile started.".into());
-    }
-    FetchOptions::with_http_proxy(&settings.inbound_address, settings.inbound_socks_port)
+    FetchOptions::from_settings(settings, core_status.is_running())
 }
 
 fn format_subscription_changes(report: &throne_domain::SubscriptionUpdateReport) -> String {
@@ -441,19 +493,21 @@ fn format_subscription_changes(report: &throne_domain::SubscriptionUpdateReport)
     text
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct SubscriptionUpdateQueue {
     pending: VecDeque<GroupId>,
     succeeded: usize,
     failed: usize,
+    origin: UpdateOrigin,
 }
 
 impl SubscriptionUpdateQueue {
-    fn new(ids: Vec<GroupId>) -> Self {
+    fn new(ids: Vec<GroupId>, origin: UpdateOrigin) -> Self {
         Self {
             pending: ids.into(),
             succeeded: 0,
             failed: 0,
+            origin,
         }
     }
 
@@ -492,6 +546,8 @@ pub struct MainWindow {
     bottom_tab: usize,
     /// Shared vertical scroll for Logs / Connections bottom panel body.
     log_scroll_handle: ScrollHandle,
+    /// Profile table (`uniform_list`) scroll — used to reveal keyboard-selected rows.
+    profile_list_scroll: UniformListScrollHandle,
     rendered_log_text: String,
     /// Last rendered Connections id set (for auto-scroll-to-last).
     rendered_connection_ids: String,
@@ -582,6 +638,9 @@ impl MainWindow {
             gpui::KeyBinding::new("ctrl-shift-g", UrlTestGroup, Some("Main")),
             gpui::KeyBinding::new("cmd-shift-r", DeleteUnavailable, Some("Main")),
             gpui::KeyBinding::new("ctrl-shift-r", DeleteUnavailable, Some("Main")),
+            // Profile table: arrow-key row selection (upstream QTableView).
+            gpui::KeyBinding::new("up", SelectPrevProfile, Some("Main")),
+            gpui::KeyBinding::new("down", SelectNextProfile, Some("Main")),
             gpui::KeyBinding::new("cmd-q", Quit, None),
         ]);
 
@@ -608,6 +667,7 @@ impl MainWindow {
             open_menu: OpenMenu::None,
             bottom_tab: 0,
             log_scroll_handle: ScrollHandle::new(),
+            profile_list_scroll: UniformListScrollHandle::new(),
             rendered_log_text: String::new(),
             rendered_connection_ids: String::new(),
             ctx_menu_at: None,
@@ -660,6 +720,7 @@ impl MainWindow {
             _appearance_sub: None,
         };
         window.spawn_runtime_poller(cx);
+        window.spawn_periodic_runner(cx);
         window
     }
 
@@ -679,7 +740,7 @@ impl MainWindow {
         let scheme = theme::apply_preference(&self.state.settings().theme, system_dark);
         // Tray glyph follows scheme (template on macOS; light/dark swap on Win/Linux).
         crate::tray::apply_scheme(scheme);
-        // Dock icon: white/black line-art masters (macOS runtime switch).
+        // Dock icon: light/dark tiles with upstream green crown (macOS runtime switch).
         crate::dock_icon::apply_for_scheme(scheme.is_dark());
         // Dialog / Button / Switch / TabBar / Alert read gpui-component Theme.
         Self::sync_gpui_component_theme(scheme, None, cx);
@@ -722,6 +783,158 @@ impl MainWindow {
         .detach();
     }
 
+    /// Upstream `PeriodicRunner`: poll every 60s; first catch-up after 10s.
+    fn spawn_periodic_runner(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            smol::Timer::after(std::time::Duration::from_secs(10)).await;
+            loop {
+                if this
+                    .update(cx, |this, cx| this.tick_periodic_jobs(cx))
+                    .is_err()
+                {
+                    break;
+                }
+                smol::Timer::after(std::time::Duration::from_secs(60)).await;
+            }
+        })
+        .detach();
+    }
+
+    /// Evaluate due subscription / routing-profile auto-update jobs (live settings).
+    fn tick_periodic_jobs(&mut self, cx: &mut Context<Self>) {
+        let now = chrono::Utc::now().timestamp();
+        let settings = self.state.settings().clone();
+
+        let sub_minutes = settings.sub_auto_update_effective_minutes();
+        if AppSettings::auto_update_due(now, settings.sub_auto_update_last, sub_minutes) {
+            // Record attempt before work so a slow job cannot double-fire.
+            self.state.settings_mut().sub_auto_update_last = now;
+            let _ = self.persist_db();
+            self.state
+                .push_log("Auto-update: running subscriptions");
+            self.start_auto_subscription_update_all(cx);
+        }
+
+        let route_minutes = settings.route_auto_update_effective_minutes();
+        if AppSettings::auto_update_due(now, settings.route_auto_update_last, route_minutes) {
+            self.state.settings_mut().route_auto_update_last = now;
+            let _ = self.persist_db();
+            self.state
+                .push_log("Auto-update: running routing profiles");
+            self.start_auto_remote_route_update(cx);
+        }
+    }
+
+    /// Upstream `UI_update_all_groups(true)` — no confirm dialog, respect `skip_auto_update`.
+    fn start_auto_subscription_update_all(&mut self, cx: &mut Context<Self>) {
+        if self.subscription_queue.is_some() || self.background_busy {
+            self.state
+                .push_log("The last subscription update has not exited.");
+            return;
+        }
+        let ids = eligible_subscription_ids_filtered(self.state.all_groups(), true);
+        if ids.is_empty() {
+            self.state
+                .push_log("Auto-update: no eligible subscriptions");
+            return;
+        }
+        self.subscription_queue = Some(SubscriptionUpdateQueue::new(ids, UpdateOrigin::Auto));
+        self.start_next_subscription_update(cx);
+    }
+
+    /// Upstream `UI_update_all_remote_routes(true)` — only remote profiles with `auto_update`.
+    fn start_auto_remote_route_update(&mut self, cx: &mut Context<Self>) {
+        let profiles: Vec<_> = self
+            .state
+            .all_routes()
+            .into_iter()
+            .filter(|p| p.is_remote && !p.remote_url.trim().is_empty() && p.auto_update)
+            .cloned()
+            .collect();
+        if profiles.is_empty() {
+            self.state
+                .push_log("Auto-update: no remote routing profiles with auto-update");
+            return;
+        }
+        // Reuse the existing remote-route fetch path (works even when Routes dialog is closed).
+        self.update_remote_routes_silent(profiles, cx);
+    }
+
+    /// Like [`Self::update_remote_routes`] but logs to the main log instead of the Routes dialog.
+    fn update_remote_routes_silent(
+        &mut self,
+        profiles: Vec<throne_domain::RouteProfile>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.background_busy {
+            self.state
+                .push_log("Auto-update: routing profiles skipped (busy)");
+            return;
+        }
+        if profiles.is_empty() {
+            return;
+        }
+        self.background_busy = true;
+        let total = profiles.len();
+        self.state.push_log(format!(
+            ">>>>>>>> Updating {total} remote routing profile(s)…"
+        ));
+        let jobs: Vec<(i64, String, String)> = profiles
+            .into_iter()
+            .map(|p| (p.id, p.remote_url.clone(), p.name.clone()))
+            .collect();
+        cx.spawn(async move |this, cx| {
+            let mut applied = 0usize;
+            let mut failures = Vec::new();
+            for (id, url, name) in jobs {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let body = throne_import::fetch_url(&url)?;
+                        fetch_route_from_body(&body)
+                    })
+                    .await;
+                match result {
+                    Ok(fetched) => {
+                        let ok = this
+                            .update(cx, |this, _cx| {
+                                this.state
+                                    .replace_route_content(id, fetched)
+                                    .map_err(|e| e.to_string())
+                            })
+                            .unwrap_or_else(|e| Err(e.to_string()));
+                        match ok {
+                            Ok(()) => applied += 1,
+                            Err(e) => failures.push(format!("{name}: {e}")),
+                        }
+                    }
+                    Err(e) => failures.push(format!("{name}: {e}")),
+                }
+            }
+            this.update(cx, |this, cx| {
+                this.background_busy = false;
+                if let Err(e) = this.persist_db() {
+                    this.state
+                        .push_log(format!("Auto-update routes persist failed: {e}"));
+                }
+                if failures.is_empty() {
+                    this.state.push_log(format!(
+                        "<<<<<<<< Auto-update routes: updated {applied} profile(s)"
+                    ));
+                } else {
+                    this.state.push_log(format!(
+                        "<<<<<<<< Auto-update routes: updated {applied}, failed {}:\n{}",
+                        failures.len(),
+                        failures.join("\n")
+                    ));
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn toggle_sort(&mut self, col: SortColumn, cx: &mut Context<Self>) {
         (self.sort_column, self.sort_asc) = next_sort_state(self.sort_column, self.sort_asc, col);
         let result = domain_sort_column(self.sort_column)
@@ -747,6 +960,35 @@ impl MainWindow {
             .into_iter()
             .cloned()
             .collect()
+    }
+
+    /// Move the selected row by `delta` (−1 = up, +1 = down) within the visible list.
+    ///
+    /// If the new selection is outside the list viewport, scrolls just enough to
+    /// reveal it (non-strict `scroll_to_item` — no jump when already fully visible).
+    fn move_profile_selection(&mut self, delta: i32, cx: &mut Context<Self>) {
+        if self.dialog_is_open() || self.open_menu != OpenMenu::None {
+            return;
+        }
+        let ids: Vec<ProfileId> = self.sorted_profiles().iter().map(|p| p.id).collect();
+        let Some(next) = adjacent_profile_id(&ids, self.state.selected_profile_id(), delta) else {
+            return;
+        };
+        let Some(ix) = ids.iter().position(|id| *id == next) else {
+            return;
+        };
+        // Align toward the edge we are moving into so continuous arrow navigation
+        // keeps a predictable amount of context on screen.
+        let strategy = if delta > 0 {
+            ScrollStrategy::Bottom
+        } else {
+            ScrollStrategy::Top
+        };
+        self.profile_list_scroll.scroll_to_item(ix, strategy);
+        if self.state.selected_profile_id() != Some(next) {
+            let _ = self.state.select_profile(next);
+        }
+        cx.notify();
     }
 
     fn sort_label(&self, col: SortColumn, base: &str) -> String {
@@ -2503,6 +2745,7 @@ impl MainWindow {
         let port = self.state.settings().inbound_socks_port;
         // Preserve other basic settings while updating inbound address.
         let s = self.state.settings().clone();
+        let subscription = throne_domain::BasicSubscriptionSettings::from_settings(&s);
         self.state.apply_basic_settings(
             addr,
             port,
@@ -2512,6 +2755,7 @@ impl MainWindow {
             s.log_level,
             s.ruleset_mirror,
             s.adblock_enable,
+            subscription,
         );
         let _ = self.persist_db();
         let msg = if allow {
@@ -3368,17 +3612,22 @@ impl MainWindow {
             cx.notify();
             return;
         }
-        self.subscription_queue = Some(SubscriptionUpdateQueue::new(ids));
+        self.subscription_queue = Some(SubscriptionUpdateQueue::new(ids, UpdateOrigin::UpdateAll));
         self.start_next_subscription_update(cx);
     }
 
     fn start_next_subscription_update(&mut self, cx: &mut Context<Self>) {
+        let origin = self
+            .subscription_queue
+            .as_ref()
+            .map(|q| q.origin)
+            .unwrap_or(UpdateOrigin::UpdateAll);
         let next = self
             .subscription_queue
             .as_mut()
             .and_then(SubscriptionUpdateQueue::take_next);
         if let Some(group_id) = next {
-            self.start_subscription_group(group_id, UpdateOrigin::UpdateAll, cx);
+            self.start_subscription_group(group_id, origin, cx);
         } else {
             let message = self
                 .subscription_queue
@@ -3411,7 +3660,7 @@ impl MainWindow {
         if group.url.trim().is_empty() || group.archive {
             self.state
                 .set_status_message("This group has no updatable subscription");
-            if origin == UpdateOrigin::UpdateAll {
+            if is_batch_subscription_origin(origin) {
                 if let Some(queue) = self.subscription_queue.as_mut() {
                     queue.record_result(false);
                 }
@@ -3425,7 +3674,7 @@ impl MainWindow {
             Ok(options) => options,
             Err(error) => {
                 self.state.set_status_message(format!("{name}: {error}"));
-                if origin == UpdateOrigin::UpdateAll {
+                if is_batch_subscription_origin(origin) {
                     if let Some(queue) = self.subscription_queue.as_mut() {
                         queue.record_result(false);
                     }
@@ -3534,7 +3783,7 @@ impl MainWindow {
                         ));
                     }
                 }
-                if origin == UpdateOrigin::UpdateAll {
+                if is_batch_subscription_origin(origin) {
                     if let Some(queue) = this.subscription_queue.as_mut() {
                         queue.record_result(succeeded);
                     }
@@ -3917,12 +4166,42 @@ impl MainWindow {
     }
 
     fn save_basic_settings(&mut self, cx: &mut Context<Self>) {
-        let (ruleset_mirror, adblock_enable) = match &self.dialog {
+        let (
+            ruleset_mirror,
+            adblock_enable,
+            net_use_proxy,
+            allow_stopping_active_profile,
+            sub_clear,
+            sub_show_change_popup,
+            net_insecure,
+            sub_send_hwid,
+            sub_auto_update_enable,
+            route_auto_update_enable,
+        ) = match &self.dialog {
             Dialog::BasicSettings {
                 ruleset_mirror,
                 adblock_enable,
+                net_use_proxy,
+                allow_stopping_active_profile,
+                sub_clear,
+                sub_show_change_popup,
+                net_insecure,
+                sub_send_hwid,
+                sub_auto_update_enable,
+                route_auto_update_enable,
                 ..
-            } => (*ruleset_mirror, *adblock_enable),
+            } => (
+                *ruleset_mirror,
+                *adblock_enable,
+                *net_use_proxy,
+                *allow_stopping_active_profile,
+                *sub_clear,
+                *sub_show_change_popup,
+                *net_insecure,
+                *sub_send_hwid,
+                *sub_auto_update_enable,
+                *route_auto_update_enable,
+            ),
             _ => return,
         };
         let Some(DialogInputs::Basic {
@@ -3932,6 +4211,10 @@ impl MainWindow {
             remote_dns,
             direct_dns,
             log_level,
+            user_agent,
+            sub_custom_hwid,
+            sub_auto_minutes,
+            route_auto_minutes,
         }) = &self.dialog_inputs
         else {
             return;
@@ -3942,7 +4225,47 @@ impl MainWindow {
         let remote_dns = DialogInputs::read_string(remote_dns, cx);
         let direct_dns = DialogInputs::read_string(direct_dns, cx);
         let log_level = DialogInputs::read_string(log_level, cx);
+        let user_agent = DialogInputs::read_string(user_agent, cx);
+        let sub_custom_hwid_params = DialogInputs::read_string(sub_custom_hwid, cx);
+        let mut sub_minutes = DialogInputs::read_string(sub_auto_minutes, cx)
+            .parse::<i32>()
+            .unwrap_or(30)
+            .abs()
+            .max(1);
+        let mut route_minutes = DialogInputs::read_string(route_auto_minutes, cx)
+            .parse::<i32>()
+            .unwrap_or(1440)
+            .abs()
+            .max(1);
+        // Upstream treats interval < 30 as disabled; raise to the minimum so Enable is useful.
+        let mut notices = Vec::new();
+        if sub_auto_update_enable && sub_minutes < 30 {
+            sub_minutes = 30;
+            notices.push("Subscription auto-update interval raised to 30 min (minimum)");
+        }
+        if route_auto_update_enable && route_minutes < 30 {
+            route_minutes = 30;
+            notices.push("Routing auto-update interval raised to 30 min (minimum)");
+        }
         let port = inbound_port.parse::<i32>().unwrap_or(2080);
+        let subscription = throne_domain::BasicSubscriptionSettings {
+            user_agent,
+            net_use_proxy,
+            net_insecure,
+            sub_clear,
+            sub_show_change_popup,
+            allow_stopping_active_profile,
+            sub_send_hwid,
+            sub_custom_hwid_params,
+            sub_auto_update: throne_domain::AppSettings::encode_auto_update(
+                sub_auto_update_enable,
+                sub_minutes,
+            ),
+            route_auto_update: throne_domain::AppSettings::encode_auto_update(
+                route_auto_update_enable,
+                route_minutes,
+            ),
+        };
         self.state.apply_basic_settings(
             inbound_address,
             port,
@@ -3952,8 +4275,14 @@ impl MainWindow {
             log_level,
             ruleset_mirror,
             adblock_enable,
+            subscription,
         );
+        for n in notices {
+            self.state.push_log(n);
+        }
         let _ = self.persist_db();
+        // Upstream CheckNow: a newly enabled / shortened job should not wait a full poll.
+        self.tick_periodic_jobs(cx);
         self.close_dialog();
         cx.notify();
     }
@@ -5001,6 +5330,7 @@ impl MainWindow {
             .map(|g| (g.id, g.name.clone()))
             .collect();
 
+        let scroll = self.profile_list_scroll.clone();
         div().flex_1().min_h(px(120.)).bg(Theme::bg_elevated()).child(
             uniform_list(
                 "profiles",
@@ -5120,6 +5450,7 @@ impl MainWindow {
                     items
                 }),
             )
+            .track_scroll(scroll)
             .size_full(),
         )
     }
@@ -5635,6 +5966,12 @@ impl Render for MainWindow {
                 }
                 this.delete_selected(cx)
             }))
+            .on_action(cx.listener(|this, _: &SelectPrevProfile, _, cx| {
+                this.move_profile_selection(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectNextProfile, _, cx| {
+                this.move_profile_selection(1, cx);
+            }))
             .on_action(cx.listener(|this, _: &UrlTestSelected, _, cx| {
                 this.url_test_selected(cx)
             }))
@@ -5784,6 +6121,15 @@ fn build_gpui_dialog(
         Dialog::BasicSettings {
             ruleset_mirror,
             adblock_enable,
+            net_use_proxy,
+            allow_stopping_active_profile,
+            sub_clear,
+            sub_show_change_popup,
+            net_insecure,
+            sub_send_hwid,
+            sub_auto_update_enable,
+            route_auto_update_enable,
+            tab,
             ..
         } => {
             let Some(DialogInputs::Basic {
@@ -5793,19 +6139,39 @@ fn build_gpui_dialog(
                 remote_dns,
                 direct_dns,
                 log_level,
+                user_agent,
+                sub_custom_hwid,
+                sub_auto_minutes,
+                route_auto_minutes,
             }) = this.dialog_inputs.as_ref()
             else {
                 return dialog.title("Basic Settings").child(div().child("…"));
             };
             let ruleset_mirror = *ruleset_mirror;
             let adblock_enable = *adblock_enable;
+            let net_use_proxy = *net_use_proxy;
+            let allow_stopping_active_profile = *allow_stopping_active_profile;
+            let sub_clear = *sub_clear;
+            let sub_show_change_popup = *sub_show_change_popup;
+            let net_insecure = *net_insecure;
+            let sub_send_hwid = *sub_send_hwid;
+            let sub_auto_update_enable = *sub_auto_update_enable;
+            let route_auto_update_enable = *route_auto_update_enable;
+            let tab = *tab;
+            let e_tab = entity.clone();
             let e_mirror = entity.clone();
             let e_adblock = entity.clone();
+            let e_sub = entity.clone();
             let e_save = entity.clone();
             let e_cancel = entity.clone();
+            // Cap dialog height so the form body can scroll (same pattern as Edit Group / Routes).
+            let dialog_max_h = (window.viewport_size().height * 0.82).max(px(360.));
+            // Room for title chrome, tab bar, and Cancel/Save footer.
+            let content_max_h = (f32::from(dialog_max_h) - 160.).clamp(240., 560.);
             dialog
                 .title("Basic Settings")
-                .w(px(520.))
+                .w(px(720.))
+                .max_h(dialog_max_h)
                 .overlay_closable(true)
                 .on_cancel({
                     let entity = entity.clone();
@@ -5825,8 +6191,30 @@ fn build_gpui_dialog(
                     remote_dns,
                     direct_dns,
                     log_level,
+                    user_agent,
+                    sub_custom_hwid,
+                    sub_auto_minutes,
+                    route_auto_minutes,
+                    tab,
+                    content_max_h,
                     ruleset_mirror,
                     adblock_enable,
+                    net_use_proxy,
+                    allow_stopping_active_profile,
+                    sub_clear,
+                    sub_show_change_popup,
+                    net_insecure,
+                    sub_send_hwid,
+                    sub_auto_update_enable,
+                    route_auto_update_enable,
+                    move |new_tab, _, cx| {
+                        e_tab.update(cx, |t, cx| {
+                            if let Dialog::BasicSettings { tab, .. } = &mut t.dialog {
+                                *tab = new_tab;
+                            }
+                            cx.notify();
+                        });
+                    },
                     move |_, cx| {
                         e_mirror.update(cx, |t, cx| {
                             if let Dialog::BasicSettings {
@@ -5845,6 +6233,49 @@ fn build_gpui_dialog(
                             } = &mut t.dialog
                             {
                                 *adblock_enable = !*adblock_enable;
+                            }
+                            cx.notify();
+                        });
+                    },
+                    move |kind, _, cx| {
+                        e_sub.update(cx, |t, cx| {
+                            if let Dialog::BasicSettings {
+                                net_use_proxy,
+                                allow_stopping_active_profile,
+                                sub_clear,
+                                sub_show_change_popup,
+                                net_insecure,
+                                sub_send_hwid,
+                                sub_auto_update_enable,
+                                route_auto_update_enable,
+                                ..
+                            } = &mut t.dialog
+                            {
+                                match kind {
+                                    BasicSubToggle::NetUseProxy => {
+                                        *net_use_proxy = !*net_use_proxy
+                                    }
+                                    BasicSubToggle::AllowStoppingActive => {
+                                        *allow_stopping_active_profile =
+                                            !*allow_stopping_active_profile
+                                    }
+                                    BasicSubToggle::SubClear => *sub_clear = !*sub_clear,
+                                    BasicSubToggle::SubShowChangePopup => {
+                                        *sub_show_change_popup = !*sub_show_change_popup
+                                    }
+                                    BasicSubToggle::NetInsecure => {
+                                        *net_insecure = !*net_insecure
+                                    }
+                                    BasicSubToggle::SubSendHwid => {
+                                        *sub_send_hwid = !*sub_send_hwid
+                                    }
+                                    BasicSubToggle::SubAutoUpdate => {
+                                        *sub_auto_update_enable = !*sub_auto_update_enable
+                                    }
+                                    BasicSubToggle::RouteAutoUpdate => {
+                                        *route_auto_update_enable = !*route_auto_update_enable
+                                    }
+                                }
                             }
                             cx.notify();
                         });
@@ -6675,7 +7106,8 @@ mod tests {
     use super::{
         CoreAction, FAILED_STOP_PROFILE_LOG, PendingProfileSwitch, SortColumn,
         SubscriptionUpdateQueue, TestProgressKind, TestProgressPanel, UpdateOrigin,
-        eligible_subscription_ids, failed_start_profile_log, next_core_action,
+        adjacent_profile_id, eligible_subscription_ids, eligible_subscription_ids_filtered,
+        failed_start_profile_log, next_core_action,
         next_runtime_generation, next_sort_state, resolve_stop_profile_display,
         running_mode_marker, runtime_poll_health, runtime_poll_is_current,
         runtime_profile_display, should_queue_recovery_restart, should_scroll_connections_to_bottom,
@@ -6729,11 +7161,35 @@ mod tests {
             options.proxy_url.as_deref(),
             Some("http://127.0.0.1:2080")
         );
+        assert_eq!(
+            options.user_agent.as_deref(),
+            Some(settings.effective_user_agent().as_str())
+        );
+    }
+
+    #[test]
+    fn net_use_proxy_also_routes_subscription_fetch() {
+        let mut settings = AppSettings::default();
+        settings.net_use_proxy = true;
+        settings.system_proxy_enabled = false;
+        settings.user_agent = "MySub/9".into();
+        settings.net_insecure = true;
+        let options = subscription_fetch_options(
+            &settings,
+            &CoreStatus::Running {
+                profile_id: 1,
+                profile_name: "node".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(options.proxy_url.as_deref(), Some("http://127.0.0.1:2080"));
+        assert_eq!(options.user_agent.as_deref(), Some("MySub/9"));
+        assert!(options.insecure);
     }
 
     #[test]
     fn subscription_update_queue_advances_serially() {
-        let mut queue = SubscriptionUpdateQueue::new(vec![2, 4]);
+        let mut queue = SubscriptionUpdateQueue::new(vec![2, 4], UpdateOrigin::UpdateAll);
         assert_eq!(queue.take_next(), Some(2));
         queue.record_result(true);
         assert_eq!(queue.take_next(), Some(4));
@@ -6741,6 +7197,47 @@ mod tests {
         assert_eq!(queue.take_next(), None);
         assert!(queue.is_finished());
         assert_eq!(queue.completion_message(), "Subscription update finished · 1 succeeded · 1 failed");
+    }
+
+    #[test]
+    fn auto_update_interval_requires_at_least_30_minutes() {
+        assert_eq!(AppSettings::effective_auto_update_minutes(1), 0);
+        assert_eq!(AppSettings::effective_auto_update_minutes(29), 0);
+        assert_eq!(AppSettings::effective_auto_update_minutes(30), 30);
+        assert_eq!(AppSettings::effective_auto_update_minutes(-30), 0);
+        assert!(AppSettings::auto_update_due(1_000, 0, 30));
+        assert!(!AppSettings::auto_update_due(1_000, 900, 30)); // 100s < 30min
+        assert!(AppSettings::auto_update_due(1_000 + 30 * 60, 1_000, 30));
+    }
+
+    #[test]
+    fn auto_update_skips_groups_marked_skip_auto_update() {
+        let mut a = Group::new(1, "a");
+        a.url = "https://a.example/sub".into();
+        let mut b = Group::new(2, "b");
+        b.url = "https://b.example/sub".into();
+        b.skip_auto_update = true;
+        assert_eq!(
+            eligible_subscription_ids_filtered([&a, &b], true),
+            vec![1]
+        );
+        assert_eq!(
+            eligible_subscription_ids_filtered([&a, &b], false),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn adjacent_profile_id_moves_and_clamps() {
+        let ids = vec![10, 20, 30];
+        assert_eq!(adjacent_profile_id(&ids, None, 1), Some(10));
+        assert_eq!(adjacent_profile_id(&ids, None, -1), Some(30));
+        assert_eq!(adjacent_profile_id(&ids, Some(10), 1), Some(20));
+        assert_eq!(adjacent_profile_id(&ids, Some(20), -1), Some(10));
+        assert_eq!(adjacent_profile_id(&ids, Some(10), -1), Some(10)); // clamp top
+        assert_eq!(adjacent_profile_id(&ids, Some(30), 1), Some(30)); // clamp bottom
+        assert_eq!(adjacent_profile_id(&ids, Some(99), 1), Some(10)); // stale → first
+        assert_eq!(adjacent_profile_id(&[], Some(1), 1), None);
     }
 
     #[test]

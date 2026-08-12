@@ -469,14 +469,14 @@ mod tests {
                     }
                 }
             }
-            // Lucide-style outline crown strokes — sparse, not a full-canvas fill.
+            // Upstream-style geometric crown silhouette — filled peaks, not full canvas.
             assert!(
-                painted > 200 && painted < 2800,
-                "expected outline crown stroke pixels, got {painted}"
+                painted > 800 && painted < 2800,
+                "expected geometric crown silhouette pixels, got {painted}"
             );
-            // Some stroke ink near the crown body / base line.
-            let has_stroke = (20..48).any(|y| (16..48).any(|x| alpha(x, y) > 0));
-            assert!(has_stroke, "expected crown stroke pixels in center region");
+            // Crown body occupies the middle band.
+            let has_body = (20..48).any(|y| (16..48).any(|x| alpha(x, y) > 0));
+            assert!(has_body, "expected crown body pixels in center region");
         }
     }
 }

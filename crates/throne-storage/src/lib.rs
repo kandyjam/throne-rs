@@ -656,10 +656,23 @@ fn merge_settings_tx(
             "disable_private_range_bypass",
             bool_str(s.disable_private_range_bypass),
         ),
+        ("user_agent", s.user_agent.clone()),
+        ("net_use_proxy", bool_str(s.net_use_proxy)),
+        ("net_insecure", bool_str(s.net_insecure)),
+        ("sub_clear", bool_str(s.sub_clear)),
         ("sub_show_change_popup", bool_str(s.sub_show_change_popup)),
         (
             "allow_stopping_active_profile",
             bool_str(s.allow_stopping_active_profile),
+        ),
+        ("sub_send_hwid", bool_str(s.sub_send_hwid)),
+        ("sub_custom_hwid_params", s.sub_custom_hwid_params.clone()),
+        ("sub_auto_update", s.sub_auto_update.to_string()),
+        ("sub_auto_update_last", s.sub_auto_update_last.to_string()),
+        ("route_auto_update", s.route_auto_update.to_string()),
+        (
+            "route_auto_update_last",
+            s.route_auto_update_last.to_string(),
         ),
         ("show_config_security", bool_str(s.show_config_security)),
         ("current_route_id", s.current_route_id.to_string()),
@@ -751,8 +764,34 @@ fn apply_setting(s: &mut AppSettings, key: &str, value: &str) {
             }
         }
         "disable_private_range_bypass" => s.disable_private_range_bypass = parse_bool(value),
+        "user_agent" => s.user_agent = value.to_string(),
+        "net_use_proxy" => s.net_use_proxy = parse_bool(value),
+        "net_insecure" => s.net_insecure = parse_bool(value),
+        "sub_clear" => s.sub_clear = parse_bool(value),
         "sub_show_change_popup" => s.sub_show_change_popup = parse_bool(value),
         "allow_stopping_active_profile" => s.allow_stopping_active_profile = parse_bool(value),
+        "sub_send_hwid" => s.sub_send_hwid = parse_bool(value),
+        "sub_custom_hwid_params" => s.sub_custom_hwid_params = value.to_string(),
+        "sub_auto_update" => {
+            if let Ok(n) = value.parse() {
+                s.sub_auto_update = n;
+            }
+        }
+        "sub_auto_update_last" => {
+            if let Ok(n) = value.parse() {
+                s.sub_auto_update_last = n;
+            }
+        }
+        "route_auto_update" => {
+            if let Ok(n) = value.parse() {
+                s.route_auto_update = n;
+            }
+        }
+        "route_auto_update_last" => {
+            if let Ok(n) = value.parse() {
+                s.route_auto_update_last = n;
+            }
+        }
         "show_config_security" => s.show_config_security = parse_bool(value),
         "current_route_id" => {
             if let Ok(n) = value.parse() {

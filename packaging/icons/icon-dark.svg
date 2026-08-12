@@ -1,18 +1,29 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Lucide Crown (ISC) — larger, lighter, thinner -->
+<!-- Upstream Throne geometric crown (faceted 3-peak). PNG masters are authoritative. -->
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
   <defs>
     <clipPath id="m"><rect x="100" y="100" width="824" height="824" rx="190" ry="190"/></clipPath>
   </defs>
   <g clip-path="url(#m)">
     <rect x="100" y="100" width="824" height="824" rx="190" ry="190" fill="#0A0A0A"/>
-    <g transform="translate(512 506) scale(22.5) translate(-12 -12.1)">
-      <g fill="none" stroke="#C8C8CE" stroke-width="1.7"
-         stroke-linecap="round" stroke-linejoin="round">
-        <path d="M11.562 3.266a.5.5 0 0 1 .876 0L15.39 8.87a1 1 0 0 0 1.516.294L21.183 5.5a.5.5 0 0 1 .798.519l-2.834 10.246a1 1 0 0 1-.956.734H5.81a1 1 0 0 1-.957-.734L2.02 6.02a.5.5 0 0 1 .798-.519l4.276 3.664a1 1 0 0 0 1.516-.294z"/>
-        <path d="M5 21h14"/>
-      </g>
-      <circle cx="12" cy="2.05" r="1.15" fill="#C8C8CE"/>
+    <!-- Map crown 512x346 content into tile with ~18% padding -->
+    <g transform="translate(184 288) scale(1.28)">
+      <!-- Left facet (light) -->
+      <path fill="#84C45D" d="M0 1 L128 1 L256 172 L128 273 L0 273 C0 220 0 80 0 1 Z"/>
+      <!-- Left fold (lighter) -->
+      <path fill="#A8D97A" d="M0 170 L128 273 L0 273 Z"/>
+      <!-- Center facet (mid) -->
+      <path fill="#31A300" d="M128 1 L256 1 L256 1 L384 1 L256 172 Z"/>
+      <path fill="#31A300" d="M128 1 L256 172 L128 273 Z"/>
+      <path fill="#2B9200" d="M256 172 L384 1 L384 273 L256 346 L128 273 Z"/>
+      <!-- Right facet (dark) -->
+      <path fill="#006E00" d="M384 1 L512 1 L512 273 L384 273 L256 172 Z"/>
+      <!-- Right fold -->
+      <path fill="#005200" d="M384 1 L512 1 L384 140 Z"/>
+      <!-- Bottom soft base with rounded outer corners -->
+      <path fill="#31A300" d="M128 273 L256 346 L384 273 L384 300 C360 340 300 346 256 346 C212 346 152 340 128 300 Z"/>
+      <path fill="#84C45D" d="M0 273 L128 273 L128 300 C100 330 40 320 0 300 Z"/>
+      <path fill="#006E00" d="M384 273 L512 273 L512 300 C472 320 412 330 384 300 Z"/>
     </g>
   </g>
 </svg>

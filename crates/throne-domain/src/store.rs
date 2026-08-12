@@ -515,6 +515,7 @@ impl AppState {
         log_level: String,
         ruleset_mirror: crate::models::RulesetMirror,
         adblock_enable: bool,
+        subscription: crate::models::BasicSubscriptionSettings,
     ) {
         self.settings.inbound_address = inbound_address;
         self.settings.inbound_socks_port = inbound_socks_port.max(1).min(65535);
@@ -524,6 +525,16 @@ impl AppState {
         self.settings.log_level = log_level;
         self.settings.ruleset_mirror = ruleset_mirror;
         self.settings.adblock_enable = adblock_enable;
+        self.settings.user_agent = subscription.user_agent;
+        self.settings.net_use_proxy = subscription.net_use_proxy;
+        self.settings.net_insecure = subscription.net_insecure;
+        self.settings.sub_clear = subscription.sub_clear;
+        self.settings.sub_show_change_popup = subscription.sub_show_change_popup;
+        self.settings.allow_stopping_active_profile = subscription.allow_stopping_active_profile;
+        self.settings.sub_send_hwid = subscription.sub_send_hwid;
+        self.settings.sub_custom_hwid_params = subscription.sub_custom_hwid_params;
+        self.settings.sub_auto_update = subscription.sub_auto_update;
+        self.settings.route_auto_update = subscription.route_auto_update;
         self.push_log("Basic Settings saved");
     }
 
@@ -1198,68 +1209,40 @@ impl AppState {
     /// Apply routing-dialog settings fields (DNS / Hijack / Warp / Common).
     pub fn apply_routing_dialog_settings(&mut self, s: AppSettings) {
         // Keep non-routing fields from current settings; overlay routing-related ones.
-        let cur = self.settings.clone();
-        self.settings = AppSettings {
-            // preserve main/basic settings not owned by this dialog
-            inbound_socks_port: cur.inbound_socks_port,
-            inbound_address: cur.inbound_address,
-            test_latency_url: cur.test_latency_url,
-            vpn_strict_route: cur.vpn_strict_route,
-            vpn_mtu: cur.vpn_mtu,
-            vpn_tun_ipv4_cidr: cur.vpn_tun_ipv4_cidr,
-            disable_private_range_bypass: cur.disable_private_range_bypass,
-            sub_show_change_popup: cur.sub_show_change_popup,
-            allow_stopping_active_profile: cur.allow_stopping_active_profile,
-            show_config_security: cur.show_config_security,
-            remember_id: cur.remember_id,
-            remember_enable: cur.remember_enable,
-            start_with_system: cur.start_with_system,
-            system_proxy_enabled: cur.system_proxy_enabled,
-            tun_mode_enabled: cur.tun_mode_enabled,
-            system_dns_set: cur.system_dns_set,
-            theme: cur.theme,
-            log_level: cur.log_level,
-            adblock_enable: cur.adblock_enable,
-            hk_start_stop: cur.hk_start_stop,
-            hk_import: cur.hk_import,
-            hk_save: cur.hk_save,
-            hk_url_test: cur.hk_url_test,
-            hk_copy_logs: cur.hk_copy_logs,
-            // from dialog draft
-            remote_dns: s.remote_dns,
-            direct_dns: s.direct_dns,
-            current_route_id: s.current_route_id,
-            ruleset_mirror: s.ruleset_mirror,
-            remote_dns_strategy: s.remote_dns_strategy,
-            direct_dns_strategy: s.direct_dns_strategy,
-            dns_cache_capacity: s.dns_cache_capacity,
-            dns_disable_cache: s.dns_disable_cache,
-            dns_disable_expire: s.dns_disable_expire,
-            dns_reverse_mapping: s.dns_reverse_mapping,
-            enable_dns_routing: s.enable_dns_routing,
-            use_dns_object: s.use_dns_object,
-            dns_object: s.dns_object,
-            dns_final_out: s.dns_final_out,
-            resolve_domain_strategy: s.resolve_domain_strategy,
-            default_domain_strategy: s.default_domain_strategy,
-            core_box_underlying_dns: s.core_box_underlying_dns,
-            fake_dns: s.fake_dns,
-            enable_dns_server: s.enable_dns_server,
-            dns_server_listen_port: s.dns_server_listen_port,
-            dns_v4_resp: s.dns_v4_resp,
-            dns_v6_resp: s.dns_v6_resp,
-            dns_server_rules: s.dns_server_rules,
-            dns_server_listen_lan: s.dns_server_listen_lan,
-            enable_redirect: s.enable_redirect,
-            redirect_listen_address: s.redirect_listen_address,
-            redirect_listen_port: s.redirect_listen_port,
-            enable_warp: s.enable_warp,
-            warp_ep: s.warp_ep,
-            warp_private_key: s.warp_private_key,
-            warp_public_key: s.warp_public_key,
-            warp_ifc_addrs: s.warp_ifc_addrs,
-            warp_reserved: s.warp_reserved,
-        };
+        let cur = &mut self.settings;
+        cur.remote_dns = s.remote_dns;
+        cur.direct_dns = s.direct_dns;
+        cur.current_route_id = s.current_route_id;
+        cur.ruleset_mirror = s.ruleset_mirror;
+        cur.remote_dns_strategy = s.remote_dns_strategy;
+        cur.direct_dns_strategy = s.direct_dns_strategy;
+        cur.dns_cache_capacity = s.dns_cache_capacity;
+        cur.dns_disable_cache = s.dns_disable_cache;
+        cur.dns_disable_expire = s.dns_disable_expire;
+        cur.dns_reverse_mapping = s.dns_reverse_mapping;
+        cur.enable_dns_routing = s.enable_dns_routing;
+        cur.use_dns_object = s.use_dns_object;
+        cur.dns_object = s.dns_object;
+        cur.dns_final_out = s.dns_final_out;
+        cur.resolve_domain_strategy = s.resolve_domain_strategy;
+        cur.default_domain_strategy = s.default_domain_strategy;
+        cur.core_box_underlying_dns = s.core_box_underlying_dns;
+        cur.fake_dns = s.fake_dns;
+        cur.enable_dns_server = s.enable_dns_server;
+        cur.dns_server_listen_port = s.dns_server_listen_port;
+        cur.dns_v4_resp = s.dns_v4_resp;
+        cur.dns_v6_resp = s.dns_v6_resp;
+        cur.dns_server_rules = s.dns_server_rules;
+        cur.dns_server_listen_lan = s.dns_server_listen_lan;
+        cur.enable_redirect = s.enable_redirect;
+        cur.redirect_listen_address = s.redirect_listen_address;
+        cur.redirect_listen_port = s.redirect_listen_port;
+        cur.enable_warp = s.enable_warp;
+        cur.warp_ep = s.warp_ep;
+        cur.warp_private_key = s.warp_private_key;
+        cur.warp_public_key = s.warp_public_key;
+        cur.warp_ifc_addrs = s.warp_ifc_addrs;
+        cur.warp_reserved = s.warp_reserved;
         self.push_log("Routing settings applied");
     }
 
@@ -1607,10 +1590,29 @@ impl AppState {
             }
         }
 
+        // Upstream: protect the running profile unless "Allow stopping the active profile".
+        let protect_running = !self.settings.allow_stopping_active_profile;
         let mut protected_running_id = None;
-        if let CoreStatus::Running { profile_id, .. } = &self.core_status {
-            if old_ids.contains(profile_id) {
-                protected_running_id = Some(*profile_id);
+        if protect_running {
+            if let CoreStatus::Running { profile_id, .. } = &self.core_status {
+                if old_ids.contains(profile_id) {
+                    protected_running_id = Some(*profile_id);
+                }
+            }
+        }
+
+        // Upstream `sub_clear`: drop existing servers first so remotes are re-added fresh
+        // (identity matching is skipped). The running profile is still protected when
+        // allow_stopping_active_profile is false.
+        if self.settings.sub_clear {
+            available.clear();
+            if let Some(running_id) = protected_running_id {
+                if let Some(profile) = self.profiles.get(&running_id) {
+                    available
+                        .entry(profile_identity_key(profile))
+                        .or_default()
+                        .push_back(running_id);
+                }
             }
         }
 
@@ -1618,23 +1620,31 @@ impl AppState {
         let mut retained = HashSet::new();
         for (name, profile_type, outbound, insecure) in items {
             let identity = subscription_item_identity_key(profile_type, &outbound);
-            let exact_id = available.get(&identity).and_then(|ids| {
-                ids.iter().copied().find(|id| {
-                    self.profiles.get(id).is_some_and(|profile| {
-                        profile.name == name
-                            && profile.profile_type == profile_type
-                            && profile.outbound == outbound
-                            && profile.insecure == insecure
+            let exact_id = if self.settings.sub_clear {
+                None
+            } else {
+                available.get(&identity).and_then(|ids| {
+                    ids.iter().copied().find(|id| {
+                        self.profiles.get(id).is_some_and(|profile| {
+                            profile.name == name
+                                && profile.profile_type == profile_type
+                                && profile.outbound == outbound
+                                && profile.insecure == insecure
+                        })
                     })
                 })
-            });
-            let same_name_id = available.get(&identity).and_then(|ids| {
-                ids.iter().copied().find(|id| {
-                    self.profiles
-                        .get(id)
-                        .is_some_and(|profile| profile.name == name)
+            };
+            let same_name_id = if self.settings.sub_clear {
+                None
+            } else {
+                available.get(&identity).and_then(|ids| {
+                    ids.iter().copied().find(|id| {
+                        self.profiles
+                            .get(id)
+                            .is_some_and(|profile| profile.name == name)
+                    })
                 })
-            });
+            };
             let matches_running = protected_running_id.is_some_and(|running_id| {
                 !retained.contains(&running_id)
                     && self.profiles.get(&running_id).is_some_and(|running| {
@@ -1663,6 +1673,8 @@ impl AppState {
                     }
                 }
                 Some(running_id)
+            } else if self.settings.sub_clear {
+                None
             } else {
                 available.get_mut(&identity).and_then(VecDeque::pop_front)
             };
@@ -2098,6 +2110,11 @@ mod tests {
     #[test]
     fn apply_basic_settings_clamps_port() {
         let mut s = AppState::with_demo_data();
+        let mut sub = crate::models::BasicSubscriptionSettings::from_settings(s.settings());
+        sub.user_agent = "CustomAgent/1".into();
+        sub.net_use_proxy = true;
+        sub.sub_clear = true;
+        sub.sub_auto_update = crate::models::AppSettings::encode_auto_update(true, 60);
         s.apply_basic_settings(
             "127.0.0.1".into(),
             99999,
@@ -2107,6 +2124,7 @@ mod tests {
             "info".into(),
             crate::models::RulesetMirror::Github,
             true,
+            sub,
         );
         assert_eq!(s.settings().inbound_socks_port, 65535);
         assert_eq!(s.settings().inbound_address, "127.0.0.1");
@@ -2114,6 +2132,11 @@ mod tests {
         assert_eq!(s.settings().log_level, "info");
         assert_eq!(s.settings().ruleset_mirror, crate::models::RulesetMirror::Github);
         assert!(s.settings().adblock_enable);
+        assert_eq!(s.settings().user_agent, "CustomAgent/1");
+        assert!(s.settings().net_use_proxy);
+        assert!(s.settings().sub_clear);
+        assert_eq!(s.settings().sub_auto_update, 60);
+        assert!(s.settings().sub_auto_update_enabled());
     }
 
     #[test]

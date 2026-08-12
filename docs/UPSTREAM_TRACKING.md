@@ -65,7 +65,7 @@ Status legend: ✅ done · 🧩 partial · ⏳ planned · ❌ out of scope (Go c
 | System proxy | `QvProxyConfigurator` | 🧩 macOS `networksetup` on Start when checkbox on | `throne-core-client` |
 | GPUI shell | — | ✅ M0 | `throne` |
 | Main window layout / ops | `mainwindow.ui` | 🧩 relative toolbar menus, Start/Stop, Tun/DNS/Proxy, group tabs, 5-col table, logs/conn/**Traffic Graph**, status + **v1.2.4** | `throne` |
-| Secondary dialogs | BasicSettings / GroupItem / ProfileEdit | 🧩 Basic/Groups/Add/Routing/Tun/Hotkey/**Edit Profile (rename)** modals; deep ProfileEdit later | `throne` |
+| Secondary dialogs | BasicSettings / GroupItem / ProfileEdit | 🧩 Basic (Common + **Subscription** UA/proxy/clear/HWID/auto-update) / Groups/Add/Routing/Tun/Hotkey/**Edit Profile (rename)**; deep ProfileEdit later | `throne` |
 
 ## Defaults synced from upstream
 
@@ -118,6 +118,6 @@ No GUI/RPC/proto changes. Re-audit when upstream tags **1.2.5**.
 
 - **Core upgrades**: sing-box / xray / amnezia bumps dominate release cadence → pin Go module when packaging core binary.  
 - **Xray depth**: interface bind, geo assets, full-config test, UDP → core-client exposes `xray_full_configs` + DNS address.  
-- **Subscription UX**: identity-preserving apply + kept-in-use; remaining: scheduled auto-update, `sub_clear`, HWID headers.  
+- **Subscription UX**: identity-preserving apply + kept-in-use; Basic Settings → Subscription ✅; PeriodicRunner for `sub_auto_update` / `route_auto_update` ✅ (poll 60s, min interval 30 min, respects `skip_auto_update` / route `auto_update`).  
 - **Routing**: remote route profiles via deeplink, raw routes, warp-bypass outbound.  
 - **Platform**: Linux TUN, installer, Wayland hotkey branch (`upstream/dev-wayland-hotkey`).

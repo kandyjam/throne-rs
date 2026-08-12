@@ -206,9 +206,124 @@ pub fn mode_switch(
         })
 }
 
+/// Full-width settings toggle: switch + wrapping label that tracks dialog width.
+///
+/// Prefer this over [`mode_switch`] for long Basic Settings labels that would
+/// otherwise clip inside the Switch's single-line label slot.
+///
+/// The whole row is the hit target (Switch is display-only) so long labels stay
+/// clickable without double-firing.
+pub fn settings_switch_row(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    checked: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let id: SharedString = id.into();
+    let label = label.into();
+    h_flex()
+        .id(id.clone())
+        .w_full()
+        .items_start()
+        .gap_2()
+        .mb_1()
+        .cursor_pointer()
+        .on_click(move |ev, w, cx| on_click(ev, w, cx))
+        .child(Switch::new(id).checked(checked).with_size(Size::XSmall))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .text_sm()
+                .text_color(Theme::text())
+                .child(label),
+        )
+}
+
+/// Left column width used by upstream Basic Settings form grids (~label column).
+pub const FORM_LABEL_W: f32 = 210.;
+
+/// Two-column form row: left label, right control (Qt `QGridLayout` / form style).
+pub fn form_row(
+    label: impl Into<SharedString>,
+    control: impl IntoElement,
+) -> impl IntoElement {
+    h_flex()
+        .w_full()
+        .items_center()
+        .gap_3()
+        .mb_2()
+        .child(
+            div()
+                .w(px(FORM_LABEL_W))
+                .flex_shrink_0()
+                .text_sm()
+                .text_color(Theme::text())
+                .child(label.into()),
+        )
+        .child(div().flex_1().min_w(px(0.)).child(control))
+}
+
+/// Form row bound to a real [`Input`] (label | input).
+pub fn form_input_row(
+    label: impl Into<SharedString>,
+    state: &Entity<InputState>,
+) -> impl IntoElement {
+    form_row(label, Input::new(state).cleanable(true))
+}
+
+/// Upstream auto-update row: `Label | [Enable] Interval … [minutes]`.
+pub fn form_enable_interval_row(
+    row_id: impl Into<SharedString>,
+    title: impl Into<SharedString>,
+    enabled: bool,
+    minutes: &Entity<InputState>,
+    on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let row_id: SharedString = row_id.into();
+    let switch_id = SharedString::from(format!("{row_id}-en"));
+    form_row(
+        title,
+        h_flex()
+            .w_full()
+            .items_center()
+            .gap_2()
+            .child(
+                h_flex()
+                    .id(switch_id.clone())
+                    .items_center()
+                    .gap_1()
+                    .flex_shrink_0()
+                    .cursor_pointer()
+                    .on_click(move |ev, w, cx| on_toggle(ev, w, cx))
+                    .child(Switch::new(switch_id).checked(enabled).with_size(Size::XSmall))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(Theme::text())
+                            .child("Enable"),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(Theme::text_muted())
+                    .flex_shrink_0()
+                    .child("Interval (minute, invalid if less than 30)"),
+            )
+            .child(
+                div()
+                    .w(px(88.))
+                    .flex_shrink_0()
+                    .child(Input::new(minutes).cleanable(true)),
+            ),
+    )
+}
+
 /// Muted helper text above dialog forms.
 pub fn section_hint(text: impl Into<SharedString>) -> impl IntoElement {
     div()
+        .w_full()
         .text_xs()
         .text_color(Theme::text_muted())
         .mb_1()
@@ -314,18 +429,20 @@ pub fn input_field_row(
     label_width: f32,
 ) -> impl IntoElement {
     h_flex()
-        .items_center()
+        .items_start()
         .gap_3()
         .mb_2()
         .w_full()
         .child(
             div()
                 .w(px(label_width))
+                .flex_shrink_0()
+                .pt(px(6.))
                 .text_xs()
                 .text_color(Theme::text_muted())
                 .child(label),
         )
-        .child(div().flex_1().min_w(px(120.)).child(Input::new(state).cleanable(true)))
+        .child(div().flex_1().min_w(px(0.)).child(Input::new(state).cleanable(true)))
 }
 
 /// Format a GPUI keystroke as a Throne hotkey label (`Cmd/Ctrl+Shift+C`).

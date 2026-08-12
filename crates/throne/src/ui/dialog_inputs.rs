@@ -20,6 +20,10 @@ pub enum DialogInputs {
         remote_dns: Entity<InputState>,
         direct_dns: Entity<InputState>,
         log_level: Entity<InputState>,
+        user_agent: Entity<InputState>,
+        sub_custom_hwid: Entity<InputState>,
+        sub_auto_minutes: Entity<InputState>,
+        route_auto_minutes: Entity<InputState>,
     },
     EditProfile {
         name: Entity<InputState>,
@@ -394,6 +398,30 @@ impl DialogInputs {
             remote_dns: single_line(window, cx, s.remote_dns.clone(), "Remote DNS"),
             direct_dns: single_line(window, cx, s.direct_dns.clone(), "Direct DNS"),
             log_level: single_line(window, cx, s.log_level.clone(), "Log level"),
+            user_agent: single_line(
+                window,
+                cx,
+                s.user_agent.clone(),
+                "Throne/<version> (default when empty)",
+            ),
+            sub_custom_hwid: single_line(
+                window,
+                cx,
+                s.sub_custom_hwid_params.clone(),
+                "hwid=…,os=…,osVersion=…,model=…",
+            ),
+            sub_auto_minutes: single_line(
+                window,
+                cx,
+                s.sub_auto_update_minutes().to_string(),
+                "30",
+            ),
+            route_auto_minutes: single_line(
+                window,
+                cx,
+                s.route_auto_update_minutes().to_string(),
+                "1440",
+            ),
         }
     }
 

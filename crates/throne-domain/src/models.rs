@@ -961,8 +961,39 @@ pub struct AppSettings {
     #[serde(default = "default_vpn_tun_ipv4_cidr")]
     pub vpn_tun_ipv4_cidr: String,
     pub disable_private_range_bypass: bool,
+    /// Upstream Basic Settings → Subscription: custom User-Agent (empty = default).
+    #[serde(default)]
+    pub user_agent: String,
+    /// Force subscription/asset HTTP through the mixed inbound (also true when System Proxy is on).
+    #[serde(default)]
+    pub net_use_proxy: bool,
+    /// Skip TLS certificate verification for subscription / asset downloads.
+    #[serde(default)]
+    pub net_insecure: bool,
+    /// Delete existing group profiles before applying a subscription snapshot.
+    #[serde(default)]
+    pub sub_clear: bool,
     pub sub_show_change_popup: bool,
+    /// When true, a running profile that disappears from the remote list is stopped/removed.
     pub allow_stopping_active_profile: bool,
+    /// Attach `x-hwid` / device headers on subscription HTTP requests.
+    #[serde(default)]
+    pub sub_send_hwid: bool,
+    /// Optional overrides: `hwid=…,os=…,osVersion=…,model=…`.
+    #[serde(default)]
+    pub sub_custom_hwid_params: String,
+    /// Sign-encoded minutes: positive = enabled interval, negative = disabled (magnitude = minutes).
+    /// Default −30 (30 min, off). Values with |n| < 30 are ignored by the scheduler.
+    #[serde(default = "default_sub_auto_update")]
+    pub sub_auto_update: i32,
+    /// Epoch seconds of last automatic subscription sweep.
+    #[serde(default)]
+    pub sub_auto_update_last: i64,
+    /// Same sign-encoding as `sub_auto_update` for remote routing profiles. Default −1440 (daily, off).
+    #[serde(default = "default_route_auto_update")]
+    pub route_auto_update: i32,
+    #[serde(default)]
+    pub route_auto_update_last: i64,
     pub show_config_security: bool,
     pub current_route_id: i64,
     pub remember_id: i64,
@@ -1063,6 +1094,12 @@ pub struct AppSettings {
 fn default_true() -> bool {
     true
 }
+fn default_sub_auto_update() -> i32 {
+    -30
+}
+fn default_route_auto_update() -> i32 {
+    -1440
+}
 fn default_dns_cache_capacity() -> i32 {
     65536
 }
@@ -1099,8 +1136,19 @@ impl Default for AppSettings {
             vpn_mtu: 1500,
             vpn_tun_ipv4_cidr: default_vpn_tun_ipv4_cidr(),
             disable_private_range_bypass: false,
+            user_agent: String::new(),
+            net_use_proxy: false,
+            net_insecure: false,
+            sub_clear: false,
             sub_show_change_popup: true,
-            allow_stopping_active_profile: true,
+            // Upstream SettingsRepo default: false (keep running profile on sub update).
+            allow_stopping_active_profile: false,
+            sub_send_hwid: false,
+            sub_custom_hwid_params: String::new(),
+            sub_auto_update: default_sub_auto_update(),
+            sub_auto_update_last: 0,
+            route_auto_update: default_route_auto_update(),
+            route_auto_update_last: 0,
             show_config_security: true,
             current_route_id: -1,
             remember_id: -1,
@@ -1150,6 +1198,100 @@ impl Default for AppSettings {
             warp_ifc_addrs: Vec::new(),
             warp_reserved: Vec::new(),
         }
+    }
+}
+
+/// Subscription tab values from Basic Settings (upstream `DialogBasicSettings` Subscription group).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BasicSubscriptionSettings {
+    pub user_agent: String,
+    pub net_use_proxy: bool,
+    pub net_insecure: bool,
+    pub sub_clear: bool,
+    pub sub_show_change_popup: bool,
+    pub allow_stopping_active_profile: bool,
+    pub sub_send_hwid: bool,
+    pub sub_custom_hwid_params: String,
+    /// Sign-encoded minutes (see [`AppSettings::sub_auto_update`]).
+    pub sub_auto_update: i32,
+    pub route_auto_update: i32,
+}
+
+impl BasicSubscriptionSettings {
+    pub fn from_settings(s: &AppSettings) -> Self {
+        Self {
+            user_agent: s.user_agent.clone(),
+            net_use_proxy: s.net_use_proxy,
+            net_insecure: s.net_insecure,
+            sub_clear: s.sub_clear,
+            sub_show_change_popup: s.sub_show_change_popup,
+            allow_stopping_active_profile: s.allow_stopping_active_profile,
+            sub_send_hwid: s.sub_send_hwid,
+            sub_custom_hwid_params: s.sub_custom_hwid_params.clone(),
+            sub_auto_update: s.sub_auto_update,
+            route_auto_update: s.route_auto_update,
+        }
+    }
+}
+
+impl AppSettings {
+    /// Upstream `SettingsRepo::GetUserAgent` — custom string or `Throne/<version>`.
+    pub fn effective_user_agent(&self) -> String {
+        let trimmed = self.user_agent.trim();
+        if trimmed.is_empty() {
+            crate::version::user_agent()
+        } else {
+            trimmed.to_string()
+        }
+    }
+
+    /// Whether the UI enable checkbox is on (positive signed interval).
+    pub fn sub_auto_update_enabled(&self) -> bool {
+        self.sub_auto_update > 0
+    }
+
+    /// Absolute interval minutes for subscription auto-update (UI display).
+    pub fn sub_auto_update_minutes(&self) -> i32 {
+        self.sub_auto_update.unsigned_abs() as i32
+    }
+
+    pub fn route_auto_update_enabled(&self) -> bool {
+        self.route_auto_update > 0
+    }
+
+    pub fn route_auto_update_minutes(&self) -> i32 {
+        self.route_auto_update.unsigned_abs() as i32
+    }
+
+    /// Encode enable checkbox + minutes into the signed interval used by SettingsRepo.
+    pub fn encode_auto_update(enabled: bool, minutes: i32) -> i32 {
+        let minutes = minutes.abs().max(1);
+        if enabled { minutes } else { -minutes }
+    }
+
+    /// Upstream PeriodicRunner `minutesOf`: positive interval only counts when ≥ 30.
+    /// Values below 30 (or non-positive) disable the job.
+    pub fn effective_auto_update_minutes(signed: i32) -> i32 {
+        if signed >= 30 { signed } else { 0 }
+    }
+
+    /// Whether a periodic job is due (`last_run == 0` means never → always due).
+    pub fn auto_update_due(now_secs: i64, last_run_secs: i64, interval_minutes: i32) -> bool {
+        if interval_minutes <= 0 {
+            return false;
+        }
+        if last_run_secs <= 0 {
+            return true;
+        }
+        now_secs.saturating_sub(last_run_secs) >= i64::from(interval_minutes) * 60
+    }
+
+    pub fn sub_auto_update_effective_minutes(&self) -> i32 {
+        Self::effective_auto_update_minutes(self.sub_auto_update)
+    }
+
+    pub fn route_auto_update_effective_minutes(&self) -> i32 {
+        Self::effective_auto_update_minutes(self.route_auto_update)
     }
 }
 

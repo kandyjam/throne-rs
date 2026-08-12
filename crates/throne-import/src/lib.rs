@@ -15,7 +15,8 @@ use throne_domain::{ParsedOutbound, ProfileType, RouteProfile};
 
 pub use deeplink::{Deeplink, parse_deeplink};
 pub use fetch::{
-    FetchOptions, FetchResponse, fetch_url, fetch_url_with_options, fetch_url_with_timeout,
+    DeviceDetails, FetchOptions, FetchResponse, device_details, fetch_url,
+    fetch_url_with_options, fetch_url_with_timeout, hwid_headers,
 };
 pub use links::parse_share_link;
 pub use route_share::{
