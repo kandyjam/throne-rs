@@ -19,9 +19,10 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, EntityInputHandler, FocusHandle, Focusable, KeyDownEvent,
-    Pixels, ScrollHandle, ScrollStrategy, SharedString, Subscription, UTF16Selection,
-    UniformListScrollHandle, Window, actions, div, prelude::*, px, uniform_list,
+    App, Bounds, ClipboardItem, Context, DragMoveEvent, Empty, EntityInputHandler, FocusHandle,
+    Focusable, KeyDownEvent, MouseButton, Pixels, Render, ScrollHandle, ScrollStrategy,
+    SharedString, Subscription, UTF16Selection, UniformListScrollHandle, Window, actions, div,
+    prelude::*, px, uniform_list,
 };
 
 use throne_core_client::{
@@ -29,7 +30,7 @@ use throne_core_client::{
     set_system_proxy,
 };
 use throne_domain::{
-    AppSettings, AppState, CoreStatus, GroupId, Profile, ProfileId, ProfileSortColumn,
+    AppSettings, AppState, CoreStatus, Group, GroupId, Profile, ProfileId, ProfileSortColumn,
     ProfileType, TrafficSnapshot,
 };
 use throne_import::{FetchOptions, fetch_url_with_options, import_subscription_response};
@@ -604,8 +605,33 @@ pub struct MainWindow {
     runtime_poll_failures: u8,
     /// Invalidates overdue poll results across starts, stops, and profile switches.
     runtime_generation: u64,
+    /// Live drag for profile-table column resize (start mouse X + start width).
+    col_resize: Option<ColResizeDrag>,
     /// Keeps the OS appearance observer alive for the current window.
     _appearance_sub: Option<Subscription>,
+}
+
+/// Drag payload for profile table column resize handles.
+///
+/// Columns are upstream data columns only: Type(0) … Traffic(4).
+#[derive(Clone, Copy)]
+struct ProfileColResize {
+    col: usize,
+}
+
+impl Render for ProfileColResize {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        // Invisible drag ghost — resize feedback is live column width, not a floating chip.
+        Empty
+    }
+}
+
+/// In-flight column resize (mouse-delta based; no canvas bounds tracking required).
+#[derive(Clone, Copy)]
+struct ColResizeDrag {
+    col: usize,
+    start_x: f32,
+    start_width: f32,
 }
 
 impl Focusable for MainWindow {
@@ -717,6 +743,7 @@ impl MainWindow {
             runtime_poll_busy: false,
             runtime_poll_failures: 0,
             runtime_generation: 0,
+            col_resize: None,
             _appearance_sub: None,
         };
         window.spawn_runtime_poller(cx);
@@ -948,6 +975,95 @@ impl MainWindow {
         if let Err(error) = result {
             self.state
                 .set_status_message(format!("Sort failed: {error}"));
+        }
+        cx.notify();
+    }
+
+    /// Resolved profile-table data-column widths for the active group.
+    ///
+    /// When `column_width_json` is empty, returns defaults and `custom = false`
+    /// so the Name column can still flex. Saved widths → fixed layout for all five.
+    fn profile_col_layout(&self) -> ([f32; Group::PROFILE_COL_COUNT], bool) {
+        let defaults = default_profile_col_widths();
+        let Some(saved) = self
+            .state
+            .group(self.state.active_group_id())
+            .and_then(|g| g.profile_column_widths())
+        else {
+            return (defaults, false);
+        };
+        let mut out = defaults;
+        for (i, w) in saved.iter().enumerate() {
+            out[i] = clamp_col_width(i, *w as f32);
+        }
+        (out, true)
+    }
+
+    /// Ensure the active group has materialised fixed widths (first interactive resize).
+    fn ensure_profile_col_widths_materialized(&mut self) -> [f32; Group::PROFILE_COL_COUNT] {
+        let (widths, custom) = self.profile_col_layout();
+        if !custom {
+            let ints = widths.map(|w| w.round() as i32);
+            let _ = self.state.set_active_group_column_widths(&ints);
+        }
+        let (w, _) = self.profile_col_layout();
+        w
+    }
+
+    fn on_profile_col_resize_move(
+        &mut self,
+        e: &DragMoveEvent<ProfileColResize>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.col_resize else {
+            return;
+        };
+        if e.drag(cx).col != drag.col {
+            return;
+        }
+        let cur_x: f32 = e.event.position.x.into();
+        let new_w = clamp_col_width(drag.col, drag.start_width + (cur_x - drag.start_x));
+        let mut widths = self.ensure_profile_col_widths_materialized();
+        widths[drag.col] = new_w;
+        let ints = widths.map(|w| w.round() as i32);
+        let _ = self.state.set_active_group_column_widths(&ints);
+        cx.notify();
+    }
+
+    fn finish_profile_col_resize(&mut self, cx: &mut Context<Self>) {
+        if self.col_resize.take().is_none() {
+            return;
+        }
+        match self.persist_db() {
+            Ok(()) => {
+                self.state
+                    .set_status_message("Column widths saved for this group");
+            }
+            Err(e) => {
+                self.state
+                    .set_status_message(format!("Save column widths failed: {e}"));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Upstream Tools → Refresh Column Widths: clear saved widths, restore auto layout.
+    fn refresh_column_widths(&mut self, cx: &mut Context<Self>) {
+        self.close_menus();
+        self.col_resize = None;
+        if let Err(e) = self.state.clear_active_group_column_widths() {
+            self.state
+                .set_status_message(format!("Refresh column widths failed: {e}"));
+            cx.notify();
+            return;
+        }
+        match self.persist_db() {
+            Ok(()) => self
+                .state
+                .set_status_message("Column widths reset to auto layout"),
+            Err(e) => self
+                .state
+                .set_status_message(format!("Save failed: {e}")),
         }
         cx.notify();
     }
@@ -4959,6 +5075,9 @@ impl MainWindow {
                 item!("t-traffic", "Traffic Stats", |t, w, cx| {
                     t.open_traffic_stats(w, cx);
                 });
+                item!("t-col-width", "Refresh Column Widths", |t, _w, cx| {
+                    t.refresh_column_widths(cx);
+                });
                 item!("t-update", "Check For Update", |t, _w, cx| {
                     t.state.set_status_message(format!(
                         "Current version {} · throne-rs rewrite (no auto-update yet)",
@@ -5206,49 +5325,43 @@ impl MainWindow {
     }
 
     fn render_table_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        // Column widths must match row cells exactly. Click toggles sort.
+        // Column widths must match row cells exactly. Click toggles sort;
+        // drag the right edge of a column to resize (persisted per group).
         let entity = cx.entity().clone();
         let active = self.sort_column;
         let muted = Theme::text_muted();
         let accent = Theme::accent();
+        let (widths, custom) = self.profile_col_layout();
+        // Type=0 Address=1 Name=2 Test=3 Traffic=4
+        let labels = [
+            (
+                "h-type",
+                SortColumn::Type,
+                self.sort_label(SortColumn::Type, "Type"),
+            ),
+            (
+                "h-addr",
+                SortColumn::Address,
+                self.sort_label(SortColumn::Address, "Address"),
+            ),
+            (
+                "h-name",
+                SortColumn::Name,
+                self.sort_label(SortColumn::Name, "Name"),
+            ),
+            (
+                "h-test",
+                SortColumn::TestResult,
+                self.sort_label(SortColumn::TestResult, "Test Result"),
+            ),
+            (
+                "h-traf",
+                SortColumn::Traffic,
+                self.sort_label(SortColumn::Traffic, "Traffic"),
+            ),
+        ];
 
-        let hdr_fixed = |width: f32,
-                         id: &'static str,
-                         col: SortColumn,
-                         label: String,
-                         e: gpui::Entity<MainWindow>| {
-            let color = if active == col { accent } else { muted };
-            div()
-                .id(SharedString::from(id))
-                .w(px(width))
-                .min_w(px(width))
-                .max_w(px(width))
-                .flex_shrink_0()
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_ellipsis()
-                .pr_2()
-                .h_full()
-                .flex()
-                .items_center()
-                .cursor_pointer()
-                .hover(|s| s.text_color(Theme::accent()))
-                .text_color(color)
-                .child(label)
-                .on_click(move |_, _, cx| {
-                    e.update(cx, |this, cx| this.toggle_sort(col, cx));
-                })
-        };
-
-        let name_label = self.sort_label(SortColumn::Name, "Name");
-        let e_name = entity.clone();
-        let name_color = if active == SortColumn::Name {
-            accent
-        } else {
-            muted
-        };
-
-        div()
+        let mut header = div()
             .flex()
             .items_center()
             .w_full()
@@ -5260,56 +5373,96 @@ impl MainWindow {
             .text_xs()
             .font_weight(gpui::FontWeight::SEMIBOLD)
             .text_color(Theme::text_muted())
-            // # is display index only — not sortable
-            .child(col_fixed(COL_IDX, "#", Theme::text_muted()))
-            .child(hdr_fixed(
-                COL_TYPE,
-                "h-type",
-                SortColumn::Type,
-                self.sort_label(SortColumn::Type, "Type"),
-                entity.clone(),
-            ))
-            .child(hdr_fixed(
-                COL_ADDR,
-                "h-addr",
-                SortColumn::Address,
-                self.sort_label(SortColumn::Address, "Address"),
-                entity.clone(),
-            ))
-            .child(
+            // # is display index only — not sortable / not resizable
+            .child(col_fixed(COL_IDX, "#", Theme::text_muted()));
+
+        for (col_ix, (id, sort_col, label)) in labels.into_iter().enumerate() {
+            let color = if active == sort_col { accent } else { muted };
+            let e_sort = entity.clone();
+            let e_drag = entity.clone();
+            let width = widths[col_ix];
+            let name_flex = !custom && sort_col == SortColumn::Name;
+
+            let mut cell = div()
+                .id(SharedString::from(id))
+                .relative()
+                .h_full()
+                .flex()
+                .items_center()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .pr_2()
+                .cursor_pointer()
+                .hover(|s| s.text_color(Theme::accent()))
+                .text_color(color)
+                .child(label)
+                .on_click(move |_, _, cx| {
+                    e_sort.update(cx, |this, cx| this.toggle_sort(sort_col, cx));
+                });
+
+            if name_flex {
+                cell = cell.flex_1().min_w(px(0.));
+            } else {
+                cell = cell
+                    .w(px(width))
+                    .min_w(px(width))
+                    .max_w(px(width))
+                    .flex_shrink_0();
+            }
+
+            // Resize handle on the right edge (upstream QHeaderView Interactive).
+            // Traffic (last) is still resizable so users can reclaim space.
+            const HANDLE: f32 = 5.;
+            let start_width = if name_flex {
+                COL_NAME_DEFAULT
+            } else {
+                width
+            };
+            cell = cell.child(
                 div()
-                    .id("h-name")
-                    .flex_1()
-                    .min_w(px(0.))
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .pr_2()
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .cursor_pointer()
-                    .hover(|s| s.text_color(Theme::accent()))
-                    .text_color(name_color)
-                    .child(name_label)
-                    .on_click(move |_, _, cx| {
-                        e_name.update(cx, |this, cx| this.toggle_sort(SortColumn::Name, cx));
-                    }),
-            )
-            .child(hdr_fixed(
-                COL_TEST,
-                "h-test",
-                SortColumn::TestResult,
-                self.sort_label(SortColumn::TestResult, "Test Result"),
-                entity.clone(),
-            ))
-            .child(hdr_fixed(
-                COL_TRAFFIC,
-                "h-traf",
-                SortColumn::Traffic,
-                self.sort_label(SortColumn::Traffic, "Traffic"),
-                entity,
-            ))
+                    .id(SharedString::from(format!("resize-{col_ix}")))
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right(px(-(HANDLE / 2.)))
+                    .w(px(HANDLE))
+                    .cursor_col_resize()
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_drag(
+                        ProfileColResize { col: col_ix },
+                        move |drag, _offset, window, cx| {
+                            let start_x: f32 = window.mouse_position().x.into();
+                            e_drag.update(cx, |this, _| {
+                                // Materialise defaults on first interactive drag.
+                                let _ = this.ensure_profile_col_widths_materialized();
+                                this.col_resize = Some(ColResizeDrag {
+                                    col: drag.col,
+                                    start_x,
+                                    start_width,
+                                });
+                            });
+                            cx.new(|_| *drag)
+                        },
+                    )
+                    .on_drag_move(cx.listener(
+                        |this, e: &DragMoveEvent<ProfileColResize>, _window, cx| {
+                            this.on_profile_col_resize_move(e, cx);
+                        },
+                    ))
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.finish_profile_col_resize(cx);
+                        }),
+                    ),
+            );
+
+            header = header.child(cell);
+        }
+
+        header
     }
 
     fn render_profile_table(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5331,6 +5484,7 @@ impl MainWindow {
             .collect();
 
         let scroll = self.profile_list_scroll.clone();
+        let (col_widths, col_custom) = self.profile_col_layout();
         div().flex_1().min_h(px(120.)).bg(Theme::bg_elevated()).child(
             uniform_list(
                 "profiles",
@@ -5440,11 +5594,15 @@ impl MainWindow {
                                     },
                                 )
                                 .child(col_fixed(COL_IDX, row_label, idx_color))
-                                .child(col_fixed(COL_TYPE, ty, type_color))
-                                .child(col_fixed(COL_ADDR, addr, row_color))
-                                .child(col_flex(name, row_color))
-                                .child(col_fixed(COL_TEST, test, test_color))
-                                .child(col_fixed(COL_TRAFFIC, traffic, row_color)),
+                                .child(col_fixed(col_widths[0], ty, type_color))
+                                .child(col_fixed(col_widths[1], addr, row_color))
+                                .child(if col_custom {
+                                    col_fixed(col_widths[2], name, row_color).into_any_element()
+                                } else {
+                                    col_flex(name, row_color).into_any_element()
+                                })
+                                .child(col_fixed(col_widths[3], test, test_color))
+                                .child(col_fixed(col_widths[4], traffic, row_color)),
                         );
                     }
                     items
@@ -5648,11 +5806,31 @@ impl MainWindow {
 }
 
 // Profile table columns (header + rows must stay in lockstep).
+// Data columns match upstream ProfilesTableModel: Type, Address, Name, Test, Traffic.
 const COL_IDX: f32 = 32.;
-const COL_TYPE: f32 = 88.;
-const COL_ADDR: f32 = 200.;
-const COL_TEST: f32 = 100.;
-const COL_TRAFFIC: f32 = 140.;
+const COL_TYPE_DEFAULT: f32 = 88.;
+const COL_ADDR_DEFAULT: f32 = 200.;
+const COL_NAME_DEFAULT: f32 = 200.;
+const COL_TEST_DEFAULT: f32 = 100.;
+const COL_TRAFFIC_DEFAULT: f32 = 140.;
+const COL_MIN: [f32; Group::PROFILE_COL_COUNT] = [48., 80., 60., 56., 80.];
+const COL_MAX: f32 = 720.;
+
+/// Default widths when `column_width_json` is empty (auto layout).
+fn default_profile_col_widths() -> [f32; Group::PROFILE_COL_COUNT] {
+    [
+        COL_TYPE_DEFAULT,
+        COL_ADDR_DEFAULT,
+        COL_NAME_DEFAULT,
+        COL_TEST_DEFAULT,
+        COL_TRAFFIC_DEFAULT,
+    ]
+}
+
+fn clamp_col_width(col: usize, width: f32) -> f32 {
+    let min = COL_MIN.get(col).copied().unwrap_or(48.);
+    width.clamp(min, COL_MAX)
+}
 
 fn col_fixed(
     width: f32,
@@ -5674,7 +5852,7 @@ fn col_fixed(
 
 fn col_flex(text: impl Into<SharedString>, color: gpui::Hsla) -> impl IntoElement {
     // flex_1 + min_w(0) is required so the name column can shrink and ellipsize
-    // instead of painting over Test Result / Traffic.
+    // instead of painting over Test Result / Traffic (auto layout only).
     div()
         .flex_1()
         .min_w(px(0.))

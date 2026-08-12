@@ -1299,6 +1299,33 @@ impl AppState {
         &self.groups
     }
 
+    /// Persist interactive profile-table column widths on the active group
+    /// (upstream `column_width_json` / `Group::column_width`).
+    pub fn set_active_group_column_widths(
+        &mut self,
+        widths: &[i32; Group::PROFILE_COL_COUNT],
+    ) -> Result<(), StoreError> {
+        let id = self.active_group_id;
+        let g = self
+            .groups
+            .get_mut(&id)
+            .ok_or(StoreError::GroupNotFound(id))?;
+        g.column_width_json = Group::encode_profile_column_widths(widths);
+        Ok(())
+    }
+
+    /// Clear saved column widths so the UI falls back to auto layout
+    /// (upstream Tools → Refresh Column Widths).
+    pub fn clear_active_group_column_widths(&mut self) -> Result<(), StoreError> {
+        let id = self.active_group_id;
+        let g = self
+            .groups
+            .get_mut(&id)
+            .ok_or(StoreError::GroupNotFound(id))?;
+        g.column_width_json.clear();
+        Ok(())
+    }
+
     pub fn all_profiles(&self) -> Vec<&Profile> {
         self.profiles.values().collect()
     }

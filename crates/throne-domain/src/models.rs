@@ -826,6 +826,45 @@ impl Group {
             type_sort_by: 0,
         }
     }
+
+    /// Upstream profile table data columns (Type … Traffic), not the `#` row index.
+    pub const PROFILE_COL_COUNT: usize = 5;
+
+    /// Parse `column_width_json` as a compact JSON int array of length 5.
+    /// Empty / wrong length / invalid JSON → `None` (auto layout).
+    pub fn profile_column_widths(&self) -> Option<[i32; Self::PROFILE_COL_COUNT]> {
+        parse_profile_column_widths(&self.column_width_json)
+    }
+
+    /// Encode widths for `column_width_json` (upstream compact JSON array).
+    pub fn encode_profile_column_widths(widths: &[i32; Self::PROFILE_COL_COUNT]) -> String {
+        encode_profile_column_widths(widths)
+    }
+}
+
+/// Parse upstream `column_width_json` (`[type, address, name, test, traffic]`).
+pub fn parse_profile_column_widths(json: &str) -> Option<[i32; Group::PROFILE_COL_COUNT]> {
+    let trimmed = json.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let arr: Vec<i32> = serde_json::from_str(trimmed).ok()?;
+    if arr.len() != Group::PROFILE_COL_COUNT {
+        return None;
+    }
+    let mut out = [0i32; Group::PROFILE_COL_COUNT];
+    for (i, w) in arr.into_iter().enumerate() {
+        if w <= 0 {
+            return None;
+        }
+        out[i] = w;
+    }
+    Some(out)
+}
+
+/// Encode profile column widths as compact JSON array (wire-compatible with Qt).
+pub fn encode_profile_column_widths(widths: &[i32; Group::PROFILE_COL_COUNT]) -> String {
+    serde_json::to_string(widths.as_slice()).unwrap_or_else(|_| "[]".into())
 }
 
 /// High-level proxy / VPN modes (system proxy vs TUN).
@@ -1560,5 +1599,22 @@ mod tests {
     fn human_bytes_units() {
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(2048), "2.0 KB");
+    }
+
+    #[test]
+    fn profile_column_widths_roundtrip() {
+        let widths = [88, 200, 240, 100, 140];
+        let json = encode_profile_column_widths(&widths);
+        assert_eq!(json, "[88,200,240,100,140]");
+        assert_eq!(parse_profile_column_widths(&json), Some(widths));
+    }
+
+    #[test]
+    fn profile_column_widths_rejects_empty_and_bad_len() {
+        assert_eq!(parse_profile_column_widths(""), None);
+        assert_eq!(parse_profile_column_widths("[]"), None);
+        assert_eq!(parse_profile_column_widths("[1,2,3]"), None);
+        assert_eq!(parse_profile_column_widths("[88,200,240,100,0]"), None);
+        assert_eq!(parse_profile_column_widths("not-json"), None);
     }
 }
