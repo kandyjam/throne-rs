@@ -294,6 +294,10 @@ fn test_progress_percent(done: usize, total: usize) -> usize {
     }
 }
 
+fn try_take_core_logs(core: &Mutex<CoreSession>) -> Option<Vec<String>> {
+    core.try_lock().ok().map(|guard| guard.take_core_logs())
+}
+
 /// Upstream `DataViewHtmlGenerator::getProgressBar` — 10-char `#`/`-` bar (tests only).
 #[cfg(test)]
 fn test_progress_bar(done: usize, total: usize) -> String {
@@ -3915,9 +3919,8 @@ impl MainWindow {
     /// Move buffered ThroneCore stdout/stderr lines into the Logs panel.
     /// Returns true when at least one line was appended.
     fn drain_core_logs_into_ui(&mut self) -> bool {
-        let lines = match self.core.lock() {
-            Ok(guard) => guard.take_core_logs(),
-            Err(_) => return false,
+        let Some(lines) = try_take_core_logs(&self.core) else {
+            return false;
         };
         if lines.is_empty() {
             return false;
@@ -7292,9 +7295,10 @@ mod tests {
         should_scroll_logs_to_bottom, connections_ids_fingerprint,
         should_show_subscription_diff, should_update_rendered_log_text, start_profile_log,
         stop_profile_log, subscription_fetch_options, test_progress_bar, test_progress_lines,
-        test_progress_percent,
+        test_progress_percent, try_take_core_logs,
     };
-    use throne_core_client::ConnectionRow;
+    use std::sync::Mutex;
+    use throne_core_client::{ConnectionRow, CoreConfig, CoreSession};
     use throne_domain::{AppSettings, CoreStatus, Group, ProfileType};
 
     #[test]
@@ -7636,4 +7640,14 @@ mod tests {
         assert_eq!(content, "Running URL test");
     }
 
+    #[test]
+    fn core_log_drain_does_not_wait_for_a_busy_core_session() {
+        let core = Mutex::new(CoreSession::new(CoreConfig::default()));
+        let guard = core.lock().expect("core lock");
+
+        assert!(try_take_core_logs(&core).is_none());
+
+        drop(guard);
+        assert_eq!(try_take_core_logs(&core), Some(Vec::new()));
+    }
 }
