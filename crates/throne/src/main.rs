@@ -9,13 +9,13 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{
-    App, Application, Bounds, Entity, TitlebarOptions, WindowBounds, WindowHandle, WindowOptions,
-    point, prelude::*, px, size,
+    point, prelude::*, px, size, App, Bounds, Entity, TitlebarOptions, WindowBounds, WindowHandle,
+    WindowOptions,
 };
 use gpui_component::Root;
 use tracing_subscriber::EnvFilter;
 
-use throne_domain::{NKR_VERSION, display_name};
+use throne_domain::{display_name, NKR_VERSION};
 use ui::{AppShell, MainWindow};
 
 /// Set by Dock / taskbar reopen; drained on the GPUI executor (safe App borrow).
@@ -35,7 +35,7 @@ fn main() {
     let window_slot: Rc<RefCell<Option<WindowHandle<Root>>>> = Rc::new(RefCell::new(None));
     let main_slot: Rc<RefCell<Option<Entity<MainWindow>>>> = Rc::new(RefCell::new(None));
 
-    let app = Application::new().with_assets(assets::Assets);
+    let app = gpui_kit::application().with_assets(assets::Assets);
 
     // Dock click after the last window is closed (macOS
     // applicationShouldHandleReopen). Only flag here — do not open_window
@@ -62,7 +62,7 @@ fn main() {
         // next Show / Dock click recreates instead of activating a dead window.
         {
             let window_slot = window_slot.clone();
-            cx.on_window_closed(move |cx| {
+            cx.on_window_closed(move |cx, _window_id| {
                 let alive = window_slot
                     .borrow()
                     .as_ref()
@@ -84,37 +84,29 @@ fn main() {
         // Always pump tray + dock-show, even if tray install failed (dock still works).
         let window_slot = window_slot.clone();
         let main = main.clone();
-        cx.spawn(move |cx: &mut gpui::AsyncApp| {
-            let async_cx = cx.clone();
-            async move {
-                loop {
-                    smol::Timer::after(std::time::Duration::from_millis(100)).await;
+        cx.spawn(async move |cx| {
+            loop {
+                smol::Timer::after(std::time::Duration::from_millis(100)).await;
 
-                    let dock_show = PENDING_SHOW_WINDOW.swap(false, Ordering::SeqCst);
-                    let tray_cmd = tray::next_command();
+                let dock_show = PENDING_SHOW_WINDOW.swap(false, Ordering::SeqCst);
+                let tray_cmd = tray::next_command();
 
-                    if !dock_show && tray_cmd.is_none() {
-                        continue;
-                    }
-
-                    if async_cx
-                        .update(|cx| {
-                            if dock_show {
-                                show_main_window(cx, &window_slot, &main);
-                            }
-                            if let Some(command) = tray_cmd {
-                                // Drain any further menu events in the same tick.
-                                dispatch_tray_command(command, cx, &window_slot, &main);
-                                while let Some(command) = tray::next_command() {
-                                    dispatch_tray_command(command, cx, &window_slot, &main);
-                                }
-                            }
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
+                if !dock_show && tray_cmd.is_none() {
+                    continue;
                 }
+
+                cx.update(|cx| {
+                    if dock_show {
+                        show_main_window(cx, &window_slot, &main);
+                    }
+                    if let Some(command) = tray_cmd {
+                        // Drain any further menu events in the same tick.
+                        dispatch_tray_command(command, cx, &window_slot, &main);
+                        while let Some(command) = tray::next_command() {
+                            dispatch_tray_command(command, cx, &window_slot, &main);
+                        }
+                    }
+                });
             }
         })
         .detach();
@@ -257,7 +249,7 @@ fn restart_program(cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
-    use super::tray::{TrayCommand, command_from_menu_id};
+    use super::tray::{command_from_menu_id, TrayCommand};
 
     #[test]
     fn original_group_actions_have_original_shortcuts_and_confirmation() {
@@ -295,10 +287,7 @@ mod tests {
             command_from_menu_id("throne.show"),
             Some(TrayCommand::ShowWindow)
         );
-        assert_eq!(
-            command_from_menu_id("throne.exit"),
-            Some(TrayCommand::Exit)
-        );
+        assert_eq!(command_from_menu_id("throne.exit"), Some(TrayCommand::Exit));
         assert_eq!(
             command_from_menu_id("throne.select_server"),
             Some(TrayCommand::SelectServer)

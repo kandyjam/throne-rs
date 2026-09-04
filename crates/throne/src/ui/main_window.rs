@@ -19,45 +19,45 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, DragMoveEvent, Empty, EntityInputHandler, FocusHandle,
-    Focusable, KeyDownEvent, MouseButton, Pixels, Render, ScrollHandle, ScrollStrategy,
-    SharedString, Subscription, UTF16Selection, UniformListScrollHandle, Window, actions, div,
-    prelude::*, px, uniform_list,
+    actions, div, prelude::*, px, uniform_list, App, Bounds, ClipboardItem, Context, DragMoveEvent,
+    Empty, EntityInputHandler, FocusHandle, Focusable, KeyDownEvent, MouseButton, Pixels, Render,
+    ScrollHandle, ScrollStrategy, SharedString, Subscription, UTF16Selection,
+    UniformListScrollHandle, Window,
 };
 
 use throne_core_client::{
-    AutoSelectorGroupStatus, ConnectionRow, CoreConfig, CoreSession, force_clear_system_proxy,
-    set_system_proxy,
+    force_clear_system_proxy, set_system_proxy, AutoSelectorGroupStatus, ConnectionRow, CoreConfig,
+    CoreSession,
 };
 use throne_domain::{
     AppSettings, AppState, CoreStatus, Group, GroupId, Profile, ProfileId, ProfileSortColumn,
     ProfileType, TrafficSnapshot,
 };
-use throne_import::{FetchOptions, fetch_url_with_options, import_subscription_response};
+use throne_import::{fetch_url_with_options, import_subscription_response, FetchOptions};
 
-use crate::theme::{self, Theme, latency_color};
+use crate::theme::{self, latency_color, Theme};
+use crate::ui::connections::{connections_panel, ConnectionSpeedTracker};
 use crate::ui::dialog_inputs::{DialogInputs, NestedInputs};
 use crate::ui::dialogs::{
-    AutoSelectorGroupView, AutoSelectorMemberRow, BasicSubToggle, Dialog, EditGroupView,
-    HotkeyField, add_input_body, auto_selector_stats_body, basic_settings_body, edit_group_body,
+    add_input_body, auto_selector_stats_body, basic_settings_body, edit_group_body,
     edit_profile_body, hotkey_settings_body, manage_groups_body, subscription_diff_body,
-    traffic_stats_body, tun_settings_body,
+    traffic_stats_body, tun_settings_body, AutoSelectorGroupView, AutoSelectorMemberRow,
+    BasicSubToggle, Dialog, EditGroupView, HotkeyField,
 };
 use crate::ui::routing::{
-    RouteEditorTab, RoutingEvent, RoutingNested, RoutingSideEffect, routing_nested_title_owned,
-    routing_nested_view, routing_nested_width, routing_settings_view,
+    routing_nested_title_owned, routing_nested_view, routing_nested_width, routing_settings_view,
+    RouteEditorTab, RoutingEvent, RoutingNested, RoutingSideEffect,
 };
-use crate::ui::connections::{ConnectionSpeedTracker, connections_panel};
-use crate::ui::speed_graph::{SpeedGraph, speed_graph_element};
+use crate::ui::speed_graph::{speed_graph_element, SpeedGraph};
 use crate::ui::widgets::{
-    TOOLBAR_BTN_GAP, TOOLBAR_BTN_W, TOOLBAR_MENU_TOP, TOOLBAR_PAD_X, icon_btn, menu_item,
-    menu_item_checked, menu_label, menu_panel, menu_separator, mode_switch, start_stop_btn,
-    status_tag, tab_bar, toolbar_btn, StartStopState, ToolbarIcon,
+    icon_btn, menu_item, menu_item_checked, menu_label, menu_panel, menu_separator, mode_switch,
+    start_stop_btn, status_tag, tab_bar, toolbar_btn, StartStopState, ToolbarIcon, TOOLBAR_BTN_GAP,
+    TOOLBAR_BTN_W, TOOLBAR_MENU_TOP, TOOLBAR_PAD_X,
 };
 use gpui_component::{
-    ActiveTheme as _, WindowExt as _,
     button::ButtonVariant,
     dialog::{Dialog as GpuiDialog, DialogButtonProps},
+    ActiveTheme as _, WindowExt as _,
 };
 
 actions!(
@@ -150,8 +150,7 @@ fn next_core_action(status: &CoreStatus, profile_id: ProfileId) -> CoreAction {
     }
 }
 
-const FAILED_STOP_PROFILE_LOG: &str =
-    "<<<<<<<< Failed to stop, please restart the program.";
+const FAILED_STOP_PROFILE_LOG: &str = "<<<<<<<< Failed to stop, please restart the program.";
 
 fn runtime_profile_display(profile_type: ProfileType, profile_name: &str) -> String {
     format!("[{}] {profile_name}", profile_type.display_name())
@@ -800,15 +799,13 @@ impl MainWindow {
     }
 
     fn spawn_runtime_poller(&self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            loop {
-                smol::Timer::after(std::time::Duration::from_secs(1)).await;
-                if this
-                    .update(cx, |this, cx| this.poll_core_runtime(cx))
-                    .is_err()
-                {
-                    break;
-                }
+        cx.spawn(async move |this, cx| loop {
+            smol::Timer::after(std::time::Duration::from_secs(1)).await;
+            if this
+                .update(cx, |this, cx| this.poll_core_runtime(cx))
+                .is_err()
+            {
+                break;
             }
         })
         .detach();
@@ -841,8 +838,7 @@ impl MainWindow {
             // Record attempt before work so a slow job cannot double-fire.
             self.state.settings_mut().sub_auto_update_last = now;
             let _ = self.persist_db();
-            self.state
-                .push_log("Auto-update: running subscriptions");
+            self.state.push_log("Auto-update: running subscriptions");
             self.start_auto_subscription_update_all(cx);
         }
 
@@ -850,8 +846,7 @@ impl MainWindow {
         if AppSettings::auto_update_due(now, settings.route_auto_update_last, route_minutes) {
             self.state.settings_mut().route_auto_update_last = now;
             let _ = self.persist_db();
-            self.state
-                .push_log("Auto-update: running routing profiles");
+            self.state.push_log("Auto-update: running routing profiles");
             self.start_auto_remote_route_update(cx);
         }
     }
@@ -1065,21 +1060,14 @@ impl MainWindow {
             Ok(()) => self
                 .state
                 .set_status_message("Column widths reset to auto layout"),
-            Err(e) => self
-                .state
-                .set_status_message(format!("Save failed: {e}")),
+            Err(e) => self.state.set_status_message(format!("Save failed: {e}")),
         }
         cx.notify();
     }
 
     /// Visible profiles follow the active group's persisted profile ID order.
     fn sorted_profiles(&self) -> Vec<Profile> {
-        self
-            .state
-            .visible_profiles()
-            .into_iter()
-            .cloned()
-            .collect()
+        self.state.visible_profiles().into_iter().cloned().collect()
     }
 
     /// Move the selected row by `delta` (−1 = up, +1 = down) within the visible list.
@@ -1328,13 +1316,12 @@ impl MainWindow {
                 let _ = self.state.select_profile(id);
                 let _ = self.persist_db();
                 if let Ok(plan) = self.state.plan_auto_selector_profile(id) {
-                    self.state.set_status_message(format!(
-                        "Auto Selector created · {}",
-                        plan.summary()
-                    ));
-                } else {
                     self.state
-                        .set_status_message("Auto Selector created — URL Test the group, then Start");
+                        .set_status_message(format!("Auto Selector created · {}", plan.summary()));
+                } else {
+                    self.state.set_status_message(
+                        "Auto Selector created — URL Test the group, then Start",
+                    );
                 }
             }
             Err(e) => {
@@ -1498,8 +1485,7 @@ impl MainWindow {
                 cx.notify();
             }
             None => {
-                self.state
-                    .set_status_message("Select a profile to edit");
+                self.state.set_status_message("Select a profile to edit");
                 cx.notify();
             }
         }
@@ -1511,24 +1497,29 @@ impl MainWindow {
             return;
         };
         let now = chrono::Local::now().timestamp();
-        let (name, group_name, type_name, server) =
-            if let Some(p) = self.state.profile(profile_id) {
-                let gname = self
-                    .state
-                    .all_groups()
-                    .into_iter()
-                    .find(|g| g.id == p.group_id)
-                    .map(|g| g.name.clone())
-                    .unwrap_or_default();
-                (
-                    p.name.clone(),
-                    gname,
-                    p.profile_type.as_str().to_string(),
-                    p.display_address(),
-                )
-            } else {
-                (format!("Profile #{profile_id}"), String::new(), String::new(), String::new())
-            };
+        let (name, group_name, type_name, server) = if let Some(p) = self.state.profile(profile_id)
+        {
+            let gname = self
+                .state
+                .all_groups()
+                .into_iter()
+                .find(|g| g.id == p.group_id)
+                .map(|g| g.name.clone())
+                .unwrap_or_default();
+            (
+                p.name.clone(),
+                gname,
+                p.profile_type.as_str().to_string(),
+                p.display_address(),
+            )
+        } else {
+            (
+                format!("Profile #{profile_id}"),
+                String::new(),
+                String::new(),
+                String::new(),
+            )
+        };
         let _ = db.upsert_config_meta(&throne_storage::ConfigMetaRow {
             profile_id,
             name,
@@ -1655,9 +1646,9 @@ impl MainWindow {
                 ));
             }
             if usage.len() > MAX_ROWS {
-                let (od, ou) = usage[MAX_ROWS..].iter().fold((0i64, 0i64), |(d, u), row| {
-                    (d + row.down, u + row.up)
-                });
+                let (od, ou) = usage[MAX_ROWS..]
+                    .iter()
+                    .fold((0i64, 0i64), |(d, u), row| (d + row.down, u + row.up));
                 breakdown_lines.push(format!(
                     "Other  ↓{}  ↑{}  Σ{}",
                     throne_domain::human_bytes(od),
@@ -1696,9 +1687,9 @@ impl MainWindow {
                 ));
             }
             if usage.len() > MAX_ROWS {
-                let (od, ou) = usage[MAX_ROWS..].iter().fold((0i64, 0i64), |(d, u), row| {
-                    (d + row.down, u + row.up)
-                });
+                let (od, ou) = usage[MAX_ROWS..]
+                    .iter()
+                    .fold((0i64, 0i64), |(d, u), row| (d + row.down, u + row.up));
                 breakdown_lines.push(format!(
                     "Other  ↓{}  ↑{}  Σ{}",
                     throne_domain::human_bytes(od),
@@ -1888,9 +1879,7 @@ impl MainWindow {
             _ => return,
         };
         let name = match &self.dialog_inputs {
-            Some(DialogInputs::EditProfile { name }) => {
-                DialogInputs::read_string(name, cx)
-            }
+            Some(DialogInputs::EditProfile { name }) => DialogInputs::read_string(name, cx),
             _ => return,
         };
         match self.state.rename_profile(id, name) {
@@ -1900,8 +1889,7 @@ impl MainWindow {
                 self.state.set_status_message("Profile renamed");
             }
             Err(e) => {
-                self.state
-                    .set_status_message(format!("Rename failed: {e}"));
+                self.state.set_status_message(format!("Rename failed: {e}"));
             }
         }
         cx.notify();
@@ -2089,8 +2077,15 @@ impl MainWindow {
         let Some(NestedInputs::RouteEditor(re)) = &inputs.nested else {
             return;
         };
-        let (name, protocol, domain, suffix, ip) =
-            rule.unwrap_or_else(|| (String::new(), String::new(), String::new(), String::new(), String::new()));
+        let (name, protocol, domain, suffix, ip) = rule.unwrap_or_else(|| {
+            (
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            )
+        });
         DialogInputs::set_string(&re.rule_name, name, window, cx);
         DialogInputs::set_string(&re.rule_protocol, protocol, window, cx);
         DialogInputs::set_string(&re.rule_domain, domain, window, cx);
@@ -2392,8 +2387,8 @@ impl MainWindow {
             return false;
         }
 
-        let is_remote_link = text.contains("remoteRoute")
-            || report.notes.iter().any(|n| n.contains("remoteRoute"));
+        let is_remote_link =
+            text.contains("remoteRoute") || report.notes.iter().any(|n| n.contains("remoteRoute"));
         if is_remote_link && report.routes.iter().all(|r| r.is_remote) {
             let mut to_update = Vec::new();
             if let Dialog::RoutingSettings(d) = &mut self.dialog {
@@ -2577,12 +2572,8 @@ impl MainWindow {
             _ => return,
         };
         let mtu = mtu_str.parse::<i32>().unwrap_or(1500);
-        self.state.apply_tun_settings(
-            mtu,
-            vpn_strict_route,
-            disable_private_range_bypass,
-            None,
-        );
+        self.state
+            .apply_tun_settings(mtu, vpn_strict_route, disable_private_range_bypass, None);
         self.close_dialog();
         let _ = self.persist_db();
         cx.notify();
@@ -2657,7 +2648,8 @@ impl MainWindow {
             return;
         }
         let Some(id) = self.state.selected_profile_id() else {
-            self.state.set_status_message("Select a profile for IP Test");
+            self.state
+                .set_status_message("Select a profile for IP Test");
             cx.notify();
             return;
         };
@@ -2686,11 +2678,8 @@ impl MainWindow {
                 match result {
                     Ok(rows) => {
                         if let Some((pid, r)) = rows.first() {
-                            this.state.set_profile_ip_country(
-                                *pid,
-                                &r.ip,
-                                &r.country_code,
-                            );
+                            this.state
+                                .set_profile_ip_country(*pid, &r.ip, &r.country_code);
                             if r.error.is_empty() {
                                 this.state.set_status_message(format!(
                                     "IP Test · {} ({})",
@@ -2710,7 +2699,9 @@ impl MainWindow {
                             this.state.set_status_message("IP Test: empty result");
                         }
                     }
-                    Err(e) => this.state.set_status_message(format!("IP Test failed: {e}")),
+                    Err(e) => this
+                        .state
+                        .set_status_message(format!("IP Test failed: {e}")),
                 }
                 cx.notify();
             })
@@ -2758,12 +2749,8 @@ impl MainWindow {
                 match result {
                     Ok(r) => {
                         if r.error.is_empty() {
-                            this.state.set_profile_speeds(
-                                id,
-                                &r.dl_speed,
-                                &r.ul_speed,
-                                r.latency,
-                            );
+                            this.state
+                                .set_profile_speeds(id, &r.dl_speed, &r.ul_speed, r.latency);
                             this.state.set_status_message(format!(
                                 "Speedtest · ↓{} ↑{} · {} ms",
                                 if r.dl_speed.is_empty() {
@@ -3082,10 +3069,9 @@ impl MainWindow {
                         .unwrap_or(0);
                     cfg.pool = plan.pool.clone();
                     // Persist ranking / last_built into the selector profile.
-                    let _ = self.state.update_profile_outbound_json(
-                        profile_id,
-                        cfg.to_outbound_json(),
-                    );
+                    let _ = self
+                        .state
+                        .update_profile_outbound_json(profile_id, cfg.to_outbound_json());
                     Some(throne_core_client::AutoSelectorBuild {
                         config: cfg,
                         members,
@@ -3347,8 +3333,7 @@ impl MainWindow {
 
     fn import_text(&mut self, text: &str, cx: &mut Context<Self>) {
         if text.trim().is_empty() {
-            self.state
-                .set_status_message("Import: empty input");
+            self.state.set_status_message("Import: empty input");
             cx.notify();
             return;
         }
@@ -3460,7 +3445,8 @@ impl MainWindow {
         }
         let selected = self.state.selected_profile_id();
         let Some(id) = selected else {
-            self.state.set_status_message("Select a profile to URL Test");
+            self.state
+                .set_status_message("Select a profile to URL Test");
             cx.notify();
             return;
         };
@@ -3490,18 +3476,12 @@ impl MainWindow {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let mut guard = core
-                        .lock()
-                        .map_err(|e| format!("core lock: {e}"))?;
+                    let mut guard = core.lock().map_err(|e| format!("core lock: {e}"))?;
                     if test_current {
                         let r = guard
                             .url_test_current(&url, 8000)
                             .map_err(|e| e.to_string())?;
-                        Ok::<Vec<(i64, i32, String)>, String>(vec![(
-                            id,
-                            r.latency_ms,
-                            r.error,
-                        )])
+                        Ok::<Vec<(i64, i32, String)>, String>(vec![(id, r.latency_ms, r.error)])
                     } else {
                         let refs: Vec<&Profile> = vec![&profile];
                         let rows = guard
@@ -3518,10 +3498,8 @@ impl MainWindow {
                 this.background_busy = false;
                 match result {
                     Ok(rows) => {
-                        let apply: Vec<(i64, i32, &str)> = rows
-                            .iter()
-                            .map(|(a, b, c)| (*a, *b, c.as_str()))
-                            .collect();
+                        let apply: Vec<(i64, i32, &str)> =
+                            rows.iter().map(|(a, b, c)| (*a, *b, c.as_str())).collect();
                         this.state.apply_url_test_results(&apply);
                         if let Some((_, lat, err)) = rows.first() {
                             if err.is_empty() && *lat > 0 {
@@ -3536,7 +3514,9 @@ impl MainWindow {
                         }
                         let _ = this.persist_db();
                     }
-                    Err(e) => this.state.set_status_message(format!("URL Test failed: {e}")),
+                    Err(e) => this
+                        .state
+                        .set_status_message(format!("URL Test failed: {e}")),
                 }
                 cx.notify();
             })
@@ -3560,7 +3540,8 @@ impl MainWindow {
             .cloned()
             .collect();
         if profiles.is_empty() {
-            self.state.set_status_message("No profiles in group to test");
+            self.state
+                .set_status_message("No profiles in group to test");
             cx.notify();
             return;
         }
@@ -3591,9 +3572,7 @@ impl MainWindow {
                 let result = cx
                     .background_executor()
                     .spawn(async move {
-                        let mut guard = core
-                            .lock()
-                            .map_err(|e| format!("core lock: {e}"))?;
+                        let mut guard = core.lock().map_err(|e| format!("core lock: {e}"))?;
                         let refs: Vec<&Profile> = chunk.iter().collect();
                         let rows = guard
                             .url_test_profiles(&refs, &settings)
@@ -3608,10 +3587,8 @@ impl MainWindow {
 
                 match result {
                     Ok(rows) => {
-                        let apply: Vec<(i64, i32, &str)> = rows
-                            .iter()
-                            .map(|(a, b, c)| (*a, *b, c.as_str()))
-                            .collect();
+                        let apply: Vec<(i64, i32, &str)> =
+                            rows.iter().map(|(a, b, c)| (*a, *b, c.as_str())).collect();
                         let ok = rows
                             .iter()
                             .filter(|(_, l, e)| e.is_empty() && *l > 0)
@@ -3717,11 +3694,7 @@ impl MainWindow {
         self.start_subscription_group(self.state.active_group_id(), UpdateOrigin::Manual, cx);
     }
 
-    fn confirm_update_all_subscriptions(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn confirm_update_all_subscriptions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ids = eligible_subscription_ids(self.state.all_groups());
         // Restore Manage Groups under a fresh gpui dialog.
         self.dialog = Dialog::manage_groups_from_state(&self.state);
@@ -3773,7 +3746,8 @@ impl MainWindow {
             return;
         }
         let Some(group) = self.state.group(group_id) else {
-            self.state.set_status_message("Subscription group not found");
+            self.state
+                .set_status_message("Subscription group not found");
             cx.notify();
             return;
         };
@@ -3790,19 +3764,20 @@ impl MainWindow {
         }
         let name = group.name.clone();
         let url = group.url.clone();
-        let options = match subscription_fetch_options(self.state.settings(), self.state.core_status()) {
-            Ok(options) => options,
-            Err(error) => {
-                self.state.set_status_message(format!("{name}: {error}"));
-                if is_batch_subscription_origin(origin) {
-                    if let Some(queue) = self.subscription_queue.as_mut() {
-                        queue.record_result(false);
+        let options =
+            match subscription_fetch_options(self.state.settings(), self.state.core_status()) {
+                Ok(options) => options,
+                Err(error) => {
+                    self.state.set_status_message(format!("{name}: {error}"));
+                    if is_batch_subscription_origin(origin) {
+                        if let Some(queue) = self.subscription_queue.as_mut() {
+                            queue.record_result(false);
+                        }
+                        self.start_next_subscription_update(cx);
                     }
-                    self.start_next_subscription_update(cx);
+                    return;
                 }
-                return;
-            }
-        };
+            };
         self.background_busy = true;
         self.state
             .push_log(format!(">>>>>>>> Requesting subscription: {name}"));
@@ -4040,10 +4015,8 @@ impl MainWindow {
                         }
                         let mut auto_changed = false;
                         if want_auto && matches!(this.dialog, Dialog::AutoSelectorStats { .. }) {
-                            let mut next: Vec<_> = auto
-                                .into_iter()
-                                .map(auto_selector_group_view)
-                                .collect();
+                            let mut next: Vec<_> =
+                                auto.into_iter().map(auto_selector_group_view).collect();
                             enrich_auto_selector_names(&this.state, &mut next);
                             if next != this.auto_selector_snapshot {
                                 this.auto_selector_snapshot = next;
@@ -4206,9 +4179,7 @@ impl MainWindow {
                             // Upstream: get_elevated_permissions failed → leave Tun off.
                             this.state.set_spmode_vpn(false);
                             let _ = this.persist_db();
-                            let msg = e
-                                .strip_prefix("tun privilege required: ")
-                                .unwrap_or(&e);
+                            let msg = e.strip_prefix("tun privilege required: ").unwrap_or(&e);
                             this.state.set_status_message_only(msg.to_string());
                         }
                     }
@@ -4464,8 +4435,7 @@ impl MainWindow {
         match result {
             Ok(id) => {
                 let _ = self.persist_db();
-                self.state
-                    .set_status_message(format!("Group {id} saved"));
+                self.state.set_status_message(format!("Group {id} saved"));
                 self.return_to_manage_groups(window, cx);
             }
             Err(e) => {
@@ -4483,8 +4453,7 @@ impl MainWindow {
         match self.state.delete_group(id) {
             Ok(()) => {
                 let _ = self.persist_db();
-                self.state
-                    .set_status_message(format!("Group {id} removed"));
+                self.state.set_status_message(format!("Group {id} removed"));
                 self.return_to_manage_groups(window, cx);
             }
             Err(e) => {
@@ -4583,9 +4552,7 @@ impl MainWindow {
                         crate::ui::routing::RoutingTab::Dns => {
                             crate::ui::routing::RtFocus::RemoteDns
                         }
-                        crate::ui::routing::RoutingTab::Warp => {
-                            crate::ui::routing::RtFocus::WarpEp
-                        }
+                        crate::ui::routing::RoutingTab::Warp => crate::ui::routing::RtFocus::WarpEp,
                         crate::ui::routing::RoutingTab::Hijack => {
                             crate::ui::routing::RtFocus::DnsPort
                         }
@@ -4622,9 +4589,7 @@ impl MainWindow {
                 field
             }
             Dialog::TunSettings {
-                vpn_mtu,
-                focus_mtu,
-                ..
+                vpn_mtu, focus_mtu, ..
             } => {
                 if *focus_mtu {
                     Some((vpn_mtu, false))
@@ -4877,12 +4842,10 @@ impl MainWindow {
         if let Some(progress) = self.test_progress.as_ref() {
             let (pct, content) = test_progress_view(progress);
             if let Some(pct) = pct {
-                panel = panel.child(
-                    div()
-                        .w_full()
-                        .max_w(px(220.))
-                        .child(gpui_component::progress::Progress::new().value(pct)),
-                );
+                panel =
+                    panel.child(div().w_full().max_w(px(220.)).child(
+                        gpui_component::progress::Progress::new("test-progress").value(pct),
+                    ));
             }
             panel = panel.child(
                 div()
@@ -4959,12 +4922,15 @@ impl MainWindow {
             }
             OpenMenu::Settings => {
                 panel = panel.child(menu_label("Preferences"));
-                item!("set-basic", "Basic Settings", |t, w, cx| t.open_basic_settings(w, cx));
+                item!("set-basic", "Basic Settings", |t, w, cx| t
+                    .open_basic_settings(w, cx));
                 item!("set-route", "Routing Settings", |t, w, cx| {
                     t.open_routing_settings(Some(w), cx);
                 });
-                item!("set-tun", "Tun Settings", |t, w, cx| t.open_tun_settings(w, cx));
-                item!("set-hotkey", "Hotkey Settings", |t, w, cx| t.open_hotkey_settings(w, cx));
+                item!("set-tun", "Tun Settings", |t, w, cx| t
+                    .open_tun_settings(w, cx));
+                item!("set-hotkey", "Hotkey Settings", |t, w, cx| t
+                    .open_hotkey_settings(w, cx));
                 item!("set-clear-proxy", "Clear system proxy now", |t, _w, cx| {
                     force_clear_system_proxy();
                     t.state
@@ -4987,7 +4953,8 @@ impl MainWindow {
             }
             OpenMenu::Groups => {
                 panel = panel.child(menu_label("Groups"));
-                item!("g-manage", "Manage Groups", |t, w, cx| t.open_manage_groups(w, cx));
+                item!("g-manage", "Manage Groups", |t, w, cx| t
+                    .open_manage_groups(w, cx));
                 item!("g-update", "Update subscription", |t, w, cx| {
                     t.update_subscription(false, Some(w), cx);
                 });
@@ -4995,7 +4962,8 @@ impl MainWindow {
                     t.update_subscription(true, Some(w), cx);
                 });
                 panel = panel.child(menu_separator());
-                item!("g-urltest", "Url Test Group", |t, _w, cx| t.url_test_group(cx));
+                item!("g-urltest", "Url Test Group", |t, _w, cx| t
+                    .url_test_group(cx));
                 item!("g-clear", "Clear Group test result", |t, _w, cx| {
                     let gid = t.state.active_group_id();
                     t.state.clear_test_results_in_group(gid);
@@ -5025,7 +4993,8 @@ impl MainWindow {
                 item!("r-settings", "Routing Settings", |t, w, cx| {
                     t.open_routing_settings(Some(w), cx);
                 });
-                item!("r-cycle", "Next route profile", |t, _w, cx| t.cycle_route(cx));
+                item!("r-cycle", "Next route profile", |t, _w, cx| t
+                    .cycle_route(cx));
                 let routes: Vec<_> = self
                     .state
                     .all_routes()
@@ -5054,17 +5023,23 @@ impl MainWindow {
             }
             OpenMenu::Tools => {
                 panel = panel.child(menu_label("Tools"));
-                item!("t-url", "Url Test Selected", |t, _w, cx| t.url_test_selected(cx));
+                item!("t-url", "Url Test Selected", |t, _w, cx| t
+                    .url_test_selected(cx));
                 item!("t-url-group", "Url Test Group (⌘⇧G)", |t, _w, cx| {
                     t.url_test_group(cx);
                 });
-                item!("t-delete-unavailable", "Delete Unavailable (⌘⇧R)", |t, w, cx| {
-                    t.delete_unavailable(Some(w), cx);
-                });
+                item!(
+                    "t-delete-unavailable",
+                    "Delete Unavailable (⌘⇧R)",
+                    |t, w, cx| {
+                        t.delete_unavailable(Some(w), cx);
+                    }
+                );
                 item!("t-speed", "Speedtest Selected", |t, _w, cx| {
                     t.speed_test_selected(cx);
                 });
-                item!("t-ip", "IP Test Selected", |t, _w, cx| t.ip_test_selected(cx));
+                item!("t-ip", "IP Test Selected", |t, _w, cx| t
+                    .ip_test_selected(cx));
                 panel = panel.child(menu_separator());
                 item!("t-runtime", "Runtime Stats", |t, _w, cx| {
                     t.bottom_tab = 1;
@@ -5107,9 +5082,11 @@ impl MainWindow {
                 item!("c-clip", "Add profile from clipboard", |t, _w, cx| {
                     t.import_clipboard(cx);
                 });
-                item!("c-edit", "Edit profile…", |t, w, cx| t.open_edit_profile(w, cx));
+                item!("c-edit", "Edit profile…", |t, w, cx| t
+                    .open_edit_profile(w, cx));
                 item!("c-del", "Delete", |t, _w, cx| t.delete_selected(cx));
-                item!("c-test", "Url Test Selected", |t, _w, cx| t.url_test_selected(cx));
+                item!("c-test", "Url Test Selected", |t, _w, cx| t
+                    .url_test_selected(cx));
             }
             OpenMenu::GroupTabCtx => {
                 item!("gt-add", "Add new Group", |t, w, cx| {
@@ -5162,10 +5139,25 @@ impl MainWindow {
 
         // Buttons only — dropdown panels are root overlays so they paint above the table.
         let menus = [
-            (OpenMenu::Program, "tb-program", ToolbarIcon::Program, "Program"),
-            (OpenMenu::Settings, "tb-settings", ToolbarIcon::Settings, "Settings"),
+            (
+                OpenMenu::Program,
+                "tb-program",
+                ToolbarIcon::Program,
+                "Program",
+            ),
+            (
+                OpenMenu::Settings,
+                "tb-settings",
+                ToolbarIcon::Settings,
+                "Settings",
+            ),
             (OpenMenu::Groups, "tb-groups", ToolbarIcon::Groups, "Groups"),
-            (OpenMenu::Routing, "tb-routing", ToolbarIcon::Routing, "Routing"),
+            (
+                OpenMenu::Routing,
+                "tb-routing",
+                ToolbarIcon::Routing,
+                "Routing",
+            ),
             (OpenMenu::Tools, "tb-tools", ToolbarIcon::Tools, "Tools"),
         ];
 
@@ -5243,18 +5235,21 @@ impl MainWindow {
             .items_center()
             .gap_1()
             .min_h(px(32.))
-            .on_mouse_down(gpui::MouseButton::Right, move |ev: &gpui::MouseDownEvent, _, cx| {
-                // Empty tab-bar area → only "Add new Group" (upstream).
-                let pos = ev.position;
-                e_empty.update(cx, |this, cx| {
-                    this.ctx_group_id = None;
-                    this.show_menu(
-                        OpenMenu::GroupTabCtx,
-                        Some((pos.x.into(), pos.y.into())),
-                        cx,
-                    );
-                });
-            });
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                move |ev: &gpui::MouseDownEvent, _, cx| {
+                    // Empty tab-bar area → only "Add new Group" (upstream).
+                    let pos = ev.position;
+                    e_empty.update(cx, |this, cx| {
+                        this.ctx_group_id = None;
+                        this.show_menu(
+                            OpenMenu::GroupTabCtx,
+                            Some((pos.x.into(), pos.y.into())),
+                            cx,
+                        );
+                    });
+                },
+            );
 
         for &gid in self.state.group_order() {
             let Some(group) = self.state.group(gid) else {
@@ -5287,11 +5282,7 @@ impl MainWindow {
                     } else {
                         Theme::bg_elevated()
                     })
-                    .text_color(if sel {
-                        Theme::accent()
-                    } else {
-                        Theme::text()
-                    })
+                    .text_color(if sel { Theme::accent() } else { Theme::text() })
                     .hover(|s| s.bg(Theme::bg_hover()))
                     .child(name)
                     .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
@@ -5417,11 +5408,7 @@ impl MainWindow {
             // Resize handle on the right edge (upstream QHeaderView Interactive).
             // Traffic (last) is still resizable so users can reclaim space.
             const HANDLE: f32 = 5.;
-            let start_width = if name_flex {
-                COL_NAME_DEFAULT
-            } else {
-                width
-            };
+            let start_width = if name_flex { COL_NAME_DEFAULT } else { width };
             cell = cell.child(
                 div()
                     .id(SharedString::from(format!("resize-{col_ix}")))
@@ -5488,138 +5475,135 @@ impl MainWindow {
 
         let scroll = self.profile_list_scroll.clone();
         let (col_widths, col_custom) = self.profile_col_layout();
-        div().flex_1().min_h(px(120.)).bg(Theme::bg_elevated()).child(
-            uniform_list(
-                "profiles",
-                count,
-                cx.processor(move |_this, range: Range<usize>, _window, _cx| {
-                    let mut items = Vec::new();
-                    for (display_i, ix) in range.clone().enumerate() {
-                        let Some(profile) = profiles.get(ix) else {
-                            continue;
-                        };
-                        let id = profile.id;
-                        let is_selected = selected == Some(id);
-                        let is_running = running_id == Some(id);
-                        let row_label = if is_running {
-                            "✓".to_string()
-                        } else {
-                            (ix + 1).to_string()
-                        };
-                        let ty = profile.display_type();
-                        let addr = if profile.profile_type == ProfileType::AutoSelector {
-                            throne_domain::profile_auto_selector(profile)
-                                .and_then(|c| group_names.get(&c.gid).cloned())
-                                .map(|n| format!("group · {n}"))
-                                .unwrap_or_else(|| profile.display_address())
-                        } else {
-                            profile.display_address()
-                        };
-                        let name = profile.name.clone();
-                        let test = profile.display_test_result();
-                        let traffic = profile.display_traffic();
-                        let lat_color = latency_color(profile.latency_ms);
-                        let insecure = show_sec && profile.insecure;
-                        let e_select = entity.clone();
-                        let e_ctx = entity.clone();
+        div()
+            .flex_1()
+            .min_h(px(120.))
+            .bg(Theme::bg_elevated())
+            .child(
+                uniform_list(
+                    "profiles",
+                    count,
+                    cx.processor(move |_this, range: Range<usize>, _window, _cx| {
+                        let mut items = Vec::new();
+                        for (display_i, ix) in range.clone().enumerate() {
+                            let Some(profile) = profiles.get(ix) else {
+                                continue;
+                            };
+                            let id = profile.id;
+                            let is_selected = selected == Some(id);
+                            let is_running = running_id == Some(id);
+                            let row_label = if is_running {
+                                "✓".to_string()
+                            } else {
+                                (ix + 1).to_string()
+                            };
+                            let ty = profile.display_type();
+                            let addr = if profile.profile_type == ProfileType::AutoSelector {
+                                throne_domain::profile_auto_selector(profile)
+                                    .and_then(|c| group_names.get(&c.gid).cloned())
+                                    .map(|n| format!("group · {n}"))
+                                    .unwrap_or_else(|| profile.display_address())
+                            } else {
+                                profile.display_address()
+                            };
+                            let name = profile.name.clone();
+                            let test = profile.display_test_result();
+                            let traffic = profile.display_traffic();
+                            let lat_color = latency_color(profile.latency_ms);
+                            let insecure = show_sec && profile.insecure;
+                            let e_select = entity.clone();
+                            let e_ctx = entity.clone();
 
-                        let (bg, fg) = if is_selected && !is_running {
-                            (Theme::bg_selected(), Theme::text_on_selected())
-                        } else if display_i % 2 == 1 {
-                            (Theme::bg_app(), Theme::text())
-                        } else {
-                            (Theme::bg_elevated(), Theme::text())
-                        };
+                            let (bg, fg) = if is_selected && !is_running {
+                                (Theme::bg_selected(), Theme::text_on_selected())
+                            } else if display_i % 2 == 1 {
+                                (Theme::bg_app(), Theme::text())
+                            } else {
+                                (Theme::bg_elevated(), Theme::text())
+                            };
 
-                        let idx_color = if is_running {
-                            Theme::success()
-                        } else if is_selected {
-                            fg
-                        } else {
-                            Theme::text_muted()
-                        };
-                        let row_color = if is_running {
-                            Theme::success()
-                        } else {
-                            fg
-                        };
-                        let type_color = if insecure {
-                            Theme::danger()
-                        } else {
-                            row_color
-                        };
-                        let test_color = if is_running || is_selected {
-                            row_color
-                        } else {
-                            lat_color
-                        };
+                            let idx_color = if is_running {
+                                Theme::success()
+                            } else if is_selected {
+                                fg
+                            } else {
+                                Theme::text_muted()
+                            };
+                            let row_color = if is_running { Theme::success() } else { fg };
+                            let type_color = if insecure { Theme::danger() } else { row_color };
+                            let test_color = if is_running || is_selected {
+                                row_color
+                            } else {
+                                lat_color
+                            };
 
-                        items.push(
-                            div()
-                                .id(SharedString::from(format!("row-{id}")))
-                                .flex()
-                                .items_center()
-                                .w_full()
-                                .px_2()
-                                .h(px(28.))
-                                .bg(bg)
-                                .text_color(row_color)
-                                .text_sm()
-                                .cursor_pointer()
-                                .border_b_1()
-                                .border_color(Theme::border_light())
-                                .on_mouse_down(
-                                    gpui::MouseButton::Left,
-                                    move |ev: &gpui::MouseDownEvent, _, cx| {
-                                        e_select.update(cx, |this, cx| {
-                                            let _ = this.state.select_profile(id);
-                                            if ev.click_count >= 2 {
-                                                this.activate_profile(id, cx);
-                                            } else {
-                                                cx.notify();
-                                            }
-                                        });
-                                    },
-                                )
-                                .on_mouse_down(
-                                    gpui::MouseButton::Right,
-                                    move |ev: &gpui::MouseDownEvent, _, cx| {
-                                        let pos = ev.position;
-                                        e_ctx.update(cx, |this, cx| {
-                                            let _ = this.state.select_profile(id);
-                                            this.ctx_group_id = None;
-                                            this.show_menu(
-                                                OpenMenu::ProfileCtx,
-                                                Some((pos.x.into(), pos.y.into())),
-                                                cx,
-                                            );
-                                        });
-                                    },
-                                )
-                                .child(col_fixed(COL_IDX, row_label, idx_color))
-                                .child(col_fixed(col_widths[0], ty, type_color))
-                                .child(col_fixed(col_widths[1], addr, row_color))
-                                .child(if col_custom {
-                                    col_fixed(col_widths[2], name, row_color).into_any_element()
-                                } else {
-                                    col_flex(name, row_color).into_any_element()
-                                })
-                                .child(col_fixed(col_widths[3], test, test_color))
-                                .child(col_fixed(col_widths[4], traffic, row_color)),
-                        );
-                    }
-                    items
-                }),
+                            items.push(
+                                div()
+                                    .id(SharedString::from(format!("row-{id}")))
+                                    .flex()
+                                    .items_center()
+                                    .w_full()
+                                    .px_2()
+                                    .h(px(28.))
+                                    .bg(bg)
+                                    .text_color(row_color)
+                                    .text_sm()
+                                    .cursor_pointer()
+                                    .border_b_1()
+                                    .border_color(Theme::border_light())
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        move |ev: &gpui::MouseDownEvent, _, cx| {
+                                            e_select.update(cx, |this, cx| {
+                                                let _ = this.state.select_profile(id);
+                                                if ev.click_count >= 2 {
+                                                    this.activate_profile(id, cx);
+                                                } else {
+                                                    cx.notify();
+                                                }
+                                            });
+                                        },
+                                    )
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Right,
+                                        move |ev: &gpui::MouseDownEvent, _, cx| {
+                                            let pos = ev.position;
+                                            e_ctx.update(cx, |this, cx| {
+                                                let _ = this.state.select_profile(id);
+                                                this.ctx_group_id = None;
+                                                this.show_menu(
+                                                    OpenMenu::ProfileCtx,
+                                                    Some((pos.x.into(), pos.y.into())),
+                                                    cx,
+                                                );
+                                            });
+                                        },
+                                    )
+                                    .child(col_fixed(COL_IDX, row_label, idx_color))
+                                    .child(col_fixed(col_widths[0], ty, type_color))
+                                    .child(col_fixed(col_widths[1], addr, row_color))
+                                    .child(if col_custom {
+                                        col_fixed(col_widths[2], name, row_color).into_any_element()
+                                    } else {
+                                        col_flex(name, row_color).into_any_element()
+                                    })
+                                    .child(col_fixed(col_widths[3], test, test_color))
+                                    .child(col_fixed(col_widths[4], traffic, row_color)),
+                            );
+                        }
+                        items
+                    }),
+                )
+                .track_scroll(&scroll)
+                .size_full(),
             )
-            .track_scroll(scroll)
-            .size_full(),
-        )
     }
 
     fn copy_logs(&mut self, cx: &mut Context<Self>) {
         let text = self.state.logs_text();
         if text.trim().is_empty() {
-            self.state.set_status_message("Logs empty — nothing to copy");
+            self.state
+                .set_status_message("Logs empty — nothing to copy");
             cx.notify();
             return;
         }
@@ -5698,22 +5682,30 @@ impl MainWindow {
                         row.child(icon_btn("log-copy", "icons/copy.svg", move |_, _, cx| {
                             e_copy.update(cx, |t, cx| t.copy_logs(cx));
                         }))
-                        .child(icon_btn("log-clear", "icons/trash.svg", move |_, _, cx| {
-                            e_clear.update(cx, |t, cx| {
-                                t.state.clear_logs();
-                                cx.notify();
-                            });
-                        }))
+                        .child(icon_btn(
+                            "log-clear",
+                            "icons/trash.svg",
+                            move |_, _, cx| {
+                                e_clear.update(cx, |t, cx| {
+                                    t.state.clear_logs();
+                                    cx.notify();
+                                });
+                            },
+                        ))
                     })
                     .when(tab == 2, |row| {
                         let e_clear = entity.clone();
-                        row.child(icon_btn("graph-clear", "icons/trash.svg", move |_, _, cx| {
-                            e_clear.update(cx, |t, cx| {
-                                t.speed_graph.clear();
-                                t.state.set_status_message_only("Traffic Graph cleared");
-                                cx.notify();
-                            });
-                        }))
+                        row.child(icon_btn(
+                            "graph-clear",
+                            "icons/trash.svg",
+                            move |_, _, cx| {
+                                e_clear.update(cx, |t, cx| {
+                                    t.speed_graph.clear();
+                                    t.state.set_status_message_only("Traffic Graph cleared");
+                                    cx.notify();
+                                });
+                            },
+                        ))
                     }),
             )
             .child(
@@ -5742,15 +5734,11 @@ impl MainWindow {
                                         .flex_col()
                                         .gap_1()
                                         .child(
-                                            div()
-                                                .text_color(Theme::text_muted())
-                                                .child("Click panel or Copy · ⌘⇧C to copy all logs"),
+                                            div().text_color(Theme::text_muted()).child(
+                                                "Click panel or Copy · ⌘⇧C to copy all logs",
+                                            ),
                                         )
-                                        .child(
-                                            div()
-                                                .text_color(Theme::text())
-                                                .child(log_preview),
-                                        ),
+                                        .child(div().text_color(Theme::text()).child(log_preview)),
                                 )
                         }
                     })
@@ -5786,7 +5774,12 @@ impl MainWindow {
                     .flex_1()
                     .child(status_tag(running, self.state.running_label())),
             )
-            .child(div().flex_1().text_color(Theme::text_muted()).child(self.state.inbound_label()))
+            .child(
+                div()
+                    .flex_1()
+                    .text_color(Theme::text_muted())
+                    .child(self.state.inbound_label()),
+            )
             .child(
                 div()
                     .flex()
@@ -5835,11 +5828,7 @@ fn clamp_col_width(col: usize, width: f32) -> f32 {
     width.clamp(min, COL_MAX)
 }
 
-fn col_fixed(
-    width: f32,
-    text: impl Into<SharedString>,
-    color: gpui::Hsla,
-) -> impl IntoElement {
+fn col_fixed(width: f32, text: impl Into<SharedString>, color: gpui::Hsla) -> impl IntoElement {
     div()
         .w(px(width))
         .min_w(px(width))
@@ -6042,7 +6031,11 @@ impl EntityInputHandler for MainWindow {
         })
     }
 
-    fn marked_text_range(&self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<Range<usize>> {
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
         None
     }
 
@@ -6114,7 +6107,7 @@ impl Render for MainWindow {
         // Don't steal focus from gpui-component Dialog / Input.
         let gpui_dialog_active = window.has_active_dialog(cx);
         if !gpui_dialog_active && !focus.is_focused(window) {
-            focus.focus(window);
+            focus.focus(window, cx);
         }
 
         let dialog_open = !matches!(self.dialog, Dialog::None);
@@ -6133,9 +6126,7 @@ impl Render for MainWindow {
             .track_focus(&self.focus_handle)
             .key_context(key_ctx)
             .on_action(cx.listener(|this, _: &ToggleProxy, _, cx| this.toggle_proxy(cx)))
-            .on_action(cx.listener(|this, _: &ImportClipboard, _, cx| {
-                this.import_clipboard(cx)
-            }))
+            .on_action(cx.listener(|this, _: &ImportClipboard, _, cx| this.import_clipboard(cx)))
             .on_action(cx.listener(|this, _: &SaveDb, _, cx| this.save_db(cx)))
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.select_all(cx)))
             .on_action(cx.listener(|this, _: &DeleteSelected, _, cx| {
@@ -6153,9 +6144,7 @@ impl Render for MainWindow {
             .on_action(cx.listener(|this, _: &SelectNextProfile, _, cx| {
                 this.move_profile_selection(1, cx);
             }))
-            .on_action(cx.listener(|this, _: &UrlTestSelected, _, cx| {
-                this.url_test_selected(cx)
-            }))
+            .on_action(cx.listener(|this, _: &UrlTestSelected, _, cx| this.url_test_selected(cx)))
             .on_action(cx.listener(|this, _: &UrlTestGroup, _, cx| this.url_test_group(cx)))
             .on_action(cx.listener(|this, _: &DeleteUnavailable, window, cx| {
                 this.delete_unavailable(Some(window), cx)
@@ -6238,8 +6227,8 @@ impl Render for MainWindow {
             .when(ctx_open || group_tab_ctx_open, |el| {
                 el.child(self.render_ctx_popup(cx))
             })
-            // Dialog layer is painted by [`AppShell`] (sibling of this view) so
-            // open_dialog builders can safely read MainWindow without re-entrancy.
+        // Dialog layer is painted by [`AppShell`] (sibling of this view) so
+        // open_dialog builders can safely read MainWindow without re-entrancy.
     }
 }
 
@@ -6398,10 +6387,7 @@ fn build_gpui_dialog(
                     },
                     move |_, cx| {
                         e_mirror.update(cx, |t, cx| {
-                            if let Dialog::BasicSettings {
-                                ruleset_mirror, ..
-                            } = &mut t.dialog
-                            {
+                            if let Dialog::BasicSettings { ruleset_mirror, .. } = &mut t.dialog {
                                 *ruleset_mirror = ruleset_mirror.cycle();
                             }
                             cx.notify();
@@ -6409,10 +6395,7 @@ fn build_gpui_dialog(
                     },
                     move |_, cx| {
                         e_adblock.update(cx, |t, cx| {
-                            if let Dialog::BasicSettings {
-                                adblock_enable, ..
-                            } = &mut t.dialog
-                            {
+                            if let Dialog::BasicSettings { adblock_enable, .. } = &mut t.dialog {
                                 *adblock_enable = !*adblock_enable;
                             }
                             cx.notify();
@@ -6433,9 +6416,7 @@ fn build_gpui_dialog(
                             } = &mut t.dialog
                             {
                                 match kind {
-                                    BasicSubToggle::NetUseProxy => {
-                                        *net_use_proxy = !*net_use_proxy
-                                    }
+                                    BasicSubToggle::NetUseProxy => *net_use_proxy = !*net_use_proxy,
                                     BasicSubToggle::AllowStoppingActive => {
                                         *allow_stopping_active_profile =
                                             !*allow_stopping_active_profile
@@ -6444,12 +6425,8 @@ fn build_gpui_dialog(
                                     BasicSubToggle::SubShowChangePopup => {
                                         *sub_show_change_popup = !*sub_show_change_popup
                                     }
-                                    BasicSubToggle::NetInsecure => {
-                                        *net_insecure = !*net_insecure
-                                    }
-                                    BasicSubToggle::SubSendHwid => {
-                                        *sub_send_hwid = !*sub_send_hwid
-                                    }
+                                    BasicSubToggle::NetInsecure => *net_insecure = !*net_insecure,
+                                    BasicSubToggle::SubSendHwid => *sub_send_hwid = !*sub_send_hwid,
                                     BasicSubToggle::SubAutoUpdate => {
                                         *sub_auto_update_enable = !*sub_auto_update_enable
                                     }
@@ -6501,10 +6478,7 @@ fn build_gpui_dialog(
                     },
                     move |id, name, window, cx| {
                         e_rm.update(cx, |t, cx| {
-                            t.dialog = Dialog::ConfirmRemoveGroup {
-                                group_id: id,
-                                name,
-                            };
+                            t.dialog = Dialog::ConfirmRemoveGroup { group_id: id, name };
                             t.dialog_inputs = None;
                             t.present_gpui_dialog(window, cx);
                             cx.notify();
@@ -6609,10 +6583,7 @@ fn build_gpui_dialog(
                     move |_, cx| {
                         e_front.update(cx, |t, cx| {
                             let ids = t.group_proxy_cycle_ids();
-                            if let Dialog::EditGroup {
-                                front_proxy_id, ..
-                            } = &mut t.dialog
-                            {
+                            if let Dialog::EditGroup { front_proxy_id, .. } = &mut t.dialog {
                                 *front_proxy_id =
                                     MainWindow::cycle_group_proxy(&ids, *front_proxy_id);
                             }
@@ -6674,11 +6645,11 @@ fn build_gpui_dialog(
             let name = name.clone();
             dialog
                 .title("Confirmation")
-                .confirm()
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text("Yes")
-                        .cancel_text("No"),
+                        .cancel_text("No")
+                        .show_cancel(true),
                 )
                 .w(px(420.))
                 .on_ok(move |_, window, cx| {
@@ -6711,7 +6682,9 @@ fn build_gpui_dialog(
         }
         Dialog::AddFromInput { .. } => {
             let Some(DialogInputs::AddFromInput { text }) = this.dialog_inputs.as_ref() else {
-                return dialog.title("Add profile from input").child(div().child("…"));
+                return dialog
+                    .title("Add profile from input")
+                    .child(div().child("…"));
             };
             let hint =
                 crate::ui::dialogs::detect_hint_for_text(&DialogInputs::read_string(text, cx));
@@ -6904,12 +6877,12 @@ fn build_gpui_dialog(
             let e_confirm = entity.clone();
             dialog
                 .title("Confirmation")
-                .confirm()
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text("Remove")
                         .ok_variant(ButtonVariant::Danger)
-                        .cancel_text("Cancel"),
+                        .cancel_text("Cancel")
+                        .show_cancel(true),
                 )
                 .w(px(420.))
                 .on_ok(move |_, window, cx| {
@@ -6952,11 +6925,11 @@ fn build_gpui_dialog(
             let restore_manage_cancel = restore_manage.clone();
             dialog
                 .title("Confirmation")
-                .confirm()
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text("Yes")
-                        .cancel_text("No"),
+                        .cancel_text("No")
+                        .show_cancel(true),
                 )
                 .w(px(420.))
                 .on_ok(move |_, window, cx| {
@@ -6997,7 +6970,6 @@ fn build_gpui_dialog(
             let restore_cancel = restore_manage;
             dialog
                 .title(title)
-                .alert()
                 .button_props(DialogButtonProps::default().ok_text("Close"))
                 .w(px(560.))
                 .on_ok(move |_, window, cx| {
@@ -7130,10 +7102,7 @@ fn build_gpui_dialog(
                     &notice,
                     move |_, cx| {
                         e_toggle.update(cx, |t, cx| {
-                            if let Dialog::AutoSelectorStats {
-                                only_problems, ..
-                            } = &mut t.dialog
-                            {
+                            if let Dialog::AutoSelectorStats { only_problems, .. } = &mut t.dialog {
                                 *only_problems = !*only_problems;
                             }
                             t.presented_dialog_stack = (0, NestedKind::None);
@@ -7218,9 +7187,13 @@ fn build_gpui_dialog(
                     }
                 })
                 .on_close(on_dismiss)
-                .child(routing_settings_view(draft, inputs, move |ev, window, cx| {
-                    entity_ev.update(cx, |t, cx| t.handle_routing_event(ev, window, cx));
-                }))
+                .child(routing_settings_view(
+                    draft,
+                    inputs,
+                    move |ev, window, cx| {
+                        entity_ev.update(cx, |t, cx| t.handle_routing_event(ev, window, cx));
+                    },
+                ))
         }
         Dialog::None => dialog.title("").child(div()),
     }
@@ -7285,17 +7258,16 @@ fn build_nested_routing_dialog(
 #[cfg(test)]
 mod tests {
     use super::{
-        CoreAction, FAILED_STOP_PROFILE_LOG, PendingProfileSwitch, SortColumn,
-        SubscriptionUpdateQueue, TestProgressKind, TestProgressPanel, UpdateOrigin,
-        adjacent_profile_id, eligible_subscription_ids, eligible_subscription_ids_filtered,
-        failed_start_profile_log, next_core_action,
+        adjacent_profile_id, connections_ids_fingerprint, eligible_subscription_ids,
+        eligible_subscription_ids_filtered, failed_start_profile_log, next_core_action,
         next_runtime_generation, next_sort_state, resolve_stop_profile_display,
-        running_mode_marker, runtime_poll_health, runtime_poll_is_current,
-        runtime_profile_display, should_queue_recovery_restart, should_scroll_connections_to_bottom,
-        should_scroll_logs_to_bottom, connections_ids_fingerprint,
-        should_show_subscription_diff, should_update_rendered_log_text, start_profile_log,
-        stop_profile_log, subscription_fetch_options, test_progress_bar, test_progress_lines,
-        test_progress_percent, try_take_core_logs,
+        running_mode_marker, runtime_poll_health, runtime_poll_is_current, runtime_profile_display,
+        should_queue_recovery_restart, should_scroll_connections_to_bottom,
+        should_scroll_logs_to_bottom, should_show_subscription_diff,
+        should_update_rendered_log_text, start_profile_log, stop_profile_log,
+        subscription_fetch_options, test_progress_bar, test_progress_lines, test_progress_percent,
+        try_take_core_logs, CoreAction, PendingProfileSwitch, SortColumn, SubscriptionUpdateQueue,
+        TestProgressKind, TestProgressPanel, UpdateOrigin, FAILED_STOP_PROFILE_LOG,
     };
     use std::sync::Mutex;
     use throne_core_client::{ConnectionRow, CoreConfig, CoreSession};
@@ -7321,7 +7293,10 @@ mod tests {
     #[test]
     fn manual_update_only_requests_diff_when_enabled() {
         assert!(should_show_subscription_diff(UpdateOrigin::Manual, true));
-        assert!(!should_show_subscription_diff(UpdateOrigin::UpdateAll, true));
+        assert!(!should_show_subscription_diff(
+            UpdateOrigin::UpdateAll,
+            true
+        ));
         assert!(!should_show_subscription_diff(UpdateOrigin::Manual, false));
     }
 
@@ -7339,10 +7314,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(
-            options.proxy_url.as_deref(),
-            Some("http://127.0.0.1:2080")
-        );
+        assert_eq!(options.proxy_url.as_deref(), Some("http://127.0.0.1:2080"));
         assert_eq!(
             options.user_agent.as_deref(),
             Some(settings.effective_user_agent().as_str())
@@ -7378,7 +7350,10 @@ mod tests {
         queue.record_result(false);
         assert_eq!(queue.take_next(), None);
         assert!(queue.is_finished());
-        assert_eq!(queue.completion_message(), "Subscription update finished · 1 succeeded · 1 failed");
+        assert_eq!(
+            queue.completion_message(),
+            "Subscription update finished · 1 succeeded · 1 failed"
+        );
     }
 
     #[test]
@@ -7399,10 +7374,7 @@ mod tests {
         let mut b = Group::new(2, "b");
         b.url = "https://b.example/sub".into();
         b.skip_auto_update = true;
-        assert_eq!(
-            eligible_subscription_ids_filtered([&a, &b], true),
-            vec![1]
-        );
+        assert_eq!(eligible_subscription_ids_filtered([&a, &b], true), vec![1]);
         assert_eq!(
             eligible_subscription_ids_filtered([&a, &b], false),
             vec![1, 2]
@@ -7460,8 +7432,14 @@ mod tests {
         let profile = runtime_profile_display(ProfileType::Vless, "Tokyo");
 
         assert_eq!(profile, "[VLESS] Tokyo");
-        assert_eq!(start_profile_log(&profile), ">>>>>>>> Starting profile [VLESS] Tokyo");
-        assert_eq!(stop_profile_log(&profile), ">>>>>>>> Stopping profile [VLESS] Tokyo");
+        assert_eq!(
+            start_profile_log(&profile),
+            ">>>>>>>> Starting profile [VLESS] Tokyo"
+        );
+        assert_eq!(
+            stop_profile_log(&profile),
+            ">>>>>>>> Stopping profile [VLESS] Tokyo"
+        );
         assert_eq!(
             failed_start_profile_log(&profile),
             "<<<<<<<< Failed to start profile [VLESS] Tokyo"

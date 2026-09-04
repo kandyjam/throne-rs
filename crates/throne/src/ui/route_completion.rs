@@ -10,8 +10,8 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 
 use anyhow::Result;
-use gpui::{Context, Task, Window};
-use gpui_component::input::{CompletionProvider, InputState, RopeExt};
+use gpui::{App, Task, Window};
+use gpui_component::input::{CompletionProvider, RopeExt};
 use gpui_component::Rope;
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionResponse, CompletionTextEdit, Position, TextEdit,
@@ -133,7 +133,7 @@ impl CompletionProvider for RuleLineProvider {
         offset: usize,
         _trigger: lsp_types::CompletionContext,
         _window: &mut Window,
-        _cx: &mut Context<InputState>,
+        _cx: &mut App,
     ) -> Task<Result<CompletionResponse>> {
         let (line_start, line_end, line) = Self::line_bounds(text, offset);
         let mut items = self.filter_items(&line);
@@ -160,12 +160,7 @@ impl CompletionProvider for RuleLineProvider {
         Task::ready(Ok(CompletionResponse::Array(items)))
     }
 
-    fn is_completion_trigger(
-        &self,
-        _offset: usize,
-        new_text: &str,
-        _cx: &mut Context<InputState>,
-    ) -> bool {
+    fn is_completion_trigger(&self, _offset: usize, new_text: &str, _cx: &mut App) -> bool {
         // Don't open the menu when the user commits a new line.
         !new_text.contains('\n') && !new_text.contains('\r')
     }

@@ -1,9 +1,9 @@
 //! Secondary feature dialogs (settings / groups / add / routing / tun / hotkeys).
 
-use gpui::{App, Entity, SharedString, Window, div, prelude::*, px};
 use chrono::{Local, TimeZone};
+use gpui::{div, prelude::*, px, App, Entity, SharedString, Window};
 use gpui_component::{
-    input::InputState,
+    input::{InputState, TextareaState},
     scroll::ScrollableElement as _,
 };
 
@@ -304,7 +304,9 @@ pub fn edit_profile_body(
     div()
         .flex()
         .flex_col()
-        .child(section_hint(format!("Type: {type_label} · edit name below")))
+        .child(section_hint(format!(
+            "Type: {type_label} · edit name below"
+        )))
         .child(div().mb_3().child(input_field_row("Name", name_input, 80.)))
         .child(dialog_actions(
             "ep-cancel",
@@ -409,11 +411,9 @@ pub fn basic_settings_body(
                 .child(form_input_row("Log level", log_level))
                 .child(form_row(
                     "Rule-set mirror",
-                    secondary_btn(
-                        "bs-mirror",
-                        ruleset_mirror.label(),
-                        move |_, w, cx| on_cycle_mirror(w, cx),
-                    ),
+                    secondary_btn("bs-mirror", ruleset_mirror.label(), move |_, w, cx| {
+                        on_cycle_mirror(w, cx)
+                    }),
                 ))
                 .child(settings_switch_row(
                     "bs-adblock",
@@ -540,20 +540,14 @@ pub fn basic_settings_body(
                         .child(content),
                 ),
         )
-        .child(
-            div()
-                .flex_shrink_0()
-                .w_full()
-                .pt_1()
-                .child(dialog_actions(
-                    "bs-cancel",
-                    "Cancel",
-                    "bs-save",
-                    "Save",
-                    on_cancel,
-                    on_save,
-                )),
-        )
+        .child(div().flex_shrink_0().w_full().pt_1().child(dialog_actions(
+            "bs-cancel",
+            "Cancel",
+            "bs-save",
+            "Save",
+            on_cancel,
+            on_save,
+        )))
 }
 
 /// Upstream DialogManageGroups: list of GroupItems + New group / Update all.
@@ -652,12 +646,7 @@ pub fn manage_groups_body(
                         .child(actions),
                 )
                 .when(has_url, |el| {
-                    el.child(
-                        div()
-                            .text_xs()
-                            .text_color(Theme::text_muted())
-                            .child(url),
-                    )
+                    el.child(div().text_xs().text_color(Theme::text_muted()).child(url))
                 })
                 .when_some(metadata, |el, text| {
                     el.child(div().text_xs().text_color(Theme::text_muted()).child(text))
@@ -665,22 +654,19 @@ pub fn manage_groups_body(
         );
     }
 
-    div()
-        .flex()
-        .flex_col()
-        .w_full()
-        .child(list)
-        .child(
-            div()
-                .flex()
-                .gap_2()
-                .child(primary_btn("mg-add", "New group", move |_, w, cx| on_new(w, cx)))
-                .child(secondary_btn(
-                    "mg-update-all",
-                    "Update all subscriptions",
-                    move |_, w, cx| on_update_all(w, cx),
-                )),
-        )
+    div().flex().flex_col().w_full().child(list).child(
+        div()
+            .flex()
+            .gap_2()
+            .child(primary_btn("mg-add", "New group", move |_, w, cx| {
+                on_new(w, cx)
+            }))
+            .child(secondary_btn(
+                "mg-update-all",
+                "Update all subscriptions",
+                move |_, w, cx| on_update_all(w, cx),
+            )),
+    )
 }
 
 /// Upstream DialogEditGroup body.
@@ -773,16 +759,18 @@ pub fn edit_group_body(
                 move |_, w, cx| on_cycle_landing(w, cx),
             )),
     );
-    common = common.child(
-        div().mb_1().child(mode_switch(
-            "eg-clear",
-            "Auto Clear Unavailable Profiles",
-            draft.auto_clear_unavailable,
-            move |_, w, cx| on_toggle_auto_clear(w, cx),
-        )),
-    );
+    common = common.child(div().mb_1().child(mode_switch(
+        "eg-clear",
+        "Auto Clear Unavailable Profiles",
+        draft.auto_clear_unavailable,
+        move |_, w, cx| on_toggle_auto_clear(w, cx),
+    )));
 
-    let mut sections = div().flex().flex_col().w_full().child(group_panel("Common", common));
+    let mut sections = div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .child(group_panel("Common", common));
 
     if draft.is_subscription {
         sections = sections.child(group_panel(
@@ -945,11 +933,7 @@ pub fn auto_selector_stats_body(
             format!(
                 "{} · phase {} · selected {sel}",
                 if g.tag.is_empty() { "proxy" } else { &g.tag },
-                if g.phase.is_empty() {
-                    "—"
-                } else {
-                    &g.phase
-                }
+                if g.phase.is_empty() { "—" } else { &g.phase }
             )
         }
         None => "No auto-selector is running".into(),
@@ -976,9 +960,7 @@ pub fn auto_selector_stats_body(
                 g.members_total, g.members_alive, g.members_qualified
             )
         }
-        None => {
-            "Start an Auto Selector profile, then open this window again.".into()
-        }
+        None => "Start an Auto Selector profile, then open this window again.".into(),
     };
 
     let mut rows: Vec<AutoSelectorMemberRow> = groups
@@ -1027,19 +1009,15 @@ pub fn auto_selector_stats_body(
         );
 
     if rows.is_empty() {
-        table = table.child(
-            div()
-                .p_3()
-                .text_sm()
-                .text_color(Theme::text_muted())
-                .child(if groups.is_empty() {
-                    "Waiting for core snapshot…"
-                } else if only_problems {
-                    "No problem members right now."
-                } else {
-                    "No members reported."
-                }),
-        );
+        table = table.child(div().p_3().text_sm().text_color(Theme::text_muted()).child(
+            if groups.is_empty() {
+                "Waiting for core snapshot…"
+            } else if only_problems {
+                "No problem members right now."
+            } else {
+                "No members reported."
+            },
+        ));
     } else {
         for (i, m) in rows.into_iter().enumerate() {
             let tag = m.tag.clone();
@@ -1099,12 +1077,9 @@ pub fn auto_selector_stats_body(
                     .text_sm()
                     .text_color(fg)
                     .cursor_pointer()
-                    .on_mouse_down(
-                        gpui::MouseButton::Left,
-                        move |_, window, cx| {
-                            on_row(tag.clone(), window, cx);
-                        },
-                    )
+                    .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
+                        on_row(tag.clone(), window, cx);
+                    })
                     .child(div().w(px(36.)).child(format!("{}", m.rank.max(0))))
                     .child(div().w(px(72.)).child(m.state.clone()))
                     .child(div().w(px(64.)).child(avg))
@@ -1162,10 +1137,14 @@ pub fn auto_selector_stats_body(
                 .child(secondary_btn("as-recheck", "Recheck", move |_, w, cx| {
                     on_recheck(w, cx)
                 }))
-                .child(secondary_btn("as-pin", "Pin", move |_, w, cx| on_pin(w, cx)))
-                .child(secondary_btn("as-release", "Release pin", move |_, w, cx| {
-                    on_release(w, cx)
+                .child(secondary_btn("as-pin", "Pin", move |_, w, cx| {
+                    on_pin(w, cx)
                 }))
+                .child(secondary_btn(
+                    "as-release",
+                    "Release pin",
+                    move |_, w, cx| on_release(w, cx),
+                ))
                 .child(primary_btn("as-close", "Close", move |_, w, cx| {
                     on_close(w, cx)
                 })),
@@ -1173,7 +1152,7 @@ pub fn auto_selector_stats_body(
 }
 
 pub fn add_input_body(
-    text_input: &Entity<InputState>,
+    text_input: &Entity<TextareaState>,
     type_hint: &str,
     on_save: impl Fn(&mut Window, &mut App) + 'static,
     on_cancel: impl Fn(&mut Window, &mut App) + 'static,
@@ -1236,22 +1215,18 @@ pub fn tun_settings_body(
              (same as upstream Throne; empty Local DNS + Tun will fail to start).",
         ))
         .child(input_field_row("MTU", mtu_input, 140.))
-        .child(
-            div().mb_2().child(mode_switch(
-                "tun-strict",
-                "Strict route",
-                vpn_strict_route,
-                move |_, w, cx| on_toggle_strict(w, cx),
-            )),
-        )
-        .child(
-            div().mb_3().child(mode_switch(
-                "tun-bypass",
-                "Bypass private LAN ranges (recommended)",
-                !disable_private_range_bypass,
-                move |_, w, cx| on_toggle_bypass(w, cx),
-            )),
-        )
+        .child(div().mb_2().child(mode_switch(
+            "tun-strict",
+            "Strict route",
+            vpn_strict_route,
+            move |_, w, cx| on_toggle_strict(w, cx),
+        )))
+        .child(div().mb_3().child(mode_switch(
+            "tun-bypass",
+            "Bypass private LAN ranges (recommended)",
+            !disable_private_range_bypass,
+            move |_, w, cx| on_toggle_bypass(w, cx),
+        )))
         .child(dialog_actions(
             "tun-cancel",
             "Cancel",
@@ -1354,7 +1329,7 @@ pub fn traffic_stats_body(
     on_close: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     use crate::theme::Theme;
-    use gpui::{PathBuilder, canvas, point, px};
+    use gpui::{canvas, point, px, PathBuilder};
 
     let period_labels = ["24 hours", "7 days", "30 days", "90 days"];
     let bars = bars.to_vec();
@@ -1424,29 +1399,34 @@ pub fn traffic_stats_body(
             div()
                 .flex()
                 .gap_2()
-                .children(["By profile", "By app"].iter().enumerate().map(|(i, label)| {
-                    let on = on_tab.clone();
-                    let selected = tab == i;
-                    div()
-                        .id(SharedString::from(format!("ts-tab-{i}")))
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .text_xs()
-                        .cursor_pointer()
-                        .bg(if selected {
-                            Theme::bg_selected()
-                        } else {
-                            Theme::bg_elevated()
-                        })
-                        .text_color(if selected {
-                            Theme::text_on_selected()
-                        } else {
-                            Theme::text()
-                        })
-                        .child(*label)
-                        .on_click(move |_, w, cx| on(i, w, cx))
-                })),
+                .children(
+                    ["By profile", "By app"]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, label)| {
+                            let on = on_tab.clone();
+                            let selected = tab == i;
+                            div()
+                                .id(SharedString::from(format!("ts-tab-{i}")))
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .text_xs()
+                                .cursor_pointer()
+                                .bg(if selected {
+                                    Theme::bg_selected()
+                                } else {
+                                    Theme::bg_elevated()
+                                })
+                                .text_color(if selected {
+                                    Theme::text_on_selected()
+                                } else {
+                                    Theme::text()
+                                })
+                                .child(*label)
+                                .on_click(move |_, w, cx| on(i, w, cx))
+                        }),
+                ),
         )
         .child(
             div()
@@ -1554,25 +1534,20 @@ pub fn traffic_stats_body(
             }
             list
         })
-        .child(
+        .child(div().flex().justify_end().child({
+            let on = on_close;
             div()
-                .flex()
-                .justify_end()
-                .child({
-                    let on = on_close;
-                    div()
-                        .id("ts-close")
-                        .px_3()
-                        .py_1()
-                        .rounded_md()
-                        .text_xs()
-                        .cursor_pointer()
-                        .bg(Theme::accent())
-                        .text_color(Theme::text_on_selected())
-                        .child("Close")
-                        .on_click(move |_, w, cx| on(w, cx))
-                }),
-        )
+                .id("ts-close")
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .text_xs()
+                .cursor_pointer()
+                .bg(Theme::accent())
+                .text_color(Theme::text_on_selected())
+                .child("Close")
+                .on_click(move |_, w, cx| on(w, cx))
+        }))
 }
 
 #[cfg(test)]
@@ -1581,10 +1556,8 @@ mod tests {
 
     #[test]
     fn subscription_info_formats_usage_remaining_and_expiry() {
-        let text = format_subscription_info(
-            "upload=10; download=15; total=100; expire=1785500000",
-        )
-        .unwrap();
+        let text = format_subscription_info("upload=10; download=15; total=100; expire=1785500000")
+            .unwrap();
         assert!(text.contains("Used: 25B"));
         assert!(text.contains("Remain: 75B"));
         assert!(text.contains("Expire:"));

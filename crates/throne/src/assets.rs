@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use anyhow::Result;
 use gpui::{AssetSource, SharedString};
 
-/// App assets: Throne icons first, then [gpui-component-assets] for IconName SVGs.
+/// App assets: Throne icons first, then [gpui-kit-assets] for IconName SVGs.
 pub struct Assets;
 
 fn load_throne(path: &str) -> Option<Cow<'static, [u8]>> {
@@ -42,7 +42,7 @@ impl AssetSource for Assets {
             return Ok(Some(bytes));
         }
         // Lucide set used by gpui-component IconName (Spinner → icons/loader.svg, etc.).
-        match gpui_component_assets::Assets.load(path) {
+        match gpui_kit_assets::Assets.load(path) {
             Ok(data) => Ok(data),
             Err(_) => Ok(None),
         }
@@ -58,9 +58,12 @@ impl AssetSource for Assets {
             Vec::new()
         };
 
-        if let Ok(component) = gpui_component_assets::Assets.list(path) {
+        if let Ok(component) = gpui_kit_assets::Assets.list(path) {
             for name in component {
-                if !names.iter().any(|existing| existing.as_ref() == name.as_ref()) {
+                if !names
+                    .iter()
+                    .any(|existing| existing.as_ref() == name.as_ref())
+                {
                     names.push(name);
                 }
             }

@@ -5,7 +5,9 @@
 //! skipped when [`DialogInputs`] is active.
 
 use gpui::{App, AppContext, Context, Entity, Window};
-use gpui_component::input::InputState;
+use gpui_component::input::{CompletionProvider, EditorState, InputState, TextareaState};
+
+use std::rc::Rc;
 
 use crate::ui::route_completion::{dns_rule_completion_provider, simple_rule_completion_provider};
 use throne_domain::{AppSettings, AppState};
@@ -32,7 +34,7 @@ pub enum DialogInputs {
         mtu: Entity<InputState>,
     },
     AddFromInput {
-        text: Entity<InputState>,
+        text: Entity<TextareaState>,
     },
     /// Edit Group form (name + subscription URL).
     EditGroup {
@@ -51,16 +53,14 @@ pub enum NestedInputs {
     /// Raw route editor: Name + sing-box route JSON.
     RawEditor(RawEditorInputs),
     /// Import paste multi-line.
-    ImportPaste {
-        text: Entity<InputState>,
-    },
+    ImportPaste { text: Entity<TextareaState> },
 }
 
 /// Real Inputs for the raw route profile editor.
 #[derive(Clone)]
 pub struct RawEditorInputs {
     pub name: Entity<InputState>,
-    pub json: Entity<InputState>,
+    pub json: Entity<TextareaState>,
 }
 
 /// Real Inputs for the structured route profile editor.
@@ -68,16 +68,16 @@ pub struct RawEditorInputs {
 pub struct RouteEditorInputs {
     pub name: Entity<InputState>,
     pub url: Entity<InputState>,
-    pub simple_direct: Entity<InputState>,
-    pub simple_proxy: Entity<InputState>,
-    pub simple_block: Entity<InputState>,
-    pub simple_warp: Entity<InputState>,
+    pub simple_direct: Entity<EditorState>,
+    pub simple_proxy: Entity<EditorState>,
+    pub simple_block: Entity<EditorState>,
+    pub simple_warp: Entity<EditorState>,
     /// Advanced tab — bound to the currently selected rule (empty when none).
     pub rule_name: Entity<InputState>,
     pub rule_protocol: Entity<InputState>,
-    pub rule_domain: Entity<InputState>,
-    pub rule_suffix: Entity<InputState>,
-    pub rule_ip: Entity<InputState>,
+    pub rule_domain: Entity<TextareaState>,
+    pub rule_suffix: Entity<TextareaState>,
+    pub rule_ip: Entity<TextareaState>,
 }
 
 impl NestedInputs {
@@ -94,33 +94,29 @@ impl NestedInputs {
         Self::RouteEditor(RouteEditorInputs {
             name: single_line(window, cx, name.to_string(), "Profile name"),
             url: single_line(window, cx, url.to_string(), "https://…"),
-            simple_direct: multi_line_simple_rules(
+            simple_direct: editor_simple_rules(
                 window,
                 cx,
                 simple_direct.to_string(),
                 "domain: / suffix: / …",
-                5,
             ),
-            simple_proxy: multi_line_simple_rules(
+            simple_proxy: editor_simple_rules(
                 window,
                 cx,
                 simple_proxy.to_string(),
                 "domain: / suffix: / …",
-                5,
             ),
-            simple_block: multi_line_simple_rules(
+            simple_block: editor_simple_rules(
                 window,
                 cx,
                 simple_block.to_string(),
                 "domain: / suffix: / …",
-                5,
             ),
-            simple_warp: multi_line_simple_rules(
+            simple_warp: editor_simple_rules(
                 window,
                 cx,
                 simple_warp.to_string(),
                 "domain: / suffix: / …",
-                5,
             ),
             rule_name: single_line(window, cx, String::new(), "Rule name"),
             rule_protocol: single_line(window, cx, String::new(), "tcp / udp / …"),
@@ -138,13 +134,7 @@ impl NestedInputs {
     ) -> Self {
         Self::RawEditor(RawEditorInputs {
             name: single_line(window, cx, name.to_string(), "Profile name"),
-            json: multi_line(
-                window,
-                cx,
-                json.to_string(),
-                "{\n  \"rules\": []\n}",
-                12,
-            ),
+            json: multi_line(window, cx, json.to_string(), "{\n  \"rules\": []\n}", 12),
         })
     }
 
@@ -174,7 +164,7 @@ impl NestedInputs {
         }
     }
 
-    pub fn as_import_paste(&self) -> Option<&Entity<InputState>> {
+    pub fn as_import_paste(&self) -> Option<&Entity<TextareaState>> {
         match self {
             Self::ImportPaste { text } => Some(text),
             _ => None,
@@ -189,13 +179,13 @@ pub struct RoutingInputs {
     pub direct_dns: Entity<InputState>,
     pub local_override: Entity<InputState>,
     pub cache_cap: Entity<InputState>,
-    pub dns_object: Entity<InputState>,
+    pub dns_object: Entity<TextareaState>,
     pub dns_v4: Entity<InputState>,
     pub dns_v6: Entity<InputState>,
     pub dns_port: Entity<InputState>,
     pub redirect_addr: Entity<InputState>,
     pub redirect_port: Entity<InputState>,
-    pub dns_rules: Entity<InputState>,
+    pub dns_rules: Entity<EditorState>,
     pub warp_ep: Entity<InputState>,
     pub warp_priv: Entity<InputState>,
     pub warp_pub: Entity<InputState>,
@@ -232,18 +222,12 @@ impl RoutingInputs {
                 s.redirect_listen_address.clone(),
                 "Listen address",
             ),
-            redirect_port: single_line(
-                window,
-                cx,
-                s.redirect_listen_port.to_string(),
-                "Port",
-            ),
-            dns_rules: multi_line_dns_rules(
+            redirect_port: single_line(window, cx, s.redirect_listen_port.to_string(), "Port"),
+            dns_rules: editor_dns_rules(
                 window,
                 cx,
                 dns_rules,
                 "domain: / suffix: / regex: / ruleset:",
-                4,
             ),
             warp_ep: single_line(window, cx, s.warp_ep.clone(), "Endpoint"),
             warp_priv: single_line(window, cx, s.warp_private_key.clone(), "Private key"),
@@ -321,79 +305,73 @@ fn multi_line<V: 'static>(
     value: impl Into<String>,
     placeholder: &'static str,
     rows: usize,
-) -> Entity<InputState> {
+) -> Entity<TextareaState> {
     let value = value.into();
     cx.new(|cx| {
-        InputState::new(window, cx)
-            .multi_line(true)
+        TextareaState::new(window, cx)
             .rows(rows)
             .placeholder(placeholder)
             .default_value(value)
     })
 }
 
-/// Multi-line Input with upstream-style simple-rule autocomplete.
-fn multi_line_simple_rules<V: 'static>(
+fn editor_with_completion<V: 'static>(
     window: &mut Window,
     cx: &mut Context<V>,
     value: impl Into<String>,
     placeholder: &'static str,
-    rows: usize,
-) -> Entity<InputState> {
+    provider: Rc<dyn CompletionProvider>,
+) -> Entity<EditorState> {
     let value = value.into();
-    let provider = simple_rule_completion_provider();
     cx.new(|cx| {
-        let mut state = InputState::new(window, cx)
-            .multi_line(true)
-            .rows(rows)
+        let mut state = EditorState::new(window, cx)
             .placeholder(placeholder)
-            .default_value(value);
-        state.lsp.completion_provider = Some(provider);
+            .default_value(value)
+            .line_number(false)
+            .searchable(false);
+        state.lsp_mut().completion_provider = Some(provider);
         state
     })
 }
 
-/// Multi-line Input with DNS-rules autocomplete (domain/suffix/regex/ruleset).
-fn multi_line_dns_rules<V: 'static>(
+/// Multi-line editor with upstream-style simple-rule autocomplete.
+fn editor_simple_rules<V: 'static>(
     window: &mut Window,
     cx: &mut Context<V>,
     value: impl Into<String>,
     placeholder: &'static str,
-    rows: usize,
-) -> Entity<InputState> {
-    let value = value.into();
-    let provider = dns_rule_completion_provider();
-    cx.new(|cx| {
-        let mut state = InputState::new(window, cx)
-            .multi_line(true)
-            .rows(rows)
-            .placeholder(placeholder)
-            .default_value(value);
-        state.lsp.completion_provider = Some(provider);
-        state
-    })
+) -> Entity<EditorState> {
+    editor_with_completion(
+        window,
+        cx,
+        value,
+        placeholder,
+        simple_rule_completion_provider(),
+    )
+}
+
+/// Multi-line editor with DNS-rules autocomplete (domain/suffix/regex/ruleset).
+fn editor_dns_rules<V: 'static>(
+    window: &mut Window,
+    cx: &mut Context<V>,
+    value: impl Into<String>,
+    placeholder: &'static str,
+) -> Entity<EditorState> {
+    editor_with_completion(
+        window,
+        cx,
+        value,
+        placeholder,
+        dns_rule_completion_provider(),
+    )
 }
 
 impl DialogInputs {
-    pub fn basic<V: 'static>(
-        window: &mut Window,
-        cx: &mut Context<V>,
-        state: &AppState,
-    ) -> Self {
+    pub fn basic<V: 'static>(window: &mut Window, cx: &mut Context<V>, state: &AppState) -> Self {
         let s = state.settings();
         Self::Basic {
-            inbound_address: single_line(
-                window,
-                cx,
-                s.inbound_address.clone(),
-                "Inbound address",
-            ),
-            inbound_port: single_line(
-                window,
-                cx,
-                s.inbound_socks_port.to_string(),
-                "Port",
-            ),
+            inbound_address: single_line(window, cx, s.inbound_address.clone(), "Inbound address"),
+            inbound_port: single_line(window, cx, s.inbound_socks_port.to_string(), "Port"),
             test_url: single_line(window, cx, s.test_latency_url.clone(), "Test URL"),
             remote_dns: single_line(window, cx, s.remote_dns.clone(), "Remote DNS"),
             direct_dns: single_line(window, cx, s.direct_dns.clone(), "Direct DNS"),
@@ -425,11 +403,7 @@ impl DialogInputs {
         }
     }
 
-    pub fn edit_profile<V: 'static>(
-        window: &mut Window,
-        cx: &mut Context<V>,
-        name: &str,
-    ) -> Self {
+    pub fn edit_profile<V: 'static>(window: &mut Window, cx: &mut Context<V>, name: &str) -> Self {
         Self::EditProfile {
             name: single_line(window, cx, name.to_string(), "Profile name"),
         }
@@ -480,19 +454,48 @@ impl DialogInputs {
         }
     }
 
-    pub fn read_string(entity: &Entity<InputState>, cx: &App) -> String {
-        entity.read(cx).value().to_string()
+    pub fn read_string<T: DialogValue + 'static>(entity: &Entity<T>, cx: &App) -> String {
+        entity.read(cx).dialog_value()
     }
 
-    pub fn set_string(
-        entity: &Entity<InputState>,
+    pub fn set_string<T: DialogValue + 'static>(
+        entity: &Entity<T>,
         value: impl Into<String>,
         window: &mut Window,
         cx: &mut App,
     ) {
         let value = value.into();
         entity.update(cx, |input, cx| {
-            input.set_value(value, window, cx);
+            input.dialog_set_value(value, window, cx);
         });
     }
 }
+
+/// Shared value/set_value seam for Input / Textarea / Editor states.
+pub trait DialogValue: Sized {
+    fn dialog_value(&self) -> String;
+    fn dialog_set_value(&mut self, value: String, window: &mut Window, cx: &mut Context<Self>);
+}
+
+macro_rules! impl_dialog_value {
+    ($ty:ty) => {
+        impl DialogValue for $ty {
+            fn dialog_value(&self) -> String {
+                self.value().to_string()
+            }
+
+            fn dialog_set_value(
+                &mut self,
+                value: String,
+                window: &mut Window,
+                cx: &mut Context<Self>,
+            ) {
+                self.set_value(value, window, cx);
+            }
+        }
+    };
+}
+
+impl_dialog_value!(InputState);
+impl_dialog_value!(TextareaState);
+impl_dialog_value!(EditorState);

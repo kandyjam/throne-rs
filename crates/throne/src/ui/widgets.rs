@@ -4,15 +4,14 @@
 
 use std::rc::Rc;
 
-use gpui::{
-    App, ClickEvent, Entity, KeyDownEvent, SharedString, Window, div, prelude::*, px,
-};
+use gpui::{div, prelude::*, px, App, ClickEvent, Entity, KeyDownEvent, SharedString, Window};
 use gpui_component::{
-    Icon, Sizable as _, Size, h_flex,
     button::{Button, ButtonVariants as _},
-    input::{Input, InputState},
+    h_flex,
+    input::{Editor, EditorState, Input, InputState, Textarea, TextareaState},
     switch::Switch,
     tab::{Tab, TabBar},
+    Icon, Sizable as _, Size,
 };
 
 use crate::theme::Theme;
@@ -66,7 +65,7 @@ pub fn start_stop_presentation(state: StartStopState) -> (&'static str, bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{StartStopState, ToolbarIcon, start_stop_presentation, toolbar_icon_path};
+    use super::{start_stop_presentation, toolbar_icon_path, StartStopState, ToolbarIcon};
 
     #[test]
     fn toolbar_actions_use_distinct_embedded_icon_assets() {
@@ -123,11 +122,7 @@ pub fn toolbar_btn(
     on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let id: SharedString = id.into();
-    let icon_color = if open {
-        Theme::accent()
-    } else {
-        Theme::icon()
-    };
+    let icon_color = if open { Theme::accent() } else { Theme::icon() };
     div()
         .id(id)
         .flex()
@@ -244,10 +239,7 @@ pub fn settings_switch_row(
 pub const FORM_LABEL_W: f32 = 210.;
 
 /// Two-column form row: left label, right control (Qt `QGridLayout` / form style).
-pub fn form_row(
-    label: impl Into<SharedString>,
-    control: impl IntoElement,
-) -> impl IntoElement {
+pub fn form_row(label: impl Into<SharedString>, control: impl IntoElement) -> impl IntoElement {
     h_flex()
         .w_full()
         .items_center()
@@ -296,13 +288,12 @@ pub fn form_enable_interval_row(
                     .flex_shrink_0()
                     .cursor_pointer()
                     .on_click(move |ev, w, cx| on_toggle(ev, w, cx))
-                    .child(Switch::new(switch_id).checked(enabled).with_size(Size::XSmall))
                     .child(
-                        div()
-                            .text_sm()
-                            .text_color(Theme::text())
-                            .child("Enable"),
-                    ),
+                        Switch::new(switch_id)
+                            .checked(enabled)
+                            .with_size(Size::XSmall),
+                    )
+                    .child(div().text_sm().text_color(Theme::text()).child("Enable")),
             )
             .child(
                 div()
@@ -331,10 +322,7 @@ pub fn section_hint(text: impl Into<SharedString>) -> impl IntoElement {
 }
 
 /// Titled group panel — mirrors upstream `QGroupBox` (Routes / Route Profile).
-pub fn group_panel(
-    title: impl Into<SharedString>,
-    body: impl IntoElement,
-) -> impl IntoElement {
+pub fn group_panel(title: impl Into<SharedString>, body: impl IntoElement) -> impl IntoElement {
     div()
         .w_full()
         .flex()
@@ -442,7 +430,12 @@ pub fn input_field_row(
                 .text_color(Theme::text_muted())
                 .child(label),
         )
-        .child(div().flex_1().min_w(px(0.)).child(Input::new(state).cleanable(true)))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .child(Input::new(state).cleanable(true)),
+        )
 }
 
 /// Format a GPUI keystroke as a Throne hotkey label (`Cmd/Ctrl+Shift+C`).
@@ -453,8 +446,19 @@ pub fn format_hotkey_chord(keystroke: &gpui::Keystroke) -> Option<String> {
     // Modifier-only keydowns — wait for a real key.
     if matches!(
         key,
-        "control" | "ctrl" | "shift" | "alt" | "option" | "meta" | "cmd" | "command" | "win"
-            | "windows" | "super" | "fn" | "function"
+        "control"
+            | "ctrl"
+            | "shift"
+            | "alt"
+            | "option"
+            | "meta"
+            | "cmd"
+            | "command"
+            | "win"
+            | "windows"
+            | "super"
+            | "fn"
+            | "function"
     ) {
         return None;
     }
@@ -494,7 +498,10 @@ pub fn format_hotkey_chord(keystroke: &gpui::Keystroke) -> Option<String> {
             // Single letters / digits → uppercase; f-keys keep common casing.
             if other.len() == 1 {
                 other.to_uppercase()
-            } else if let Some(rest) = other.strip_prefix('f').filter(|r| r.chars().all(|c| c.is_ascii_digit())) {
+            } else if let Some(rest) = other
+                .strip_prefix('f')
+                .filter(|r| r.chars().all(|c| c.is_ascii_digit()))
+            {
                 format!("F{rest}")
             } else {
                 let mut chars = other.chars();
@@ -646,21 +653,34 @@ mod hotkey_format_tests {
     }
 }
 
-/// Full-width real multi-line [`Input`].
-pub fn input_area(state: &Entity<InputState>) -> impl IntoElement {
-    div().w_full().child(Input::new(state).cleanable(true))
+/// Full-width real multi-line [`Textarea`].
+pub fn input_area(state: &Entity<TextareaState>) -> impl IntoElement {
+    div().w_full().child(Textarea::new(state))
 }
 
-/// Multi-line [`Input`] with a **definite** pixel height (route simple-rules grids).
+/// Multi-line [`Textarea`] with a **definite** pixel height (route simple-rules grids).
 ///
-/// gpui-component multi-line Inputs collapse to ~one line under `h_auto` unless
+/// gpui-component multi-line fields collapse to ~one line under `h_auto` unless
 /// given an explicit `.h(...)`. Percentage/`h_full` only works when every ancestor
 /// already has a definite height — so we pin the height in pixels here.
-pub fn input_area_tall(state: &Entity<InputState>, height: f32) -> impl IntoElement {
+pub fn input_area_tall(state: &Entity<TextareaState>, height: f32) -> impl IntoElement {
     div()
         .w_full()
         .h(px(height))
-        .child(Input::new(state).cleanable(true).h(px(height)))
+        .child(Textarea::new(state).h(px(height)))
+}
+
+/// Full-width [`Editor`] (used for rule fields that need completion).
+pub fn editor_area(state: &Entity<EditorState>) -> impl IntoElement {
+    div().w_full().child(Editor::new(state))
+}
+
+/// [`Editor`] with a definite pixel height.
+pub fn editor_area_tall(state: &Entity<EditorState>, height: f32) -> impl IntoElement {
+    div()
+        .w_full()
+        .h(px(height))
+        .child(Editor::new(state).h(px(height)))
 }
 
 /// Compact Input (flex-1) for inline rows; optional trailing control (e.g. preset ▼).
@@ -836,11 +856,7 @@ pub fn menu_item_checked(
 }
 
 pub fn menu_separator() -> impl IntoElement {
-    div()
-        .h(px(1.))
-        .mx_1()
-        .my_0p5()
-        .bg(Theme::border_light())
+    div().h(px(1.)).mx_1().my_0p5().bg(Theme::border_light())
 }
 
 pub fn menu_label(text: impl Into<SharedString>) -> impl IntoElement {
