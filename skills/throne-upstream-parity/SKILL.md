@@ -19,9 +19,9 @@ Keep **throne-rs** (`rewrite/rust-gpui`) behaviorally aligned with
 |------|--------|
 | Upstream remote | `upstream` → `https://github.com/throneproj/Throne.git` |
 | Baseline branch | `upstream/dev` (or a release tag e.g. `1.2.4`) |
-| **Current pin** | tag **`1.2.4`** (`33777e27`) |
-| **Tip tracked** | `upstream/dev` @ `ed2fdde2` (`1.2.4-1-g…`, naiveproxy only) |
-| **1.2.5** | **Not released** (no tag / no GitHub release as of 2026-08-10). Do not bump product version to 1.2.5 until upstream tags it. |
+| **Current pin** | tag **`1.3.0-beta.2`** (`2feab171`) |
+| **Tip tracked** | `upstream/dev` describe `1.3.0-beta.2-1-g…` |
+| **1.2.5** | Never tagged; line jumped to **1.3.0-beta.1**. |
 | Product version | root [`VERSION`](../../VERSION) + workspace `Cargo.toml` `version` (= latest **released** upstream tag / `NKR_VERSION`) |
 | Parity matrix | [`docs/UPSTREAM_TRACKING.md`](../../docs/UPSTREAM_TRACKING.md) |
 | This rewrite | branch `rewrite/rust-gpui`, crates under `crates/` |

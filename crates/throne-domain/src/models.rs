@@ -34,6 +34,12 @@ pub enum ProfileType {
     Direct,
     Tailscale,
     ExtraCore,
+    /// Upstream 1.3.0-beta.1 Snell (v4/v6).
+    Snell,
+    /// Upstream 1.3.0-beta.1 OpenVPN client endpoint.
+    OpenVpn,
+    /// Upstream 1.3.0-beta.1 OpenConnect/AnyConnect endpoint.
+    OpenConnect,
 }
 
 impl ProfileType {
@@ -64,6 +70,9 @@ impl ProfileType {
             Self::Direct => "direct",
             Self::Tailscale => "tailscale",
             Self::ExtraCore => "extracore",
+            Self::Snell => "snell",
+            Self::OpenVpn => "openvpn",
+            Self::OpenConnect => "openconnect",
         }
     }
 
@@ -94,6 +103,9 @@ impl ProfileType {
             "direct" => Some(Self::Direct),
             "tailscale" => Some(Self::Tailscale),
             "extracore" | "extra_core" => Some(Self::ExtraCore),
+            "snell" => Some(Self::Snell),
+            "openvpn" | "openvpn-client" => Some(Self::OpenVpn),
+            "openconnect" => Some(Self::OpenConnect),
             _ => None,
         }
     }
@@ -124,6 +136,9 @@ impl ProfileType {
             Self::Direct => "Direct",
             Self::Tailscale => "Tailscale",
             Self::ExtraCore => "Extra Core",
+            Self::Snell => "Snell",
+            Self::OpenVpn => "OpenVPN",
+            Self::OpenConnect => "OpenConnect",
         }
     }
 }
@@ -163,6 +178,9 @@ pub struct ParsedOutbound {
     pub packet_encoding: Option<String>,
     /// Full serialized snapshot for DB `outbound_json`.
     pub raw_json: Option<String>,
+    /// Xray FinalMask JSON object (share-link `fm` / `finalmask`, 1.3.0-beta.2).
+    #[serde(default)]
+    pub finalmask: Option<String>,
 }
 
 impl ParsedOutbound {
@@ -173,12 +191,7 @@ impl ParsedOutbound {
     /// Address and Name columns. Never dump this struct via serde (null fields,
     /// no `type`) — that is what broke original Throne display.
     pub fn to_db_json(&self, profile_type: ProfileType) -> String {
-        normalize_outbound_json(
-            profile_type,
-            self.tag.as_deref().unwrap_or(""),
-            self,
-            None,
-        )
+        normalize_outbound_json(profile_type, self.tag.as_deref().unwrap_or(""), self, None)
     }
 }
 
@@ -327,7 +340,9 @@ fn merge_outbound_fields_from_value(fields: &mut ParsedOutbound, v: &serde_json:
             .get("tls")
             .and_then(|t| match t {
                 serde_json::Value::Bool(b) => Some(*b),
-                serde_json::Value::Object(o) => o.get("enabled").and_then(|x| x.as_bool()).or(Some(true)),
+                serde_json::Value::Object(o) => {
+                    o.get("enabled").and_then(|x| x.as_bool()).or(Some(true))
+                }
                 _ => None,
             })
             .or_else(|| obj.get("tls").and_then(|x| x.as_bool()));
@@ -367,7 +382,7 @@ fn synthesize_upstream_outbound(
     name: &str,
     o: &ParsedOutbound,
 ) -> String {
-    use serde_json::{Map, Value, json};
+    use serde_json::{json, Map, Value};
 
     let mut map = Map::new();
     map.insert(
@@ -375,11 +390,7 @@ fn synthesize_upstream_outbound(
         Value::String(profile_type.as_str().to_string()),
     );
 
-    let tag = o
-        .tag
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or(name);
+    let tag = o.tag.as_deref().filter(|s| !s.is_empty()).unwrap_or(name);
     if !tag.is_empty() {
         map.insert("tag".into(), Value::String(tag.to_string()));
     }
@@ -392,19 +403,43 @@ fn synthesize_upstream_outbound(
     if let Some(u) = o.uuid.as_ref().filter(|s| !s.is_empty()) {
         map.insert("uuid".into(), Value::String(u.clone()));
     }
-    if let Some(pw) = o.password.as_ref().filter(|s| !s.is_empty()) {
-        // Hysteria v1 uses auth_str; export as password for hy2 and also auth_str for hy1.
-        if profile_type == ProfileType::Hysteria {
-            map.insert("auth_str".into(), Value::String(pw.clone()));
-        } else {
-            map.insert("password".into(), Value::String(pw.clone()));
+    if profile_type == ProfileType::Wireguard {
+        // Importers stash WG keys on ParsedOutbound password/username/method/path.
+        if let Some(pk) = o.password.as_ref().filter(|s| !s.is_empty()) {
+            map.insert("private_key".into(), Value::String(pk.clone()));
         }
-    }
-    if let Some(u) = o.username.as_ref().filter(|s| !s.is_empty()) {
-        map.insert("username".into(), Value::String(u.clone()));
-    }
-    if let Some(m) = o.method.as_ref().filter(|s| !s.is_empty()) {
-        map.insert("method".into(), Value::String(m.clone()));
+        if let Some(pubk) = o.username.as_ref().filter(|s| !s.is_empty()) {
+            map.insert("peer_public_key".into(), Value::String(pubk.clone()));
+        }
+        if let Some(psk) = o.method.as_ref().filter(|s| !s.is_empty()) {
+            map.insert("pre_shared_key".into(), Value::String(psk.clone()));
+        }
+        if let Some(addr) = o.path.as_ref().filter(|s| !s.is_empty()) {
+            let addrs: Vec<Value> = addr
+                .split([',', '-'])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| Value::String(s.to_string()))
+                .collect();
+            if !addrs.is_empty() {
+                map.insert("local_address".into(), Value::Array(addrs));
+            }
+        }
+    } else {
+        if let Some(pw) = o.password.as_ref().filter(|s| !s.is_empty()) {
+            // Hysteria v1 uses auth_str; export as password for hy2 and also auth_str for hy1.
+            if profile_type == ProfileType::Hysteria {
+                map.insert("auth_str".into(), Value::String(pw.clone()));
+            } else {
+                map.insert("password".into(), Value::String(pw.clone()));
+            }
+        }
+        if let Some(u) = o.username.as_ref().filter(|s| !s.is_empty()) {
+            map.insert("username".into(), Value::String(u.clone()));
+        }
+        if let Some(m) = o.method.as_ref().filter(|s| !s.is_empty()) {
+            map.insert("method".into(), Value::String(m.clone()));
+        }
     }
     if let Some(f) = o.flow.as_ref().filter(|s| !s.is_empty()) {
         map.insert("flow".into(), Value::String(f.clone()));
@@ -482,14 +517,15 @@ fn synthesize_upstream_outbound(
             // Upstream often uses array; a single string is also accepted by many paths.
             tls.insert(
                 "alpn".into(),
-                json!(alpn.split(',').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>()),
+                json!(alpn
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()),
             );
         }
         if let Some(fp) = o.fp.as_ref().filter(|s| !s.is_empty()) {
-            tls.insert(
-                "utls".into(),
-                json!({ "enabled": true, "fingerprint": fp }),
-            );
+            tls.insert("utls".into(), json!({ "enabled": true, "fingerprint": fp }));
         }
         if o.security
             .as_ref()
@@ -530,6 +566,14 @@ fn synthesize_upstream_outbound(
         }
     }
 
+    if let Some(fm) = o.finalmask.as_ref().filter(|s| !s.is_empty()) {
+        if let Ok(v) = serde_json::from_str::<Value>(fm) {
+            if v.is_object() {
+                map.insert("finalmask".into(), v);
+            }
+        }
+    }
+
     serde_json::to_string(&Value::Object(map)).unwrap_or_else(|_| "{}".into())
 }
 
@@ -562,6 +606,44 @@ mod outbound_export_tests {
         // Must not look like a ParsedOutbound serde dump.
         assert!(v.get("raw_json").is_none());
         assert!(v.get("uuid").is_none());
+    }
+
+    #[test]
+    fn export_wireguard_uses_singbox_keys() {
+        let o = ParsedOutbound {
+            tag: Some("WG".into()),
+            server: Some("10.1.1.1".into()),
+            server_port: Some(51820),
+            password: Some("priv".into()),
+            username: Some("pub".into()),
+            method: Some("psk".into()),
+            path: Some("10.0.0.2/32".into()),
+            ..Default::default()
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&o.to_db_json(ProfileType::Wireguard)).unwrap();
+        assert_eq!(v["type"], "wireguard");
+        assert_eq!(v["private_key"], "priv");
+        assert_eq!(v["peer_public_key"], "pub");
+        assert_eq!(v["pre_shared_key"], "psk");
+        assert_eq!(v["local_address"][0], "10.0.0.2/32");
+        assert!(v.get("password").is_none());
+        assert!(v.get("username").is_none());
+        assert!(v.get("transport").is_none());
+    }
+
+    #[test]
+    fn export_vless_includes_finalmask_object() {
+        let o = ParsedOutbound {
+            tag: Some("n".into()),
+            server: Some("example.com".into()),
+            server_port: Some(443),
+            uuid: Some("11111111-1111-1111-1111-111111111111".into()),
+            finalmask: Some(r#"{"k":1}"#.into()),
+            ..Default::default()
+        };
+        let v: serde_json::Value = serde_json::from_str(&o.to_db_json(ProfileType::Vless)).unwrap();
+        assert_eq!(v["finalmask"]["k"], 1);
     }
 
     #[test]
@@ -725,10 +807,7 @@ impl Profile {
             );
         }
         // Fall back to speed-test strings when cumulative counters are empty.
-        match (
-            self.download_speed.is_empty(),
-            self.upload_speed.is_empty(),
-        ) {
+        match (self.download_speed.is_empty(), self.upload_speed.is_empty()) {
             (true, true) => String::new(),
             (false, true) => format!("↓{}", self.download_speed),
             (true, false) => format!("↑{}", self.upload_speed),
@@ -765,7 +844,10 @@ impl Profile {
         let port = self.outbound.server_port.or_else(|| {
             serde_json::from_str::<serde_json::Value>(&self.outbound_json)
                 .ok()
-                .and_then(|v| v.get("server_port").and_then(|x| x.as_u64().map(|n| n as u16)))
+                .and_then(|v| {
+                    v.get("server_port")
+                        .and_then(|x| x.as_u64().map(|n| n as u16))
+                })
         });
         match (server.is_empty(), port) {
             (true, _) => String::new(),
@@ -985,6 +1067,21 @@ fn default_vpn_tun_ipv4_cidr() -> String {
     "172.19.0.1/24".into()
 }
 
+fn default_true() -> bool {
+    true
+}
+
+/// Upstream `defaultTunPrivateRanges` — loopback/broadcast are never listed here.
+pub fn default_tun_private_ranges() -> Vec<String> {
+    vec![
+        "10.0.0.0/8".into(),
+        "172.16.0.0/12".into(),
+        "192.168.0.0/16".into(),
+        "169.254.0.0/16".into(),
+        "224.0.0.0/4".into(),
+    ]
+}
+
 /// Subset of upstream `SettingsRepo` defaults used by the Rust client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
@@ -1000,6 +1097,20 @@ pub struct AppSettings {
     #[serde(default = "default_vpn_tun_ipv4_cidr")]
     pub vpn_tun_ipv4_cidr: String,
     pub disable_private_range_bypass: bool,
+    /// Tun private LAN CIDRs to bypass when `disable_private_range_bypass` is false
+    /// (upstream `vpn_private_ranges`, 1.3.0-beta.1). Loopback/broadcast stay unconditional.
+    #[serde(default = "default_tun_private_ranges")]
+    pub vpn_private_ranges: Vec<String>,
+    /// Linux L3 bridge twins for route rules (upstream `vpn_l3_bridge`).
+    #[serde(default)]
+    pub vpn_l3_bridge: bool,
+    /// When false, skip swapping the custom light/dark dock icon (upstream `follow_status_in_taskbar`).
+    #[serde(default = "default_true")]
+    pub follow_status_in_taskbar: bool,
+    /// Register `throne://` at startup (upstream `url_scheme_auto_register`, 1.3.0-beta.2).
+    /// Turning this off does not undo an existing registration.
+    #[serde(default = "default_true")]
+    pub url_scheme_auto_register: bool,
     /// Upstream Basic Settings → Subscription: custom User-Agent (empty = default).
     #[serde(default)]
     pub user_agent: String,
@@ -1130,9 +1241,6 @@ pub struct AppSettings {
     pub warp_reserved: Vec<String>,
 }
 
-fn default_true() -> bool {
-    true
-}
 fn default_sub_auto_update() -> i32 {
     -30
 }
@@ -1175,6 +1283,10 @@ impl Default for AppSettings {
             vpn_mtu: 1500,
             vpn_tun_ipv4_cidr: default_vpn_tun_ipv4_cidr(),
             disable_private_range_bypass: false,
+            vpn_private_ranges: default_tun_private_ranges(),
+            vpn_l3_bridge: false,
+            follow_status_in_taskbar: true,
+            url_scheme_auto_register: true,
             user_agent: String::new(),
             net_use_proxy: false,
             net_insecure: false,
@@ -1305,13 +1417,21 @@ impl AppSettings {
     /// Encode enable checkbox + minutes into the signed interval used by SettingsRepo.
     pub fn encode_auto_update(enabled: bool, minutes: i32) -> i32 {
         let minutes = minutes.abs().max(1);
-        if enabled { minutes } else { -minutes }
+        if enabled {
+            minutes
+        } else {
+            -minutes
+        }
     }
 
     /// Upstream PeriodicRunner `minutesOf`: positive interval only counts when ≥ 30.
     /// Values below 30 (or non-positive) disable the job.
     pub fn effective_auto_update_minutes(signed: i32) -> i32 {
-        if signed >= 30 { signed } else { 0 }
+        if signed >= 30 {
+            signed
+        } else {
+            0
+        }
     }
 
     /// Whether a periodic job is due (`last_run == 0` means never → always due).
@@ -1523,6 +1643,9 @@ pub struct RouteProfile {
     pub remote_url: String,
     pub auto_update: bool,
     pub remote_last_update: i64,
+    /// OpenVPN/OpenConnect profile ids run alongside this routing profile (1.3.0-beta.1).
+    #[serde(default)]
+    pub endpoint_profile_ids: Vec<i64>,
 }
 
 impl RouteProfile {
@@ -1539,6 +1662,7 @@ impl RouteProfile {
             remote_url: String::new(),
             auto_update: false,
             remote_last_update: 0,
+            endpoint_profile_ids: Vec::new(),
         }
     }
 

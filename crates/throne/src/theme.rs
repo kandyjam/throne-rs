@@ -5,7 +5,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use gpui::{Hsla, WindowAppearance, rgb};
+use gpui::{rgb, Hsla, WindowAppearance};
 
 /// Whether the UI currently paints with the dark palette.
 static ACTIVE_DARK: AtomicBool = AtomicBool::new(false);
@@ -46,10 +46,7 @@ pub fn resolve_scheme(theme_setting: &str, system_dark: bool) -> ColorScheme {
             ColorScheme::Light
         };
     }
-    if lower.contains("qdarkstyle")
-        || lower.contains("blacksoft")
-        || lower == "dark"
-    {
+    if lower.contains("qdarkstyle") || lower.contains("blacksoft") || lower == "dark" {
         return ColorScheme::Dark;
     }
     if lower.contains("flatgray")
@@ -200,7 +197,6 @@ impl Theme {
             ColorScheme::Dark => rgb(0xf0b429).into(),
         }
     }
-
 }
 
 pub fn latency_color(ms: i32) -> Hsla {
@@ -215,7 +211,7 @@ pub fn latency_color(ms: i32) -> Hsla {
 
 #[cfg(test)]
 mod tests {
-    use super::{ColorScheme, apply_preference, resolve_scheme, set_active_scheme};
+    use super::{apply_preference, resolve_scheme, set_active_scheme, ColorScheme};
 
     #[test]
     fn system_preference_follows_os() {

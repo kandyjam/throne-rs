@@ -2201,8 +2201,12 @@ mod tests {
     use super::*;
     #[test]
     fn finds_cn_sets() {
-        assert!(lookup_rule_set_url("geoip-cn").unwrap().contains("/geoip/cn.srs"));
-        assert!(lookup_rule_set_url("geosite-cn").unwrap().contains("/geosite/cn.srs"));
+        assert!(lookup_rule_set_url("geoip-cn")
+            .unwrap()
+            .contains("/geoip/cn.srs"));
+        assert!(lookup_rule_set_url("geosite-cn")
+            .unwrap()
+            .contains("/geosite/cn.srs"));
         assert!(lookup_rule_set_url("geosite-category-anticensorship")
             .unwrap()
             .contains("category-anticensorship"));

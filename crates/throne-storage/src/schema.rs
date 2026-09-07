@@ -76,6 +76,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), StorageError> {
             remote_url TEXT NOT NULL DEFAULT '',
             auto_update INTEGER NOT NULL DEFAULT 0,
             remote_last_update INTEGER NOT NULL DEFAULT 0,
+            endpoint_profile_ids TEXT NOT NULL DEFAULT '[]',
             created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
             updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
         );
@@ -125,23 +126,59 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), StorageError> {
 
     // Migrations for older Throne DBs (same ALTERs as upstream).
     add_column_if_missing(conn, "groups", "type_sort_by", "INTEGER NOT NULL DEFAULT 0")?;
-    add_column_if_missing(conn, "groups", "auto_clear_unavailable", "INTEGER NOT NULL DEFAULT 0")?;
-    add_column_if_missing(conn, "route_profiles", "is_raw", "INTEGER NOT NULL DEFAULT 0")?;
-    add_column_if_missing(conn, "route_profiles", "raw_route", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(
+        conn,
+        "groups",
+        "auto_clear_unavailable",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        conn,
+        "route_profiles",
+        "is_raw",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        conn,
+        "route_profiles",
+        "raw_route",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
     add_column_if_missing(
         conn,
         "route_profiles",
         "prevent_modifications",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
-    add_column_if_missing(conn, "route_profiles", "is_remote", "INTEGER NOT NULL DEFAULT 0")?;
-    add_column_if_missing(conn, "route_profiles", "remote_url", "TEXT NOT NULL DEFAULT ''")?;
-    add_column_if_missing(conn, "route_profiles", "auto_update", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(
+        conn,
+        "route_profiles",
+        "is_remote",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        conn,
+        "route_profiles",
+        "remote_url",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column_if_missing(
+        conn,
+        "route_profiles",
+        "auto_update",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     add_column_if_missing(
         conn,
         "route_profiles",
         "remote_last_update",
         "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        conn,
+        "route_profiles",
+        "endpoint_profile_ids",
+        "TEXT NOT NULL DEFAULT '[]'",
     )?;
     add_column_if_missing(conn, "route_rules", "wifi_ssid_json", "TEXT")?;
     add_column_if_missing(conn, "route_rules", "wifi_bssid_json", "TEXT")?;

@@ -12,7 +12,7 @@ mod traffic_stats;
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -23,8 +23,8 @@ use throne_domain::{
 
 pub use paths::{default_db_path, discover_throne_databases, resolve_db_path, stats_db_path};
 pub use traffic_stats::{
-    AppTrafficRow, AppUsage, ConfigMetaRow, ConfigTrafficRow, ConfigUsage, DIRECT_STAT_PROFILE_ID,
-    TrafficSeriesPoint, TrafficStatsDb, TrafficStatsError, TrafficStatsManager,
+    AppTrafficRow, AppUsage, ConfigMetaRow, ConfigTrafficRow, ConfigUsage, TrafficSeriesPoint,
+    TrafficStatsDb, TrafficStatsError, TrafficStatsManager, DIRECT_STAT_PROFILE_ID,
 };
 
 #[derive(Debug, Error)]
@@ -115,8 +115,7 @@ impl Database {
         // Prefer tab order, but always persist every group so profile FK(gid)
         // cannot fail when group_order is a partial subset.
         let mut saved_groups: Vec<&throne_domain::Group> = state.all_groups();
-        let ordered: std::collections::HashSet<_> =
-            saved_groups.iter().map(|g| g.id).collect();
+        let ordered: std::collections::HashSet<_> = saved_groups.iter().map(|g| g.id).collect();
         for g in state.groups_map().values() {
             if !ordered.contains(&g.id) {
                 saved_groups.push(g);
@@ -154,8 +153,7 @@ impl Database {
             )?;
         }
 
-        let saved_ids: std::collections::HashSet<_> =
-            saved_groups.iter().map(|g| g.id).collect();
+        let saved_ids: std::collections::HashSet<_> = saved_groups.iter().map(|g| g.id).collect();
         let mut order_idx = 0i64;
         for gid in state.group_order() {
             if !saved_ids.contains(gid) {
@@ -211,8 +209,8 @@ impl Database {
                 r#"INSERT INTO route_profiles (
                     id, name, default_outbound_id, is_raw, raw_route,
                     prevent_modifications, is_remote, remote_url, auto_update,
-                    remote_last_update
-                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)"#,
+                    remote_last_update, endpoint_profile_ids
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)"#,
                 params![
                     r.id,
                     r.name,
@@ -224,6 +222,7 @@ impl Database {
                     r.remote_url,
                     r.auto_update as i32,
                     r.remote_last_update,
+                    to_json_i64_array(&r.endpoint_profile_ids),
                 ],
             )?;
             for (order, rule) in r.rules.iter().enumerate() {
@@ -263,7 +262,9 @@ impl Database {
                FROM groups"#,
         )?;
         let rows = stmt.query_map([], |row| {
-            let profiles_json: String = row.get::<_, Option<String>>(11)?.unwrap_or_else(|| "[]".into());
+            let profiles_json: String = row
+                .get::<_, Option<String>>(11)?
+                .unwrap_or_else(|| "[]".into());
             let profile_ids: Vec<ProfileId> =
                 serde_json::from_str(&profiles_json).unwrap_or_default();
             Ok(Group {
@@ -297,7 +298,9 @@ impl Database {
         )?;
         let rows = stmt.query_map([], |row| {
             let ty: String = row.get(1)?;
-            let outbound_json: String = row.get::<_, Option<String>>(9)?.unwrap_or_else(|| "{}".into());
+            let outbound_json: String = row
+                .get::<_, Option<String>>(9)?
+                .unwrap_or_else(|| "{}".into());
             let (outbound, name_from_ob) = parse_outbound_json(&outbound_json);
             let mut name: String = row.get::<_, Option<String>>(2)?.unwrap_or_default();
             // Upstream often stores name in outbound.tag and may leave name empty/stale.
@@ -355,7 +358,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             r#"SELECT id, name, default_outbound_id, is_raw, raw_route,
                       prevent_modifications, is_remote, remote_url, auto_update,
-                      remote_last_update
+                      remote_last_update, endpoint_profile_ids
                FROM route_profiles ORDER BY id ASC"#,
         )?;
         let mut profiles = Vec::new();
@@ -375,6 +378,9 @@ impl Database {
                     remote_url: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
                     auto_update: row.get::<_, i32>(8)? != 0,
                     remote_last_update: row.get::<_, Option<i64>>(9)?.unwrap_or(0),
+                    endpoint_profile_ids: json_i64_list(
+                        row.get::<_, Option<String>>(10)?.unwrap_or_default(),
+                    ),
                 })
             })?;
             for r in rows {
@@ -627,6 +633,17 @@ fn to_json_array(list: &[String]) -> String {
     serde_json::to_string(list).unwrap_or_else(|_| "[]".into())
 }
 
+fn to_json_i64_array(list: &[i64]) -> String {
+    serde_json::to_string(list).unwrap_or_else(|_| "[]".into())
+}
+
+fn json_i64_list(s: String) -> Vec<i64> {
+    if s.is_empty() {
+        return Vec::new();
+    }
+    serde_json::from_str(&s).unwrap_or_default()
+}
+
 fn collect_rows<T, E>(rows: impl IntoIterator<Item = Result<T, E>>) -> Result<Vec<T>, StorageError>
 where
     StorageError: From<E>,
@@ -639,10 +656,7 @@ where
 }
 
 /// Merge known settings; preserve unknown keys already in the DB.
-fn merge_settings_tx(
-    tx: &rusqlite::Transaction<'_>,
-    s: &AppSettings,
-) -> Result<(), StorageError> {
+fn merge_settings_tx(tx: &rusqlite::Transaction<'_>, s: &AppSettings) -> Result<(), StorageError> {
     let pairs: Vec<(&str, String)> = vec![
         ("inbound_socks_port", s.inbound_socks_port.to_string()),
         ("inbound_address", s.inbound_address.clone()),
@@ -655,6 +669,16 @@ fn merge_settings_tx(
         (
             "disable_private_range_bypass",
             bool_str(s.disable_private_range_bypass),
+        ),
+        ("vpn_private_ranges", to_json_array(&s.vpn_private_ranges)),
+        ("vpn_l3_bridge", bool_str(s.vpn_l3_bridge)),
+        (
+            "follow_status_in_taskbar",
+            bool_str(s.follow_status_in_taskbar),
+        ),
+        (
+            "url_scheme_auto_register",
+            bool_str(s.url_scheme_auto_register),
         ),
         ("user_agent", s.user_agent.clone()),
         ("net_use_proxy", bool_str(s.net_use_proxy)),
@@ -707,7 +731,10 @@ fn merge_settings_tx(
         ("core_box_underlying_dns", s.core_box_underlying_dns.clone()),
         ("fake_dns", bool_str(s.fake_dns)),
         ("enable_dns_server", bool_str(s.enable_dns_server)),
-        ("dns_server_listen_port", s.dns_server_listen_port.to_string()),
+        (
+            "dns_server_listen_port",
+            s.dns_server_listen_port.to_string(),
+        ),
         ("dns_v4_resp", s.dns_v4_resp.clone()),
         ("dns_v6_resp", s.dns_v6_resp.clone()),
         ("dns_server_rules", to_json_array(&s.dns_server_rules)),
@@ -733,7 +760,11 @@ fn merge_settings_tx(
 }
 
 fn bool_str(v: bool) -> String {
-    if v { "true".into() } else { "false".into() }
+    if v {
+        "true".into()
+    } else {
+        "false".into()
+    }
 }
 
 fn parse_bool(v: &str) -> bool {
@@ -804,6 +835,10 @@ fn apply_setting(s: &mut AppSettings, key: &str, value: &str) {
             }
         }
         "remember_enable" => s.remember_enable = parse_bool(value),
+        "vpn_private_ranges" => s.vpn_private_ranges = json_str_list(Some(value.to_string())),
+        "vpn_l3_bridge" => s.vpn_l3_bridge = parse_bool(value),
+        "follow_status_in_taskbar" => s.follow_status_in_taskbar = parse_bool(value),
+        "url_scheme_auto_register" => s.url_scheme_auto_register = parse_bool(value),
         "start_with_system" => s.start_with_system = parse_bool(value),
         "system_proxy_enabled" => s.system_proxy_enabled = parse_bool(value),
         "tun_mode_enabled" => s.tun_mode_enabled = parse_bool(value),
@@ -1052,11 +1087,9 @@ mod tests {
         db.save_state(&state).unwrap();
         let fixed: String = db
             .conn
-            .query_row(
-                "SELECT outbound_json FROM profiles WHERE id=1",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT outbound_json FROM profiles WHERE id=1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         let v: serde_json::Value = serde_json::from_str(&fixed).unwrap();
         assert_eq!(v["type"], "hysteria2");

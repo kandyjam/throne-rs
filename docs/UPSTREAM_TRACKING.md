@@ -2,9 +2,9 @@
 
 Remote: `upstream` → `https://github.com/throneproj/Throne.git`  
 Baseline branch: `upstream/dev`  
-**Target release (this audit):** tag **`1.2.4`** (`33777e27`) — **tag `1.2.5` does not exist yet** on GitHub (no release, no tag as of 2026-08-10 audit).  
-Last local `upstream/dev` tip at audit: `ed2fdde2` (*update naiveproxy to v150.0.7871.63-1*) — describe `1.2.4-1-ged2fdde2`.  
-**Product version:** `1.2.4` (root [`VERSION`](../VERSION) + workspace Cargo version = latest **released** upstream tag / `NKR_VERSION`). Do **not** invent `1.2.5` until upstream tags it.
+**Target release (this audit):** tag **`1.3.0-beta.2`** (`2feab171`, prerelease 2026-09-05).  
+Last local `upstream/dev` tip at audit: describe `1.3.0-beta.2-1-g…`.  
+**Product version:** `1.3.0-beta.2` (root [`VERSION`](../VERSION) + workspace Cargo version = this pin).
 
 Agent skill for ongoing parity work: [`skills/throne-upstream-parity/SKILL.md`](../skills/throne-upstream-parity/SKILL.md).
 
@@ -60,12 +60,24 @@ Status legend: ✅ done · 🧩 partial · ⏳ planned · ❌ out of scope (Go c
 | Profile editor tab order (1.2.4) | `33777e27` | ⏳ GPUI focus order later | `throne` |
 | Linux CLI installer | `89f3ec1d` | ⏳ | `script/` / xtask |
 | Windows unwritable config dir (1.2.4) | `d8e663cc` | ⏳ NSI; macOS package already uses AppConfig | `script/`, `throne` |
-| Core: sing-box / xray / TUN / DNS | Go `core/server` | ❌ keep Go binary (`ThroneCore`) — **synced to 1.2.4 sources** | `core/server` |
-| Core IPC Start/Stop | `dispatch.go` + Qt framing | 🧩 Start/Stop/Test/QueryStats/QueryConnections + AutoSelector RPC + **xray_full_configs / lazy / egress mark** | `throne-core-client`, `core/server` |
+| Core: sing-box / xray / TUN / DNS | Go `core/server` | ❌ keep Go binary (`ThroneCore`) — **synced to 1.3.0-beta.2 sources** (sing-box replace `4db236a56cd3`, wireguard-go `cdac29e5a25e`) | `core/server` |
+| Core IPC Start/Stop | `dispatch.go` + Qt framing | 🧩 Start/Stop/Test/QueryStats/QueryConnections/**CloseConnections** + AutoSelector RPC + Xray strategy (field 12 reserved) + **connection source field 14** | `throne-core-client`, `core/server` |
+| **Close connections (1.3.0-beta.1)** | `96d079c9` | ✅ Connections tab × + `CloseConnections` RPC | `throne`, `throne-core-client` |
+| **Connection source + LAN inbound (1.3.0-beta.2)** | `a1b6ac4b` | ✅ proto `source` + Source column when LAN inbound + wildcard listen shows LAN IP | `throne-core-client`, `throne-domain`, `throne` |
+| **WireGuard schemes / INI (1.3.0-beta.2)** | `30c45594`, `2b3e829d` | ✅ `wg://` `wireguard://` `vpn://` + INI PresharedKey | `throne-import` |
+| **Xray FinalMask `fm` (1.3.0-beta.2)** | `22de1725` | ✅ parse share-link query + persist in `outbound_json` | `throne-import`, `throne-domain` |
+| **URL scheme opt-out (1.3.0-beta.2)** | `064fc284` | ✅ `url_scheme_auto_register` setting + Basic Settings checkbox (Install/Uninstall later) | `throne-domain`, `throne` |
+| **Tun private ranges (1.3.0-beta.1)** | `1a512bf3` | ✅ `vpn_private_ranges` + Tun Settings editor | `throne-domain`, `throne` |
+| **Snell / OpenVPN / OpenConnect** | `e5f31546`, `3ab8b595` | 🧩 types + Snell share-link import + sing-box outbound types; VPN challenge UI later | `throne-domain`, `throne-import`, `throne-core-client` |
+| **Group URL/Speed test** | `09e49039` | ✅ group-tab context menu | `throne` |
+| **Route endpoints** | `3ab8b595` | 🧩 `endpoint_profile_ids` persisted; share/materialize later | `throne-domain`, `throne-storage` |
+| **Xray DNS inject (1.3.0-beta.1)** | `a7f20dd1` | ✅ stop sending reserved field 12; core injects direct-dns | `throne-core-client`, `core/server` |
+| **macOS Tun DNS addr** | `6e9848c2` | ✅ core uses tun prefix addr (not Next) + local physical iface helper | `core/server` |
+| **OTP / dashboard / JSON editor / L3 twins** | 1.3.0-beta.1 | ⏳ / 🧩 `vpn_l3_bridge` setting stored; dashboard RPC present in core, GUI later | `throne` |
 | System proxy | `QvProxyConfigurator` | 🧩 macOS `networksetup` on Start when checkbox on | `throne-core-client` |
 | GPUI shell | — | ✅ M0 | `throne` |
 | Main window layout / ops | `mainwindow.ui` | 🧩 relative toolbar menus, Start/Stop, Tun/DNS/Proxy, group tabs, 5-col table, logs/conn/**Traffic Graph**, status + **v1.2.4** | `throne` |
-| Secondary dialogs | BasicSettings / GroupItem / ProfileEdit | 🧩 Basic (Common + **Subscription** UA/proxy/clear/HWID/auto-update) / Groups/Add/Routing/Tun/Hotkey/**Edit Profile (rename)**; deep ProfileEdit later | `throne` |
+| Secondary dialogs | BasicSettings / GroupItem / ProfileEdit | 🧩 Basic (Common + **Subscription** + **URL Scheme** auto-register) / Groups/Add/Routing/Tun/Hotkey/**Edit Profile (rename)**; deep ProfileEdit later | `throne` |
 
 ## Defaults synced from upstream
 
@@ -85,9 +97,72 @@ Status legend: ✅ done · 🧩 partial · ⏳ planned · ❌ out of scope (Go c
 5. **Wave B+** — HTTP sub ✅; remote route fetch ✅; full Clash option parity / OS deeplink registration  
 6. **Wave 1.2.3** — version pin · Auto Selector create/plan/Start · multi-file import · Program menu · core + stats dialog ✅  
 7. **Wave 1.2.4** — version pin · core sync (egress, xray full gates, DNS quiet) · Auto Selector Xray full · Tun exclude hole · sub kept-in-use ✅  
-8. **Wave 1.2.5 (pending upstream tag)** — only tip commit so far: naiveproxy/cronet-go bump ✅ in `core/server/go.mod`+`go.sum`; product version stays 1.2.4  
+8. **Wave 1.3.0-beta.1** — core sync (Tun/DNS, CloseConnections, VPN RPCs, sing-box 1.14) · Snell import · Tun ranges · group URL test · connection close ✅  
+9. **Wave 1.3.0-beta.2** — connection source · LAN inbound label · WG/vpn schemes · FinalMask · url_scheme_auto_register · core sing-box/WG bump ✅  
 
-## Commit triage notes (1.2.4 → tip / pre-1.2.5)
+## Commit triage notes (1.3.0-beta.1 → 1.3.0-beta.2)
+
+29 commits. User-visible / core must-port vs Qt-only:
+
+| SHA | Summary | Action |
+|-----|---------|--------|
+| `2feab171` | fix constant collision | N/A Qt |
+| `a1b6ac4b` | improve LAN support | ✅ LocalNetwork + inbound label + Source column |
+| `2b3e829d` | fix wireguard decoding | ✅ INI keys / PresharedKey |
+| `339340e4` | improve db error handling | ⏳ rusqlite already surfaces errors |
+| `1f9207c0` | upgrade golang to 1.27 | ⏳ CI; core still `go 1.26` in go.mod |
+| `1098f990` | fix grpc issues in sing-box | ✅ sing-box replace bump |
+| `f2cbd0ca` | minor tray/icon/route refactors | N/A Qt |
+| `59475280` | zh_CN i18n | ⏳ |
+| `fd305f1f` | hotkey accessible names | N/A Qt |
+| `6b54f211` | refactoring tray/theme/routes | N/A Qt |
+| `065381c7` | rewrite subscription logic | 🧩 Rust already identity-preserves; no Qt parser split |
+| `840bee60` | minor WG/sub improvements | 🧩 covered by WG import |
+| `30c45594` | `wireguard://` `vpn://` | ✅ |
+| `5363313a` / `44f7a93b` | font/theme | N/A Qt |
+| `f5b4c8a5` | improve OpenVPN import | ⏳ ovpn file import later |
+| `8c720ff2` | dashboard asset path | ⏳ dashboard GUI |
+| `22de1725` | FinalMask (`fm`) | ✅ share-link parse + JSON |
+| `4b950612` | test path | N/A Qt |
+| `c8af9a2a` | discard stale test poll (#1790) | N/A no ResultPoller; one-shot URL test |
+| `48a870ad` | connections tableModel | N/A Qt; GPUI table already |
+| `133f8747` | invalid checking + context menu | ⏳ CheckConfig skip later |
+| `c453431d` / `064fc284` / `5f048553` | URL scheme | ✅ setting + checkbox |
+| `c4095535` | OpenVPN/OpenConnect reconnect | ⏳ OTP GUI |
+| `f340000b` | WG widget length | N/A Qt editor |
+| `8b1905bb` | update amnezia | 🧩 INI keys stored in raw conf |
+| `49cea029` | RPM packaging | ⏳ |
+
+## Commit triage notes (1.2.4 → 1.3.0-beta.1)
+
+49 commits. User-visible / core must-port vs Qt-only:
+
+| SHA | Summary | Action |
+|-----|---------|--------|
+| `a7f20dd1` | inject sing-box direct-dns into Xray | ✅ proto field 12 reserved + core |
+| `b2de0ea3` | Xray DNS + loopback pinning | ✅ core |
+| `6e9848c2` | Darwin tun DNS address | ✅ core tunPrefix.Addr() |
+| `08f2f501` | Windows extra process | ✅ core |
+| `7d96d9e8` / `8fc1b3d6` | Tun loopback | ✅ core |
+| `96d079c9` | Close connections | ✅ |
+| `09e49039` | Group URL/Speed test | ✅ |
+| `1a512bf3` | Alter private ranges | ✅ |
+| `e5f31546` | Snell | 🧩 type + share link |
+| `3ab8b595` | OpenVPN/OpenConnect + route endpoints | 🧩 types + persist ids |
+| `610f572a` | Hysteria Gecko obfs | ⏳ emit from editor later |
+| `8b73d132` | TLS spoof | ⏳ |
+| `79ee81f9` | sing-box dashboard | ⏳ GUI; core RPC present |
+| `2e7182b9` | OTP management | ⏳ |
+| `509dbf24` | Preset settings | ⏳ |
+| `3dfead38` | Custom JSON editor | ⏳ Qt widget |
+| `a6c8274c` | L3 bridge | 🧩 setting stored |
+| `6899acb5` | Disable custom dock icon | 🧩 `follow_status_in_taskbar` |
+| `12feb429` | Remember operation mode | ✅ already persist-on-toggle |
+| `d746dc1c` | Extend DNS settings | ⏳ extra DNS fields |
+| `f39a486e` | Connections search/sort persist | ⏳ |
+| Qt/i18n/installer | various | ⏳ / N/A |
+
+## Commit triage notes (1.2.4 → tip / pre-1.2.5, superseded)
 
 | SHA | Summary | Action |
 |-----|---------|--------|

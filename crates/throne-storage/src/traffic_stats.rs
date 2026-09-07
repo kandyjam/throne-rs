@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
 
 /// Reserved profile id for direct (non-proxy) traffic — upstream `DIRECT_STAT_PROFILE_ID`.
@@ -105,7 +105,10 @@ impl TrafficStatsDb {
     }
 
     fn create_tables(&self) -> Result<(), TrafficStatsError> {
-        let conn = self.conn.lock().map_err(|e| TrafficStatsError::Msg(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| TrafficStatsError::Msg(e.to_string()))?;
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS config_traffic_minute (
@@ -163,7 +166,10 @@ impl TrafficStatsDb {
         if rows.is_empty() {
             return Ok(());
         }
-        let conn = self.conn.lock().map_err(|e| TrafficStatsError::Msg(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| TrafficStatsError::Msg(e.to_string()))?;
         let tx = conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare(
@@ -184,7 +190,10 @@ impl TrafficStatsDb {
         if rows.is_empty() {
             return Ok(());
         }
-        let conn = self.conn.lock().map_err(|e| TrafficStatsError::Msg(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| TrafficStatsError::Msg(e.to_string()))?;
         let tx = conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare(
@@ -202,7 +211,10 @@ impl TrafficStatsDb {
     }
 
     pub fn upsert_config_meta(&self, m: &ConfigMetaRow) -> Result<(), TrafficStatsError> {
-        let conn = self.conn.lock().map_err(|e| TrafficStatsError::Msg(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| TrafficStatsError::Msg(e.to_string()))?;
         conn.execute(
             "INSERT INTO config_meta
              (profile_id, name, group_name, type, server_address, first_seen, last_seen)
@@ -229,7 +241,10 @@ impl TrafficStatsDb {
         last_path: &str,
         now_secs: i64,
     ) -> Result<(), TrafficStatsError> {
-        let conn = self.conn.lock().map_err(|e| TrafficStatsError::Msg(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| TrafficStatsError::Msg(e.to_string()))?;
         conn.execute(
             "INSERT INTO app_meta (process_name, last_path, first_seen, last_seen)
              VALUES (?1, ?2, ?3, ?4)
@@ -242,7 +257,10 @@ impl TrafficStatsDb {
 
     /// Aggregate minute rows older than `older_than_secs` into hour tier, then delete them.
     pub fn rollup_minute_to_hour(&self, older_than_secs: i64) -> Result<(), TrafficStatsError> {
-        let conn = self.conn.lock().map_err(|e| TrafficStatsError::Msg(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| TrafficStatsError::Msg(e.to_string()))?;
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO config_traffic_hour (bucket_start, profile_id, up, down)
@@ -275,7 +293,10 @@ impl TrafficStatsDb {
     }
 
     pub fn prune_hour(&self, older_than_secs: i64) -> Result<(), TrafficStatsError> {
-        let conn = self.conn.lock().map_err(|e| TrafficStatsError::Msg(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| TrafficStatsError::Msg(e.to_string()))?;
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "DELETE FROM config_traffic_hour WHERE bucket_start < ?1",
@@ -294,7 +315,10 @@ impl TrafficStatsDb {
         from_secs: i64,
         to_secs: i64,
     ) -> Result<Vec<ConfigUsage>, TrafficStatsError> {
-        let conn = self.conn.lock().map_err(|e| TrafficStatsError::Msg(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| TrafficStatsError::Msg(e.to_string()))?;
         let mut stmt = conn.prepare(
             "SELECT profile_id, SUM(u), SUM(d) FROM (
                SELECT profile_id, up AS u, down AS d FROM config_traffic_minute
@@ -321,7 +345,10 @@ impl TrafficStatsDb {
         from_secs: i64,
         to_secs: i64,
     ) -> Result<Vec<AppUsage>, TrafficStatsError> {
-        let conn = self.conn.lock().map_err(|e| TrafficStatsError::Msg(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| TrafficStatsError::Msg(e.to_string()))?;
         let mut stmt = conn.prepare(
             "SELECT process_name, SUM(u), SUM(d) FROM (
                SELECT process_name, up AS u, down AS d FROM app_traffic_minute
@@ -409,7 +436,10 @@ impl TrafficStatsDb {
             minute = minute_table,
             hour = hour_table,
         );
-        let conn = self.conn.lock().map_err(|e| TrafficStatsError::Msg(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| TrafficStatsError::Msg(e.to_string()))?;
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map(params![from_secs, to_secs], |r| {
@@ -424,7 +454,10 @@ impl TrafficStatsDb {
     }
 
     pub fn all_config_meta(&self) -> Result<Vec<ConfigMetaRow>, TrafficStatsError> {
-        let conn = self.conn.lock().map_err(|e| TrafficStatsError::Msg(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| TrafficStatsError::Msg(e.to_string()))?;
         let mut stmt = conn.prepare(
             "SELECT profile_id, name, group_name, type, server_address, first_seen, last_seen
              FROM config_meta",
@@ -445,8 +478,14 @@ impl TrafficStatsDb {
         Ok(rows)
     }
 
-    pub fn get_config_meta(&self, profile_id: i64) -> Result<Option<ConfigMetaRow>, TrafficStatsError> {
-        let conn = self.conn.lock().map_err(|e| TrafficStatsError::Msg(e.to_string()))?;
+    pub fn get_config_meta(
+        &self,
+        profile_id: i64,
+    ) -> Result<Option<ConfigMetaRow>, TrafficStatsError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| TrafficStatsError::Msg(e.to_string()))?;
         let row = conn
             .query_row(
                 "SELECT profile_id, name, group_name, type, server_address, first_seen, last_seen

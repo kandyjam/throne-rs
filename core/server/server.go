@@ -9,42 +9,44 @@ import (
 	"ThroneCore/internal/sys"
 	"ThroneCore/internal/wg"
 	"ThroneCore/internal/xray"
+	"ThroneCore/internal/xraydns"
 	"ThroneCore/test_utils"
+	"archive/zip"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/gofrs/uuid/v5"
 	"github.com/google/shlex"
 	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/experimental/clashapi"
-	"github.com/sagernet/sing-box/experimental/clashapi/trafficontrol"
+	"github.com/sagernet/sing-box/common/trafficcontrol"
 	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/service"
 	"github.com/xtls/xray-core/core"
-	xthrone "github.com/xtls/xray-core/throne"
 	xinternet "github.com/xtls/xray-core/transport/internet"
 )
 
 // Serializes Start against Stop: the dispatcher gives every request its own goroutine.
 var lifecycleMu sync.Mutex
 
-// Guards the instance pointers. Never held across a Create/Start, so the pollers
-// do not block behind a profile start.
+// Guards the instance pointers; never held across a Create/Start, so pollers do not block behind a profile start.
 var stateMu sync.RWMutex
 
 var boxInstance *boxbox.Box
 var instanceCancel context.CancelFunc
 
-// Exactly one is set while a profile runs, both covering the single merged sidecar:
-// xrayInstance when eager, xrayGate when the profile asked it to stay cold.
+// Exactly one is set while a profile runs: xrayInstance when eager, xrayGate when the profile asked it to stay cold.
 var xrayInstance *core.Instance
 var xrayGate *xray.Gate
 
@@ -88,8 +90,7 @@ func setXrayFullGates(gates []*xray.Gate) {
 	xrayFullGates = gates
 }
 
-// Shorter than the configs the profile brought: a gated instance is absent
-// between activations.
+// Shorter than the profile's config list: a gated instance is absent between activations.
 func liveXrayInstances() []*core.Instance {
 	stateMu.RLock()
 	instance, gate := xrayInstance, xrayGate
@@ -116,13 +117,10 @@ type server struct {
 	gen.UnimplementedLibcoreServiceServer
 }
 
-// To returns a pointer to the given value.
 func To[T any](v T) *T {
 	return &v
 }
 
-// Keeps the live Xray instance's egress on the current default route as the network
-// changes. Test instances are short-lived and set theirs once, so are not tracked.
 func init() {
 	m := boxdns.DnsManagerInstance
 	if m == nil || m.Monitor == nil {
@@ -133,17 +131,15 @@ func init() {
 		if ifc != nil {
 			name = ifc.Name
 		}
-		// The callback's interface is fresher than currentEgress would report here;
-		// the mark is unaffected by a route move and carries over unchanged.
+		// The callback's interface is fresher than currentEgress would report here; the mark carries over unchanged.
 		for _, inst := range liveXrayInstances() {
 			inst.SetEgress(name, autoRedirectMark.Load())
 		}
 	})
 }
 
-// One Xray instance per opaque full config, wired to the current egress conditions.
 // On failure the started ones are torn down; on success the caller must close them.
-func startXrayFullConfigs(configs []string) ([]*core.Instance, error) {
+func startXrayFullConfigs(configs []string, prepare func(*core.Instance) error) ([]*core.Instance, error) {
 	instances := make([]*core.Instance, 0, len(configs))
 	for _, cfg := range configs {
 		inst, err := xray.CreateXrayInstance(cfg)
@@ -151,7 +147,11 @@ func startXrayFullConfigs(configs []string) ([]*core.Instance, error) {
 			closeXrayInstances(instances)
 			return nil, err
 		}
-		inst.SetEgress(currentEgress())
+		if err := prepare(inst); err != nil {
+			_ = inst.Close()
+			closeXrayInstances(instances)
+			return nil, err
+		}
 		if err := inst.Start(); err != nil {
 			_ = inst.Close()
 			closeXrayInstances(instances)
@@ -162,8 +162,7 @@ func startXrayFullConfigs(configs []string) ([]*core.Instance, error) {
 	return instances, nil
 }
 
-// Tears down whichever live sidecar the profile brought up, gated or eager. Slots
-// are cleared before the close so no reader picks up a pointer that is going away.
+// Slots are cleared before the close so no reader picks up a pointer that is going away.
 func closeXray() {
 	stateMu.Lock()
 	instance, gate := xrayInstance, xrayGate
@@ -198,8 +197,7 @@ func startXrayFullGates(configs []string, idle time.Duration, prepare func(*core
 		}
 	}
 
-	// Alone, not in the fan-out below: validating a geoip/geosite config loads the
-	// geo tables the rest then share, so parallelizing it races to load them all.
+	// Alone, not in the fan-out below: the first config loads the geo tables the rest share, so parallelizing races to load them all.
 	gates[0], errs[0] = xray.StartGate(configs[0], idle, prepare)
 	if errs[0] != nil {
 		return nil, errs[0]
@@ -232,14 +230,45 @@ func startXrayFullGates(configs []string, idle time.Duration, prepare func(*core
 	return gates, nil
 }
 
+// One per start, never a package global: a probe box must not answer for the running instance.
+type boxContextHolder struct {
+	ctx atomic.Pointer[context.Context]
+}
+
+func (h *boxContextHolder) publish(box *boxbox.Box) {
+	if box == nil {
+		return
+	}
+	boxCtx := box.Context()
+	h.ctx.Store(&boxCtx)
+}
+
+func (h *boxContextHolder) get() context.Context {
+	if stored := h.ctx.Load(); stored != nil {
+		return *stored
+	}
+	return nil
+}
+
+// Must run between core.New and Start; both settings keep the instance off an active TUN.
+func xrayPreparer(dnsStrategy string, boxCtx xraydns.BoxProvider) func(*core.Instance) error {
+	return func(instance *core.Instance) error {
+		instance.SetEgress(currentEgress())
+		if dnsStrategy == "" || boxCtx == nil {
+			return nil
+		}
+		// One resolver per instance: it caches the dns-direct transport of the box it was prepared for.
+		instance.SetOutboundDNS(xraydns.New(boxCtx), xinternet.ParseDomainStrategy(dnsStrategy))
+		return nil
+	}
+}
+
 func closeXrayInstances(instances []*core.Instance) {
 	for _, inst := range instances {
 		_ = inst.Close()
 	}
 }
 
-// A throwaway core stack for one batch: a test box plus any Xray sidecars its
-// outbounds dial into. close tears them down in reverse order.
 type testEnv struct {
 	box   *boxbox.Box
 	tags  []string
@@ -248,14 +277,18 @@ type testEnv struct {
 
 // `current` measures the running instance instead of building one, and owns nothing.
 func prepareTestEnv(current bool, needXray bool, xrayConfig string, xrayFullConfigs []string,
-	coreConfig string, tags []string, useDefaultOutbound bool) (*testEnv, error) {
+	coreConfig string, tags []string, useDefaultOutbound bool,
+	xrayDNSStrategy string) (*testEnv, error) {
+
+	// Owned here, not by the caller: this builds the probe box the Xray instances below resolve through.
+	var boxCtx boxContextHolder
+	prepareXray := xrayPreparer(xrayDNSStrategy, boxCtx.get)
 
 	if current {
 		box := currentBox()
 		if box == nil {
 			return nil, errInstanceNotRunning
 		}
-		// Without a "proxy" outbound there is nothing named to measure.
 		outTags := tags
 		if _, exists := box.Outbound().Outbound("proxy"); exists {
 			outTags = []string{"proxy"}
@@ -281,10 +314,11 @@ func prepareTestEnv(current bool, needXray bool, xrayConfig string, xrayFullConf
 			unwind()
 			return nil, err
 		}
-		// Egress only (no DNS): keep test egress off an active TUN, both the
-		// route it would take and the auto_redirect that would pull it back
-		// in regardless of route. See Start().
-		instance.SetEgress(currentEgress())
+		if err = prepareXray(instance); err != nil {
+			_ = instance.Close()
+			unwind()
+			return nil, err
+		}
 		if err = instance.Start(); err != nil {
 			_ = instance.Close()
 			unwind()
@@ -293,14 +327,14 @@ func prepareTestEnv(current bool, needXray bool, xrayConfig string, xrayFullConf
 		cleanups = append(cleanups, func() { _ = instance.Close() })
 	}
 
-	fullXray, err := startXrayFullConfigs(xrayFullConfigs)
+	fullXray, err := startXrayFullConfigs(xrayFullConfigs, prepareXray)
 	if err != nil {
 		unwind()
 		return nil, err
 	}
 	cleanups = append(cleanups, func() { closeXrayInstances(fullXray) })
 
-	box, cancel, err := boxmain.Create([]byte(coreConfig))
+	box, cancel, err := boxmain.Create([]byte(coreConfig), boxCtx.publish)
 	if err != nil {
 		unwind()
 		return nil, err
@@ -370,8 +404,6 @@ func (s *server) Start(ctx context.Context, in *gen.LoadConfigReq) (out *gen.Err
 		}
 		var extraConfPath, extraCleanupPath string
 		if in.ExtraProcessConf != nil {
-			// The Core creates it in a fresh random temp file that cannot be hijacked by
-			// symlink tricks even when elevated. See CreateExtraConfig.
 			extraConfPath, extraCleanupPath, e = process.CreateExtraConfig(*in.ExtraProcessConf)
 			if e != nil {
 				err = E.Cause(e, "Failed to create extra.conf")
@@ -395,23 +427,11 @@ func (s *server) Start(ctx context.Context, in *gen.LoadConfigReq) (out *gen.Err
 
 	autoRedirectMark.Store(autoRedirectMarkFor([]byte(in.GetCoreConfig())))
 
-	dnsAddr := in.GetXrayOutboundDnsAddress()
-	dnsStrategy := in.GetXrayOutboundDnsStrategy()
-	prepareXray := func(instance *core.Instance) error {
-		instance.SetEgress(currentEgress())
-		if dnsAddr == "" {
-			return nil
-		}
-		resolver, e := xthrone.NewResolver(dnsAddr)
-		if e != nil {
-			return E.Cause(e, "failed to create Xray outbound DNS resolver")
-		}
-		instance.SetOutboundDNS(resolver, xinternet.ParseDomainStrategy(dnsStrategy))
-		return nil
-	}
+	// Filled in below, once boxmain.Create has built the box these sidecars resolve through.
+	var boxCtx boxContextHolder
+	prepareXray := xrayPreparer(in.GetXrayOutboundDnsStrategy(), boxCtx.get)
 
 	if *in.NeedXray {
-		// Published only once fully up; error paths close what they built.
 		if in.GetXrayLazyStart() {
 			gate, e := xray.StartGate(*in.XrayConfig,
 				time.Duration(in.GetXrayIdleSeconds())*time.Second, prepareXray)
@@ -451,7 +471,7 @@ func (s *server) Start(ctx context.Context, in *gen.LoadConfigReq) (out *gen.Err
 		setXrayFullGates(gates)
 	}
 
-	box, cancel, err := boxmain.Create([]byte(*in.CoreConfig))
+	box, cancel, err := boxmain.Create([]byte(*in.CoreConfig), boxCtx.publish)
 	if err != nil {
 		if extraProcess != nil {
 			extraProcess.Stop()
@@ -481,7 +501,7 @@ func (s *server) Start(ctx context.Context, in *gen.LoadConfigReq) (out *gen.Err
 			return
 		}
 
-		tunDNS := tunPrefix.Addr().Next()
+		tunDNS := tunPrefix.Addr()
 		if !tunDNS.IsValid() || !tunDNS.Is4() {
 			err = fmt.Errorf("got invalid DNS IP from tun_ipv4_cidr: %s", tunDNS)
 			stopAllCores()
@@ -533,8 +553,7 @@ func (s *server) Stop(ctx context.Context, in *gen.EmptyReq) (out *gen.ErrorResp
 	}
 
 	closeXray()
-	// The Tun and its nftables rules went down with the box above, so test
-	// instances started from here on must not carry the exemption mark.
+	// The Tun and its nftables rules went down with the box, so later test instances must not carry the exemption mark.
 	autoRedirectMark.Store(0)
 
 	return
@@ -542,8 +561,7 @@ func (s *server) Stop(ctx context.Context, in *gen.EmptyReq) (out *gen.ErrorResp
 
 func (s *server) CheckConfig(ctx context.Context, in *gen.LoadConfigReq) (out *gen.ErrorResp, _ error) {
 	out = &gen.ErrorResp{}
-	// boxmain.Check can panic on malformed configs; unrecovered it reaches main()'s
-	// os.Exit(0) and kills the core. Stack to the log, panic value to the wire.
+	// boxmain.Check can panic on malformed configs; unrecovered it reaches main()'s os.Exit(0) and kills the core.
 	defer func() {
 		if r := recover(); r != nil {
 			buf := make([]byte, 4096)
@@ -553,8 +571,6 @@ func (s *server) CheckConfig(ctx context.Context, in *gen.LoadConfigReq) (out *g
 		}
 	}()
 	if in.GetNeedXray() {
-		// Xray-format configs can't be validated by sing-box; hand them to the
-		// Xray core instead.
 		if err := xray.CheckXrayConfig(in.GetXrayConfig()); err != nil {
 			out.Error = To(err.Error())
 		}
@@ -569,7 +585,8 @@ func (s *server) CheckConfig(ctx context.Context, in *gen.LoadConfigReq) (out *g
 
 func (s *server) Test(ctx context.Context, in *gen.TestReq) (*gen.TestResp, error) {
 	env, err := prepareTestEnv(in.GetTestCurrent(), in.GetNeedXray(), in.GetXrayConfig(),
-		in.XrayFullConfigs, in.GetConfig(), in.OutboundTags, in.GetUseDefaultOutbound())
+		in.XrayFullConfigs, in.GetConfig(), in.OutboundTags, in.GetUseDefaultOutbound(),
+		in.GetXrayOutboundDnsStrategy())
 	if err != nil {
 		if errors.Is(err, errInstanceNotRunning) {
 			return &gen.TestResp{Results: []*gen.URLTestResp{{
@@ -582,17 +599,22 @@ func (s *server) Test(ctx context.Context, in *gen.TestReq) (*gen.TestResp, erro
 	}
 	defer env.close()
 
+	// Held, not re-read: StopTest rearms a fresh context, uncancelled.
+	testCtx := test_utils.TestContext()
+
 	// A muxed config needs a warm connection; the live instance already is one.
 	twice := !in.GetTestCurrent()
-	results := test_utils.BatchURLTest(test_utils.TestContext(), env.box, env.tags, in.GetUrl(),
+	results := test_utils.BatchURLTest(testCtx, env.box, env.tags, in.GetUrl(),
 		int(in.GetMaxConcurrency()), twice, time.Duration(in.GetTestTimeoutMs())*time.Millisecond)
 
 	res := make([]*gen.URLTestResp, 0, len(results))
+	failed := make(map[string]bool, len(results))
 	for idx, data := range results {
 		errStr := ""
 		if data.Error != nil {
 			errStr = data.Error.Error()
 		}
+		failed[env.tags[idx]] = errStr != ""
 		res = append(res, &gen.URLTestResp{
 			OutboundTag: To(env.tags[idx]),
 			LatencyMs:   To(int32(data.Duration.Milliseconds())),
@@ -600,7 +622,22 @@ func (s *server) Test(ctx context.Context, in *gen.TestReq) (*gen.TestResp, erro
 		})
 	}
 
-	return &gen.TestResp{Results: res}, nil
+	out := &gen.TestResp{Results: res}
+	// `defer env.close()` tears the box down on return, so this cannot wait.
+	var pending []string
+	for _, tag := range in.VpnEndpointTags {
+		if failed[tag] {
+			pending = append(pending, tag)
+		}
+	}
+	if len(pending) > 0 {
+		timeout := defaultVPNStatusTimeout
+		if ms := in.GetVpnStatusTimeoutMs(); ms > 0 {
+			timeout = time.Duration(ms) * time.Millisecond
+		}
+		out.VpnStatus = collectVPNStatus(testCtx, env.box, pending, timeout)
+	}
+	return out, nil
 }
 
 func (s *server) StopTest(ctx context.Context, in *gen.EmptyReq) (*gen.EmptyResp, error) {
@@ -629,7 +666,8 @@ func (s *server) QueryURLTest(ctx context.Context, in *gen.EmptyReq) (out *gen.Q
 func (s *server) IPTest(ctx context.Context, in *gen.IPTestRequest) (*gen.IPTestResp, error) {
 	// Always builds its own box: there is no test-current variant of an IP test.
 	env, err := prepareTestEnv(false, in.GetNeedXray(), in.GetXrayConfig(),
-		in.XrayFullConfigs, in.GetConfig(), in.OutboundTags, in.GetUseDefaultOutbound())
+		in.XrayFullConfigs, in.GetConfig(), in.OutboundTags, in.GetUseDefaultOutbound(),
+		in.GetXrayOutboundDnsStrategy())
 	if err != nil {
 		return nil, err
 	}
@@ -678,14 +716,8 @@ func (s *server) QueryStats(ctx context.Context, in *gen.EmptyReq) (out *gen.Que
 	out.Ups = make(map[string]int64)
 	out.Downs = make(map[string]int64)
 	if box := currentBox(); box != nil {
-		clash := service.FromContext[adapter.ClashServer](box.Context())
-		if clash != nil {
-			cApi, ok := clash.(*clashapi.Server)
-			if !ok {
-				log.Println("Failed to assert clash server")
-				err = E.New("invalid clash server type")
-				return
-			}
+		trafficManager := service.PtrFromContext[trafficcontrol.Manager](box.Context())
+		if trafficManager != nil {
 			outbounds := service.FromContext[adapter.OutboundManager](box.Context())
 			if outbounds == nil {
 				log.Println("Failed to get outbound manager")
@@ -699,12 +731,12 @@ func (s *server) QueryStats(ctx context.Context, in *gen.EmptyReq) (out *gen.Que
 				return
 			}
 			for _, ob := range outbounds.Outbounds() {
-				u, d := cApi.TrafficManager().TotalOutbound(ob.Tag())
+				u, d := trafficManager.TotalOutbound(ob.Tag())
 				out.Ups[ob.Tag()] = u
 				out.Downs[ob.Tag()] = d
 			}
 			for _, ep := range endpoints.Endpoints() {
-				u, d := cApi.TrafficManager().TotalOutbound(ep.Tag())
+				u, d := trafficManager.TotalOutbound(ep.Tag())
 				out.Ups[ep.Tag()] = u
 				out.Downs[ep.Tag()] = d
 			}
@@ -713,9 +745,7 @@ func (s *server) QueryStats(ctx context.Context, in *gen.EmptyReq) (out *gen.Que
 	return
 }
 
-// connMetaToProto maps one tracker's metadata into the wire type. Shared by the
-// active and closed lists so both carry identical, enriched fields.
-func connMetaToProto(c *trafficontrol.TrackerMetadata) *gen.ConnectionMetaData {
+func connMetaToProto(c *trafficcontrol.TrackerMetadata) *gen.ConnectionMetaData {
 	process := ""
 	processPath := ""
 	if c.Metadata.ProcessInfo != nil {
@@ -726,6 +756,10 @@ func connMetaToProto(c *trafficontrol.TrackerMetadata) *gen.ConnectionMetaData {
 	var closedAt int64
 	if !c.ClosedAt.IsZero() {
 		closedAt = c.ClosedAt.UnixMilli()
+	}
+	source := ""
+	if c.Metadata.Source.IsValid() {
+		source = c.Metadata.Source.String()
 	}
 	return &gen.ConnectionMetaData{
 		Id:          To(c.ID.String()),
@@ -741,25 +775,20 @@ func connMetaToProto(c *trafficontrol.TrackerMetadata) *gen.ConnectionMetaData {
 		ProcessPath: To(processPath),
 		Chain:       c.Chain,
 		ClosedAt:    To(closedAt),
+		Source:      To(source),
 	}
 }
 
-// Live connections plus the recently-closed ring, so accounting does not lose one
-// that closed between polls. Non-draining; the client dedups by id.
+// Non-draining: the recently-closed ring is re-reported every poll and the client dedups by id.
 func (s *server) QueryConnections(ctx context.Context, in *gen.EmptyReq) (*gen.QueryConnectionsResp, error) {
 	box := currentBox()
 	if box == nil {
 		return &gen.QueryConnectionsResp{}, nil
 	}
-	clashServer := service.FromContext[adapter.ClashServer](box.Context())
-	if clashServer == nil {
-		return &gen.QueryConnectionsResp{}, errors.New("no clash server found")
+	tm := service.PtrFromContext[trafficcontrol.Manager](box.Context())
+	if tm == nil {
+		return &gen.QueryConnectionsResp{}, errors.New("no traffic manager found")
 	}
-	clash, ok := clashServer.(*clashapi.Server)
-	if !ok {
-		return &gen.QueryConnectionsResp{}, errors.New("invalid state, should not be here")
-	}
-	tm := clash.TrafficManager()
 
 	active := make([]*gen.ConnectionMetaData, 0)
 	for _, c := range tm.Connections() {
@@ -770,6 +799,36 @@ func (s *server) QueryConnections(ctx context.Context, in *gen.EmptyReq) (*gen.Q
 		closed = append(closed, connMetaToProto(c))
 	}
 	return &gen.QueryConnectionsResp{Active: active, Closed: closed}, nil
+}
+
+// Ids that already closed are a silent no-op: the client's table is always a poll behind.
+func (s *server) CloseConnections(ctx context.Context, in *gen.CloseConnectionsRequest) (*gen.CloseConnectionsResponse, error) {
+	if len(in.Ids) == 0 {
+		return &gen.CloseConnectionsResponse{Closed: To(int32(0))}, nil
+	}
+	box := currentBox()
+	if box == nil {
+		return &gen.CloseConnectionsResponse{Error: To("no instance is running")}, nil
+	}
+	tm := service.PtrFromContext[trafficcontrol.Manager](box.Context())
+	if tm == nil {
+		return &gen.CloseConnectionsResponse{Error: To("no traffic manager found")}, nil
+	}
+
+	var closed int32
+	for _, raw := range in.Ids {
+		id, err := uuid.FromString(raw)
+		if err != nil {
+			continue
+		}
+		tracker := tm.Connection(id)
+		if tracker == nil {
+			continue
+		}
+		tracker.Close() //nolint:errcheck — the tracker leaves the manager either way
+		closed++
+	}
+	return &gen.CloseConnectionsResponse{Closed: To(closed)}, nil
 }
 
 func (s *server) IsPrivileged(ctx context.Context, _ *gen.EmptyReq) (*gen.IsPrivilegedResponse, error) {
@@ -788,7 +847,8 @@ func (s *server) SpeedTest(ctx context.Context, in *gen.SpeedTestRequest) (*gen.
 	}
 
 	env, err := prepareTestEnv(in.GetTestCurrent(), in.GetNeedXray(), in.GetXrayConfig(),
-		in.XrayFullConfigs, in.GetConfig(), in.OutboundTags, in.GetUseDefaultOutbound())
+		in.XrayFullConfigs, in.GetConfig(), in.OutboundTags, in.GetUseDefaultOutbound(),
+		in.GetXrayOutboundDnsStrategy())
 	if err != nil {
 		if errors.Is(err, errInstanceNotRunning) {
 			return &gen.SpeedTestResponse{Results: []*gen.SpeedTestResult{{
@@ -839,4 +899,106 @@ func (s *server) GenWgKeyPair(ctx context.Context, _ *gen.EmptyReq) (out *gen.Ge
 	res.PrivateKey = To(privateKey.String())
 	res.PublicKey = To(privateKey.PublicKey().String())
 	return &res, nil
+}
+
+func (s *server) InstallDashboard(ctx context.Context, in *gen.InstallDashboardRequest) (*gen.ErrorResp, error) {
+	archivePath := in.GetArchivePath()
+	targetDir := in.GetTargetDir()
+	if archivePath == "" || targetDir == "" {
+		return &gen.ErrorResp{Error: To("missing archive path or target dir")}, nil
+	}
+
+	reader, err := zip.OpenReader(archivePath)
+	if err != nil {
+		return &gen.ErrorResp{Error: To(E.Cause(err, "open dashboard archive").Error())}, nil
+	}
+	defer reader.Close()
+
+	trimDir := zipIsInSingleDirectory(reader.File)
+	tempDir := targetDir + ".tmp"
+	if err = os.RemoveAll(tempDir); err != nil {
+		return &gen.ErrorResp{Error: To(err.Error())}, nil
+	}
+	if err = os.MkdirAll(tempDir, 0o755); err != nil {
+		return &gen.ErrorResp{Error: To(err.Error())}, nil
+	}
+
+	failed := func(err error) (*gen.ErrorResp, error) {
+		os.RemoveAll(tempDir)
+		return &gen.ErrorResp{Error: To(err.Error())}, nil
+	}
+	var extracted int
+	for _, file := range reader.File {
+		if file.FileInfo().IsDir() {
+			continue
+		}
+		elements := strings.Split(file.Name, "/")
+		if trimDir {
+			elements = elements[1:]
+		}
+		if len(elements) == 0 {
+			continue
+		}
+		relativePath := filepath.Join(elements...)
+		if !filepath.IsLocal(relativePath) {
+			return failed(E.New("invalid dashboard archive entry: ", file.Name))
+		}
+		savePath := filepath.Join(tempDir, relativePath)
+		if err = os.MkdirAll(filepath.Dir(savePath), 0o755); err != nil {
+			return failed(err)
+		}
+		if err = extractZipEntry(file, savePath); err != nil {
+			return failed(err)
+		}
+		extracted++
+	}
+	if extracted == 0 {
+		return failed(E.New("dashboard archive is empty"))
+	}
+	if err = adoptExtracted(tempDir); err != nil {
+		return failed(E.Cause(err, "hand the dashboard files to the invoking user"))
+	}
+
+	if err = os.RemoveAll(targetDir); err != nil {
+		return failed(err)
+	}
+	if err = os.Rename(tempDir, targetDir); err != nil {
+		return failed(err)
+	}
+	return &gen.ErrorResp{}, nil
+}
+
+func extractZipEntry(file *zip.File, savePath string) error {
+	reader, err := file.Open()
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+	writer, err := os.Create(savePath)
+	if err != nil {
+		return err
+	}
+	defer writer.Close()
+	_, err = io.Copy(writer, reader)
+	return err
+}
+
+// GitHub archives wrap every file under a single "<repo>-<branch>/" top-level directory.
+func zipIsInSingleDirectory(files []*zip.File) bool {
+	var dirName string
+	for _, file := range files {
+		if file.FileInfo().IsDir() {
+			continue
+		}
+		elements := strings.Split(file.Name, "/")
+		if len(elements) < 2 {
+			return false
+		}
+		if dirName == "" {
+			dirName = elements[0]
+		} else if dirName != elements[0] {
+			return false
+		}
+	}
+	return dirName != ""
 }

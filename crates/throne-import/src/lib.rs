@@ -13,14 +13,14 @@ mod route_share;
 
 use throne_domain::{ParsedOutbound, ProfileType, RouteProfile};
 
-pub use deeplink::{Deeplink, parse_deeplink};
+pub use deeplink::{parse_deeplink, Deeplink};
 pub use fetch::{
-    DeviceDetails, FetchOptions, FetchResponse, device_details, fetch_url,
-    fetch_url_with_options, fetch_url_with_timeout, hwid_headers,
+    device_details, fetch_url, fetch_url_with_options, fetch_url_with_timeout, hwid_headers,
+    DeviceDetails, FetchOptions, FetchResponse,
 };
 pub use links::parse_share_link;
 pub use route_share::{
-    RouteImportReport, import_route_payload, to_share_link, to_share_object, try_import_routes,
+    import_route_payload, to_share_link, to_share_object, try_import_routes, RouteImportReport,
 };
 
 #[derive(Debug, Clone)]
@@ -29,12 +29,8 @@ pub struct SubscriptionImport {
     pub user_info: Option<String>,
 }
 
-pub fn import_subscription_response(
-    response: FetchResponse,
-) -> Result<SubscriptionImport, String> {
-    let user_info = response
-        .header("Subscription-UserInfo")
-        .map(str::to_string);
+pub fn import_subscription_response(response: FetchResponse) -> Result<SubscriptionImport, String> {
+    let user_info = response.header("Subscription-UserInfo").map(str::to_string);
     let report = import_text(&response.body);
     if !report.errors.is_empty() {
         return Err(format!(
@@ -48,7 +44,9 @@ pub fn import_subscription_response(
         } else {
             report.errors.join("; ")
         };
-        return Err(format!("subscription contained no usable profiles: {detail}"));
+        return Err(format!(
+            "subscription contained no usable profiles: {detail}"
+        ));
     }
     Ok(SubscriptionImport { report, user_info })
 }
@@ -58,10 +56,7 @@ pub fn import_from_url(url: &str) -> ImportReport {
     match fetch_url(url) {
         Ok(body) => {
             let mut report = import_text(&body);
-            if report.profiles.is_empty()
-                && report.routes.is_empty()
-                && report.errors.is_empty()
-            {
+            if report.profiles.is_empty() && report.routes.is_empty() && report.errors.is_empty() {
                 report
                     .errors
                     .push("fetched body but no profiles/routes recognized".into());
@@ -166,6 +161,11 @@ fn import_text_inner(trimmed: &str) -> ImportReport {
         };
     }
 
+    // Amnezia vpn:// container (1.3.0-beta.2)
+    if trimmed.to_ascii_lowercase().starts_with("vpn://") {
+        return import_vpn_scheme(trimmed);
+    }
+
     // WireGuard conf file
     if trimmed.contains("[Interface]") && trimmed.contains("[Peer]") {
         if let Some(p) = parse_wireguard_file(trimmed) {
@@ -246,6 +246,13 @@ fn import_lines(text: &str) -> ImportReport {
             continue;
         }
         // Nested JSON object line
+        if line.to_ascii_lowercase().starts_with("vpn://") {
+            let inner = import_vpn_scheme(line);
+            report.profiles.extend(inner.profiles);
+            report.errors.extend(inner.errors);
+            report.skipped += inner.skipped;
+            continue;
+        }
         if line.starts_with('{') {
             if let Some(list) = json_sub::try_import_json(line) {
                 report.profiles.extend(list);
@@ -266,53 +273,155 @@ fn import_lines(text: &str) -> ImportReport {
     report
 }
 
-fn parse_wireguard_file(text: &str) -> Option<ImportedProfile> {
+pub(crate) fn parse_wireguard_file(text: &str) -> Option<ImportedProfile> {
     let mut private_key = None;
     let mut address = None;
     let mut public_key = None;
     let mut endpoint = None;
-    let mut section = "";
+    let mut preshared = None;
     for line in text.lines() {
         let line = line.trim();
-        if line.starts_with('[') {
-            section = line;
+        if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
             continue;
         }
-        if let Some((k, v)) = line.split_once('=') {
-            let k = k.trim().to_ascii_lowercase();
-            let v = v.trim().to_string();
-            match (section, k.as_str()) {
-                ("[Interface]", "privatekey") => private_key = Some(v),
-                ("[Interface]", "address") => address = Some(v),
-                ("[Peer]", "publickey") => public_key = Some(v),
-                ("[Peer]", "endpoint") => endpoint = Some(v),
-                _ => {}
-            }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let k = k.trim().to_ascii_lowercase().replace('_', "");
+        let v = v.trim().to_string();
+        match k.as_str() {
+            "privatekey" => private_key = Some(v),
+            "address" => address = Some(v.replace(' ', "")),
+            "publickey" => public_key = Some(v),
+            "presharedkey" | "psk" => preshared = Some(v),
+            "endpoint" => endpoint = Some(v),
+            _ => {}
         }
     }
     let endpoint = endpoint?;
     let (host, port) = match endpoint.rsplit_once(':') {
-        Some((h, p)) => (h.trim_matches('[').trim_matches(']').to_string(), p.parse().ok()?),
+        Some((h, p)) => (
+            h.trim().trim_matches('[').trim_matches(']').to_string(),
+            p.trim().parse().ok().filter(|n| *n > 0).unwrap_or(51820),
+        ),
         None => return None,
     };
+    let private_key = private_key.filter(|s| !s.is_empty())?;
+    let public_key = public_key.filter(|s| !s.is_empty())?;
     let name = "WireGuard".to_string();
-    let mut outbound = ParsedOutbound {
+    let outbound = ParsedOutbound {
         tag: Some(name.clone()),
         server: Some(host),
         server_port: Some(port),
-        password: private_key,
-        username: public_key,
+        password: Some(private_key),
+        username: Some(public_key),
+        method: preshared,
         path: address,
         raw_json: Some(text.to_string()),
         ..Default::default()
     };
-    outbound.raw_json = Some(text.to_string());
     Some(ImportedProfile {
         name,
         profile_type: ProfileType::Wireguard,
         outbound,
         source: "wg-conf".into(),
     })
+}
+
+/// Amnezia `vpn://` payload: percent-decode + base64, then JSON containers or a conf body.
+fn import_vpn_scheme(link: &str) -> ImportReport {
+    let after = link
+        .trim()
+        .get(6..)
+        .unwrap_or("")
+        .split('#')
+        .next()
+        .unwrap_or("");
+    let decoded = percent_decode_bytes(after);
+    let bytes = decode::decode_b64_bytes(&decoded).or_else(|| decode::decode_b64_bytes(after));
+    let Some(bytes) = bytes else {
+        return ImportReport {
+            errors: vec!["vpn:// payload is not valid base64".into()],
+            skipped: 1,
+            ..Default::default()
+        };
+    };
+    let bytes = maybe_quncompress(&bytes);
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+        let mut report = ImportReport::default();
+        report.notes.push("vpn://".into());
+        collect_vpn_containers(&v, &mut report);
+        if report.profiles.is_empty() && report.errors.is_empty() {
+            report.errors.push("vpn:// JSON had no configs".into());
+        }
+        return report;
+    }
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let mut report = import_text_inner(text.trim());
+    report.notes.insert(0, "vpn://".into());
+    report
+}
+
+/// Qt `qUncompress`: 4-byte big-endian size prefix + zlib. Also try raw zlib.
+fn maybe_quncompress(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Read;
+    if bytes.len() > 4 {
+        let mut dec = flate2::read::ZlibDecoder::new(&bytes[4..]);
+        let mut out = Vec::new();
+        if dec.read_to_end(&mut out).is_ok() && !out.is_empty() {
+            return out;
+        }
+    }
+    let mut dec = flate2::read::ZlibDecoder::new(bytes);
+    let mut out = Vec::new();
+    if dec.read_to_end(&mut out).is_ok() && !out.is_empty() {
+        return out;
+    }
+    bytes.to_vec()
+}
+
+fn percent_decode_bytes(s: &str) -> String {
+    urlencoding::decode(s)
+        .map(|c| c.into_owned())
+        .unwrap_or_else(|_| s.to_string())
+}
+
+fn collect_vpn_containers(v: &serde_json::Value, report: &mut ImportReport) {
+    let Some(containers) = v.get("containers").and_then(|c| c.as_array()) else {
+        return;
+    };
+    for c in containers {
+        let Some(obj) = c.as_object() else { continue };
+        for proto in obj.values() {
+            let conf = proto
+                .get("last_config")
+                .and_then(vpn_last_config_text)
+                .unwrap_or_default();
+            let conf = conf.trim();
+            if conf.is_empty() {
+                continue;
+            }
+            let inner = import_text_inner(conf);
+            report.profiles.extend(inner.profiles);
+            report.errors.extend(inner.errors);
+            report.skipped += inner.skipped;
+        }
+    }
+}
+
+fn vpn_last_config_text(v: &serde_json::Value) -> Option<String> {
+    if let Some(s) = v.as_str() {
+        if let Ok(inner) = serde_json::from_str::<serde_json::Value>(s) {
+            if let Some(cfg) = inner.get("config").and_then(|c| c.as_str()) {
+                return Some(cfg.to_string());
+            }
+        }
+        return Some(s.to_string());
+    }
+    v.as_object()
+        .and_then(|o| o.get("config"))
+        .and_then(|c| c.as_str())
+        .map(|s| s.to_string())
 }
 
 #[cfg(test)]
@@ -342,7 +451,8 @@ mod tests {
     #[test]
     fn subscription_response_rejects_partial_parse_to_protect_existing_snapshot() {
         let response = FetchResponse {
-            body: "vless://11111111-1111-1111-1111-111111111111@example.com:443#Demo\nnot-a-link".into(),
+            body: "vless://11111111-1111-1111-1111-111111111111@example.com:443#Demo\nnot-a-link"
+                .into(),
             headers: Vec::new(),
         };
 
@@ -356,7 +466,10 @@ mod tests {
         assert_eq!(r.ok_count(), 1);
         assert_eq!(r.profiles[0].profile_type, ProfileType::Vless);
         assert_eq!(r.profiles[0].name, "Demo-VLESS");
-        assert_eq!(r.profiles[0].outbound.server.as_deref(), Some("example.com"));
+        assert_eq!(
+            r.profiles[0].outbound.server.as_deref(),
+            Some("example.com")
+        );
         assert_eq!(r.profiles[0].outbound.server_port, Some(443));
     }
 
@@ -380,7 +493,82 @@ not-a-link
         assert_eq!(r.ok_count(), 1);
         assert_eq!(r.profiles[0].profile_type, ProfileType::Shadowsocks);
         assert_eq!(r.profiles[0].outbound.password.as_deref(), Some("p@ss"));
-        assert_eq!(r.profiles[0].outbound.method.as_deref(), Some("aes-256-gcm"));
+        assert_eq!(
+            r.profiles[0].outbound.method.as_deref(),
+            Some("aes-256-gcm")
+        );
+    }
+
+    #[test]
+    fn import_wireguard_link_and_ini() {
+        let link = "wireguard://pk@10.1.1.1:51820?public_key=pubk&address=10.0.0.2/32#WG1";
+        let r = import_text(link);
+        assert_eq!(r.ok_count(), 1);
+        assert_eq!(r.profiles[0].profile_type, ProfileType::Wireguard);
+        assert_eq!(r.profiles[0].outbound.server.as_deref(), Some("10.1.1.1"));
+        assert_eq!(r.profiles[0].outbound.server_port, Some(51820));
+        assert_eq!(r.profiles[0].outbound.password.as_deref(), Some("pk"));
+        assert_eq!(r.profiles[0].outbound.username.as_deref(), Some("pubk"));
+        let json: serde_json::Value =
+            serde_json::from_str(&r.profiles[0].outbound.to_db_json(ProfileType::Wireguard))
+                .unwrap();
+        assert_eq!(json["private_key"], "pk");
+        assert_eq!(json["peer_public_key"], "pubk");
+        assert_eq!(json["local_address"][0], "10.0.0.2/32");
+
+        let ini = "[Interface]\nPrivateKey = aaa\nAddress = 10.0.0.2/32\n[Peer]\nPublicKey = bbb\nPresharedKey = psk\nEndpoint = example.com:51820\n";
+        let r = import_text(ini);
+        assert_eq!(r.ok_count(), 1);
+        assert_eq!(r.profiles[0].outbound.username.as_deref(), Some("bbb"));
+        assert_eq!(r.profiles[0].outbound.method.as_deref(), Some("psk"));
+        let json: serde_json::Value =
+            serde_json::from_str(&r.profiles[0].outbound.to_db_json(ProfileType::Wireguard))
+                .unwrap();
+        assert_eq!(json["private_key"], "aaa");
+        assert_eq!(json["peer_public_key"], "bbb");
+        assert_eq!(json["pre_shared_key"], "psk");
+    }
+
+    #[test]
+    fn import_vpn_scheme_json_container() {
+        let inner = serde_json::json!({
+            "containers": [{
+                "awg": {
+                    "last_config": "[Interface]\nPrivateKey = aaa\nAddress = 10.0.0.2/32\n[Peer]\nPublicKey = bbb\nEndpoint = 1.2.3.4:51820\n"
+                }
+            }]
+        });
+        let b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            inner.to_string().as_bytes(),
+        );
+        let r = import_text(&format!("vpn://{b64}"));
+        assert_eq!(r.ok_count(), 1, "{:?}", r.errors);
+        assert_eq!(r.profiles[0].profile_type, ProfileType::Wireguard);
+    }
+
+    #[test]
+    fn import_vless_finalmask_query() {
+        let link = "vless://11111111-1111-1111-1111-111111111111@example.com:443?encryption=none&security=tls&fm=%7B%22k%22%3A1%7D#FM";
+        let r = import_text(link);
+        assert_eq!(r.ok_count(), 1);
+        assert_eq!(
+            r.profiles[0].outbound.finalmask.as_deref(),
+            Some(r#"{"k":1}"#)
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&r.profiles[0].outbound.to_db_json(ProfileType::Vless)).unwrap();
+        assert_eq!(json["finalmask"]["k"], 1);
+    }
+
+    #[test]
+    fn import_snell_link() {
+        let link = "snell://psk@example.com:440?version=4#Node";
+        let r = import_text(link);
+        assert_eq!(r.ok_count(), 1);
+        assert_eq!(r.profiles[0].profile_type, ProfileType::Snell);
+        assert_eq!(r.profiles[0].outbound.password.as_deref(), Some("psk"));
+        assert_eq!(r.profiles[0].outbound.method.as_deref(), Some("4"));
     }
 
     #[test]

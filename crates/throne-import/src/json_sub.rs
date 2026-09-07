@@ -116,9 +116,7 @@ fn import_singbox(doc: &Value, kind: SingBoxKind, raw: &str) -> Vec<ImportedProf
             // Full custom config fallback
             vec![custom_profile("Sing-box config", raw, true)]
         }
-        SingBoxKind::OutboundObject => outbound_from_singbox(doc)
-            .into_iter()
-            .collect(),
+        SingBoxKind::OutboundObject => outbound_from_singbox(doc).into_iter().collect(),
         SingBoxKind::OutboundArray => doc
             .as_array()
             .into_iter()

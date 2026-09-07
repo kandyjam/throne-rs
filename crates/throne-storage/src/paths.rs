@@ -105,19 +105,25 @@ pub fn discover_throne_databases() -> Vec<PathBuf> {
     for base in app_config_bases() {
         push(base.join("Throne").join("config").join("throne.db"));
         push(base.join("Throne").join("throne.db"));
-        push(base.join("throneproj").join("Throne").join("config").join("throne.db"));
-        push(base.join("config").join("Throne").join("config").join("throne.db"));
+        push(
+            base.join("throneproj")
+                .join("Throne")
+                .join("config")
+                .join("throne.db"),
+        );
+        push(
+            base.join("config")
+                .join("Throne")
+                .join("config")
+                .join("throne.db"),
+        );
     }
 
     // 4) macOS Application Support (packaged NKR_CPP_USE_APPDATA style)
     if let Some(home) = dirs::home_dir() {
-        push(
-            home.join("Library/Application Support/Throne/config/throne.db"),
-        );
+        push(home.join("Library/Application Support/Throne/config/throne.db"));
         push(home.join("Library/Application Support/Throne/throne.db"));
-        push(
-            home.join("Library/Preferences/Throne/config/throne.db"),
-        );
+        push(home.join("Library/Preferences/Throne/config/throne.db"));
         // Linux XDG
         push(home.join(".config/Throne/config/throne.db"));
         push(home.join(".config/Throne/throne.db"));

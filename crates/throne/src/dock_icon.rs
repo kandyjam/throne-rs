@@ -179,7 +179,14 @@ mod macos {
 }
 
 /// Switch Dock icon for light/dark at the stock Dock tile size.
-pub fn apply_for_scheme(is_dark: bool) {
+///
+/// When `follow_status` is false (upstream `follow_status_in_taskbar`), leave
+/// the stock icon alone.
+pub fn apply_for_scheme(is_dark: bool, follow_status: bool) {
+    if !follow_status {
+        APPLIED.store(-1, Ordering::Relaxed);
+        return;
+    }
     let tag: i8 = if is_dark { 1 } else { 0 };
     if APPLIED.load(Ordering::Relaxed) == tag {
         return;

@@ -111,6 +111,8 @@ pub enum Dialog {
         sub_send_hwid: bool,
         sub_auto_update_enable: bool,
         route_auto_update_enable: bool,
+        /// Register `throne://` at startup (1.3.0-beta.2).
+        url_scheme_auto_register: bool,
         /// Active tab (Common / Subscription).
         tab: BasicSettingsTab,
         /// Which field is focused for keyboard edit: 0 addr 1 port 2 test 3 rdns 4 ddns 5 log
@@ -143,6 +145,7 @@ pub enum Dialog {
         vpn_strict_route: bool,
         /// When true, private ranges are NOT excluded from TUN (upstream flag name).
         disable_private_range_bypass: bool,
+        vpn_l3_bridge: bool,
         focus_mtu: bool,
     },
     HotkeySettings {
@@ -212,6 +215,7 @@ impl Dialog {
             sub_send_hwid: s.sub_send_hwid,
             sub_auto_update_enable: s.sub_auto_update_enabled(),
             route_auto_update_enable: s.route_auto_update_enabled(),
+            url_scheme_auto_register: s.url_scheme_auto_register,
             tab: BasicSettingsTab::Common,
             focus: 0,
         }
@@ -260,6 +264,7 @@ impl Dialog {
             vpn_mtu: s.vpn_mtu.to_string(),
             vpn_strict_route: s.vpn_strict_route,
             disable_private_range_bypass: s.disable_private_range_bypass,
+            vpn_l3_bridge: s.vpn_l3_bridge,
             focus_mtu: true,
         }
     }
@@ -329,6 +334,7 @@ pub enum BasicSubToggle {
     SubSendHwid,
     SubAutoUpdate,
     RouteAutoUpdate,
+    UrlSchemeAutoRegister,
 }
 
 /// Build basic settings body with real gpui-component Inputs.
@@ -360,6 +366,7 @@ pub fn basic_settings_body(
     sub_send_hwid: bool,
     sub_auto_update_enable: bool,
     route_auto_update_enable: bool,
+    url_scheme_auto_register: bool,
     on_set_tab: impl Fn(BasicSettingsTab, &mut Window, &mut App) + 'static,
     on_cycle_mirror: impl Fn(&mut Window, &mut App) + 'static,
     on_toggle_adblock: impl Fn(&mut Window, &mut App) + 'static,
@@ -429,6 +436,15 @@ pub fn basic_settings_body(
                 .child(group_panel("Inbound Settings", inbound))
                 .child(group_panel("Testing", testing))
                 .child(group_panel("Other", extras))
+                .child(group_panel(
+                    "URL Scheme",
+                    toggle(
+                        "bs-url-scheme",
+                        "Register throne:// links at startup",
+                        url_scheme_auto_register,
+                        BasicSubToggle::UrlSchemeAutoRegister,
+                    ),
+                ))
                 .into_any_element()
         }
         // Upstream Subscription tab grid order (dialog_basic_settings.ui tab_3).
@@ -859,7 +875,8 @@ fn group_subscription_metadata(group: &throne_domain::Group) -> Option<String> {
 }
 
 /// Scrollable diff text for the SubscriptionDiff alert dialog.
-/// Footer Close comes from gpui-component [`Dialog::alert`].
+/// Footer Close is attached via `confirm_dialog_footer` (gpui-component 0.6
+/// no longer paints `button_props` as a footer).
 pub fn subscription_diff_body(body: &str) -> impl IntoElement {
     div()
         .id("sub-diff-scroll")
@@ -1198,10 +1215,13 @@ fn detect_hint(text: &str) -> &'static str {
 
 pub fn tun_settings_body(
     mtu_input: &Entity<InputState>,
+    ranges_input: &Entity<InputState>,
     vpn_strict_route: bool,
     disable_private_range_bypass: bool,
+    vpn_l3_bridge: bool,
     on_toggle_strict: impl Fn(&mut Window, &mut App) + 'static,
     on_toggle_bypass: impl Fn(&mut Window, &mut App) + 'static,
+    on_toggle_l3: impl Fn(&mut Window, &mut App) + 'static,
     on_save: impl Fn(&mut Window, &mut App) + 'static,
     on_cancel: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
@@ -1215,17 +1235,24 @@ pub fn tun_settings_body(
              (same as upstream Throne; empty Local DNS + Tun will fail to start).",
         ))
         .child(input_field_row("MTU", mtu_input, 140.))
+        .child(input_field_row("Private ranges", ranges_input, 140.))
         .child(div().mb_2().child(mode_switch(
             "tun-strict",
             "Strict route",
             vpn_strict_route,
             move |_, w, cx| on_toggle_strict(w, cx),
         )))
-        .child(div().mb_3().child(mode_switch(
+        .child(div().mb_2().child(mode_switch(
             "tun-bypass",
             "Bypass private LAN ranges (recommended)",
             !disable_private_range_bypass,
             move |_, w, cx| on_toggle_bypass(w, cx),
+        )))
+        .child(div().mb_3().child(mode_switch(
+            "tun-l3",
+            "L3 bridge (Linux)",
+            vpn_l3_bridge,
+            move |_, w, cx| on_toggle_l3(w, cx),
         )))
         .child(dialog_actions(
             "tun-cancel",

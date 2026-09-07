@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use thiserror::Error;
 
 use crate::auto_selector::{
-    AutoSelectorConfig, AutoSelectorPlan, plan_auto_selector, profile_auto_selector,
-    rerank_auto_selector_pool,
+    plan_auto_selector, profile_auto_selector, rerank_auto_selector_pool, AutoSelectorConfig,
+    AutoSelectorPlan,
 };
 use crate::models::{
     AppSettings, CoreStatus, Group, GroupId, ParsedOutbound, Profile, ProfileId, ProfileType,
@@ -193,7 +193,11 @@ impl AppState {
         if self.log_lines.is_empty() {
             self.status_message.clone()
         } else {
-            self.log_lines.iter().cloned().collect::<Vec<_>>().join("\n")
+            self.log_lines
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
         }
     }
 
@@ -597,14 +601,16 @@ impl AppState {
     }
 
     /// Plan membership for an Auto Selector profile.
-    pub fn plan_auto_selector_profile(&self, profile_id: ProfileId) -> Result<AutoSelectorPlan, StoreError> {
+    pub fn plan_auto_selector_profile(
+        &self,
+        profile_id: ProfileId,
+    ) -> Result<AutoSelectorPlan, StoreError> {
         let profile = self
             .profiles
             .get(&profile_id)
             .ok_or(StoreError::ProfileNotFound(profile_id))?;
-        let cfg = profile_auto_selector(profile).ok_or_else(|| {
-            StoreError::Msg("Profile is not an Auto Selector".into())
-        })?;
+        let cfg = profile_auto_selector(profile)
+            .ok_or_else(|| StoreError::Msg("Profile is not an Auto Selector".into()))?;
         let group = self.groups.get(&cfg.gid);
         Ok(plan_auto_selector(profile, &cfg, group, |id| {
             self.profiles.get(&id).cloned()
@@ -612,22 +618,21 @@ impl AppState {
     }
 
     /// Persist ranked pool after URL testing members of an Auto Selector.
-    pub fn rerank_auto_selector(&mut self, profile_id: ProfileId) -> Result<Vec<ProfileId>, StoreError> {
+    pub fn rerank_auto_selector(
+        &mut self,
+        profile_id: ProfileId,
+    ) -> Result<Vec<ProfileId>, StoreError> {
         let profile = self
             .profiles
             .get(&profile_id)
             .ok_or(StoreError::ProfileNotFound(profile_id))?
             .clone();
-        let mut cfg = profile_auto_selector(&profile).ok_or_else(|| {
-            StoreError::Msg("Profile is not an Auto Selector".into())
-        })?;
+        let mut cfg = profile_auto_selector(&profile)
+            .ok_or_else(|| StoreError::Msg("Profile is not an Auto Selector".into()))?;
         let group = self.groups.get(&cfg.gid).cloned();
-        let ranked = rerank_auto_selector_pool(
-            &mut cfg,
-            profile_id,
-            group.as_ref(),
-            |id| self.profiles.get(&id).cloned(),
-        );
+        let ranked = rerank_auto_selector_pool(&mut cfg, profile_id, group.as_ref(), |id| {
+            self.profiles.get(&id).cloned()
+        });
         if let Some(p) = self.profiles.get_mut(&profile_id) {
             p.outbound_json = cfg.to_outbound_json();
             p.outbound.raw_json = Some(p.outbound_json.clone());
@@ -659,13 +664,10 @@ impl AppState {
             .profiles
             .get(&profile_id)
             .ok_or(StoreError::ProfileNotFound(profile_id))?;
-        let cfg = profile_auto_selector(profile).ok_or_else(|| {
-            StoreError::Msg("Profile is not an Auto Selector".into())
-        })?;
+        let cfg = profile_auto_selector(profile)
+            .ok_or_else(|| StoreError::Msg("Profile is not an Auto Selector".into()))?;
         let group = self.groups.get(&cfg.gid);
-        let plan = plan_auto_selector(profile, &cfg, group, |id| {
-            self.profiles.get(&id).cloned()
-        });
+        let plan = plan_auto_selector(profile, &cfg, group, |id| self.profiles.get(&id).cloned());
         if let Some(err) = &plan.error {
             return Err(StoreError::Msg(err.clone()));
         }
@@ -787,14 +789,29 @@ impl AppState {
 
     /// Inbound summary for `label_inbound`.
     ///
-    /// Upstream: `Mixed: {DisplayAddress(inbound_address, port)}` — show the
-    /// stored listen host, including `::` / `0.0.0.0` when Allow LAN is on.
-    /// IPv6 hosts are bracket-wrapped (`[::]:2080`) like `WrapIPV6Host`.
+    /// Upstream 1.3.0-beta.2: a wildcard bind is not dialable, so show the
+    /// default-route LAN address when one is known.
     pub fn inbound_label(&self) -> String {
+        let lan = if crate::local_network::lan_inbound_is_wildcard(&self.settings.inbound_address) {
+            crate::local_network::lan_address()
+        } else {
+            None
+        };
+        self.inbound_label_for(lan)
+    }
+
+    /// `lan = None` keeps the stored listen host (used by tests).
+    pub fn inbound_label_for(&self, lan: Option<String>) -> String {
         let s = &self.settings;
         let raw = s.inbound_address.trim();
         let host = if raw.is_empty() { "127.0.0.1" } else { raw };
-        let display = display_listen_address(host, s.inbound_socks_port);
+        let display_host = if crate::local_network::lan_inbound_is_wildcard(host) {
+            lan.filter(|a| !a.is_empty())
+                .unwrap_or_else(|| host.to_string())
+        } else {
+            host.to_string()
+        };
+        let display = display_listen_address(&display_host, s.inbound_socks_port);
         format!("Mixed: {display}")
     }
 
@@ -912,8 +929,7 @@ impl AppState {
         self.profiles
             .retain(|_, p| self.groups.contains_key(&p.group_id));
         for g in self.groups.values_mut() {
-            g.profile_ids
-                .retain(|id| self.profiles.contains_key(id));
+            g.profile_ids.retain(|id| self.profiles.contains_key(id));
         }
         self.active_group_id = self.group_order.first().copied().unwrap_or(0);
         self.selected_profile_id = self
@@ -976,8 +992,7 @@ impl AppState {
         }
         // Keep each group's profile_ids list aligned with live profiles.
         for g in self.groups.values_mut() {
-            g.profile_ids
-                .retain(|id| self.profiles.contains_key(id));
+            g.profile_ids.retain(|id| self.profiles.contains_key(id));
         }
         for (id, p) in &self.profiles {
             if let Some(g) = self.groups.get_mut(&p.group_id) {
@@ -1093,7 +1108,11 @@ impl AppState {
     }
 
     /// Replace rules/raw body of a route after remote fetch / import.
-    pub fn replace_route_content(&mut self, id: i64, incoming: RouteProfile) -> Result<(), StoreError> {
+    pub fn replace_route_content(
+        &mut self,
+        id: i64,
+        incoming: RouteProfile,
+    ) -> Result<(), StoreError> {
         let label = {
             let r = self
                 .routes
@@ -1252,6 +1271,8 @@ impl AppState {
         vpn_strict_route: bool,
         disable_private_range_bypass: bool,
         vpn_tun_ipv4_cidr: Option<String>,
+        vpn_private_ranges: Option<Vec<String>>,
+        vpn_l3_bridge: Option<bool>,
     ) {
         self.settings.vpn_mtu = vpn_mtu.clamp(1280, 65535);
         self.settings.vpn_strict_route = vpn_strict_route;
@@ -1262,12 +1283,19 @@ impl AppState {
                 self.settings.vpn_tun_ipv4_cidr = t.to_string();
             }
         }
+        if let Some(ranges) = vpn_private_ranges {
+            self.settings.vpn_private_ranges = ranges;
+        }
+        if let Some(l3) = vpn_l3_bridge {
+            self.settings.vpn_l3_bridge = l3;
+        }
         self.push_log(format!(
-            "Tun settings · mtu={} strict={} bypass_private={} addr={}",
+            "Tun settings · mtu={} strict={} bypass_private={} addr={} ranges={}",
             self.settings.vpn_mtu,
             vpn_strict_route,
             !disable_private_range_bypass,
-            self.settings.vpn_tun_ipv4_cidr
+            self.settings.vpn_tun_ipv4_cidr,
+            self.settings.vpn_private_ranges.len()
         ));
     }
 
@@ -1389,13 +1417,7 @@ impl AppState {
         }
     }
 
-    pub fn set_profile_speeds(
-        &mut self,
-        id: ProfileId,
-        dl: &str,
-        ul: &str,
-        latency_ms: i32,
-    ) {
+    pub fn set_profile_speeds(&mut self, id: ProfileId, dl: &str, ul: &str, latency_ms: i32) {
         if let Some(p) = self.profiles.get_mut(&id) {
             p.download_speed = dl.to_string();
             p.upload_speed = ul.to_string();
@@ -1461,8 +1483,7 @@ impl AppState {
         let Some(g) = self.groups.get(&group_id) else {
             return Vec::new();
         };
-        g
-            .profile_ids
+        g.profile_ids
             .iter()
             .copied()
             .filter(|id| {
@@ -1588,7 +1609,10 @@ impl AppState {
             removed,
             kept,
         };
-        self.push_log(format!("Subscription updated · {}", summary.format_status()));
+        self.push_log(format!(
+            "Subscription updated · {}",
+            summary.format_status()
+        ));
         Ok(summary)
     }
 
@@ -1674,9 +1698,10 @@ impl AppState {
             };
             let matches_running = protected_running_id.is_some_and(|running_id| {
                 !retained.contains(&running_id)
-                    && self.profiles.get(&running_id).is_some_and(|running| {
-                        profile_identity_key(running) == identity
-                    })
+                    && self
+                        .profiles
+                        .get(&running_id)
+                        .is_some_and(|running| profile_identity_key(running) == identity)
             });
             let existing_id = if let Some(exact_id) = exact_id {
                 if let Some(ids) = available.get_mut(&identity) {
@@ -1770,7 +1795,10 @@ impl AppState {
         group.profile_ids = report.result_order.clone();
         group.info = info;
         group.sub_last_update = updated_at;
-        if self.selected_profile_id.is_some_and(|id| !self.profiles.contains_key(&id)) {
+        if self
+            .selected_profile_id
+            .is_some_and(|id| !self.profiles.contains_key(&id))
+        {
             self.selected_profile_id = group.profile_ids.first().copied();
         }
         if let CoreStatus::Running {
@@ -1863,11 +1891,7 @@ fn compare_profiles(
         ProfileSortColumn::Traffic => left
             .traffic_downlink
             .saturating_add(left.traffic_uplink)
-            .cmp(
-                &right
-                    .traffic_downlink
-                    .saturating_add(right.traffic_uplink),
-            ),
+            .cmp(&right.traffic_downlink.saturating_add(right.traffic_uplink)),
     }
 }
 
@@ -1966,12 +1990,8 @@ mod tests {
     fn push_log_only_appends_without_changing_status() {
         let mut state = AppState::empty();
         state.set_status_message_only("Running [System Proxy]");
-        state.push_log_only(
-            "inbound/mixed[mixed-in]: inbound connection from 127.0.0.1:12345",
-        );
-        state.push_log_only(
-            "outbound/direct[direct]: outbound connection to apple.com:443",
-        );
+        state.push_log_only("inbound/mixed[mixed-in]: inbound connection from 127.0.0.1:12345");
+        state.push_log_only("outbound/direct[direct]: outbound connection to apple.com:443");
 
         assert_eq!(state.status_message(), "Running [System Proxy]");
         let logs = state.logs_text();
@@ -1996,7 +2016,8 @@ mod tests {
 
         let unavailable = state.add_profile(active_group, "Unavailable", ProfileType::Vless);
         let untested = state.add_profile(active_group, "Untested", ProfileType::Vless);
-        let other_unavailable = state.add_profile(other_group, "Other unavailable", ProfileType::Vless);
+        let other_unavailable =
+            state.add_profile(other_group, "Other unavailable", ProfileType::Vless);
         state.set_profile_latency(unavailable, -1);
         state.set_profile_latency(untested, 0);
         state.set_profile_latency(other_unavailable, -1);
@@ -2157,7 +2178,10 @@ mod tests {
         assert_eq!(s.settings().inbound_address, "127.0.0.1");
         assert_eq!(s.settings().test_latency_url, "https://example.com/204");
         assert_eq!(s.settings().log_level, "info");
-        assert_eq!(s.settings().ruleset_mirror, crate::models::RulesetMirror::Github);
+        assert_eq!(
+            s.settings().ruleset_mirror,
+            crate::models::RulesetMirror::Github
+        );
         assert!(s.settings().adblock_enable);
         assert_eq!(s.settings().user_agent, "CustomAgent/1");
         assert!(s.settings().net_use_proxy);
@@ -2169,14 +2193,18 @@ mod tests {
     #[test]
     fn inbound_label_shows_allow_lan_addresses() {
         let mut s = AppState::with_demo_data();
-        assert_eq!(s.inbound_label(), "Mixed: 127.0.0.1:2080");
+        assert_eq!(s.inbound_label_for(None), "Mixed: 127.0.0.1:2080");
 
         s.settings_mut().inbound_address = "::".into();
-        assert_eq!(s.inbound_label(), "Mixed: [::]:2080");
+        assert_eq!(s.inbound_label_for(None), "Mixed: [::]:2080");
+        assert_eq!(
+            s.inbound_label_for(Some("192.168.1.8".into())),
+            "Mixed: 192.168.1.8:2080"
+        );
 
         s.settings_mut().inbound_address = "0.0.0.0".into();
         s.settings_mut().inbound_socks_port = 1080;
-        assert_eq!(s.inbound_label(), "Mixed: 0.0.0.0:1080");
+        assert_eq!(s.inbound_label_for(None), "Mixed: 0.0.0.0:1080");
     }
 
     #[test]
@@ -2240,12 +2268,7 @@ mod tests {
         o1.uuid = Some("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into());
         s.replace_group_profiles(
             gid,
-            vec![(
-                "old-a".into(),
-                ProfileType::Vless,
-                o1.clone(),
-                false,
-            )],
+            vec![("old-a".into(), ProfileType::Vless, o1.clone(), false)],
         )
         .unwrap();
 
@@ -2273,10 +2296,7 @@ mod tests {
         o3.server = Some("3.3.3.3".into());
         o3.server_port = Some(8443);
         let sum2 = s
-            .replace_group_profiles(
-                gid,
-                vec![("only-c".into(), ProfileType::Vless, o3, false)],
-            )
+            .replace_group_profiles(gid, vec![("only-c".into(), ProfileType::Vless, o3, false)])
             .unwrap();
         assert_eq!(sum2.total, 1);
         assert_eq!(sum2.kept, 0);
@@ -2309,7 +2329,11 @@ mod tests {
             .unwrap();
         let old_ids = state.group(group_id).unwrap().profile_ids.clone();
         state.profiles.get_mut(&old_ids[0]).unwrap().latency_ms = 42;
-        state.profiles.get_mut(&old_ids[0]).unwrap().traffic_downlink = 900;
+        state
+            .profiles
+            .get_mut(&old_ids[0])
+            .unwrap()
+            .traffic_downlink = 900;
 
         let mut changed_a = old_a;
         changed_a.sni = Some("new.example".into());
@@ -2403,7 +2427,12 @@ mod tests {
                 group_id,
                 vec![
                     ("first".into(), ProfileType::Vless, outbound.clone(), false),
-                    ("running".into(), ProfileType::Vless, outbound.clone(), false),
+                    (
+                        "running".into(),
+                        ProfileType::Vless,
+                        outbound.clone(),
+                        false,
+                    ),
                 ],
             )
             .unwrap();
@@ -2502,12 +2531,7 @@ mod tests {
                 group_id,
                 vec![
                     ("first".into(), ProfileType::Vless, shared, false),
-                    (
-                        "running".into(),
-                        ProfileType::Vless,
-                        changed_running,
-                        false,
-                    ),
+                    ("running".into(), ProfileType::Vless, changed_running, false),
                 ],
                 String::new(),
                 123,
@@ -2541,12 +2565,7 @@ mod tests {
                 group_id,
                 vec![
                     ("first".into(), ProfileType::Vless, first.clone(), false),
-                    (
-                        "running".into(),
-                        ProfileType::Vless,
-                        running.clone(),
-                        false,
-                    ),
+                    ("running".into(), ProfileType::Vless, running.clone(), false),
                 ],
             )
             .unwrap();
@@ -2564,18 +2583,8 @@ mod tests {
             .apply_subscription_snapshot(
                 group_id,
                 vec![
-                    (
-                        "first".into(),
-                        ProfileType::Vless,
-                        changed_first,
-                        false,
-                    ),
-                    (
-                        "running".into(),
-                        ProfileType::Vless,
-                        changed_running,
-                        false,
-                    ),
+                    ("first".into(), ProfileType::Vless, changed_first, false),
+                    ("running".into(), ProfileType::Vless, changed_running, false),
                 ],
                 String::new(),
                 123,

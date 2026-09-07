@@ -6,10 +6,12 @@ use std::collections::HashMap;
 
 use crate::CoreError;
 
-/// Optional 1.2.4 LoadConfigReq extensions (Xray full gates / lazy sidecar).
+/// Optional LoadConfigReq extensions (Xray full gates / lazy sidecar).
+///
+/// 1.3.0-beta.1 reserved field 12 (`xray_outbound_dns_address`); core injects
+/// sing-box direct-dns into Xray instead of a dns-in loopback.
 #[derive(Debug, Clone, Default)]
 pub struct LoadConfigExtras {
-    pub xray_outbound_dns_address: String,
     pub xray_outbound_dns_strategy: String,
     pub xray_lazy_start: bool,
     pub xray_idle_seconds: i32,
@@ -34,12 +36,7 @@ pub fn encode_load_config_req_ex(
 ) -> Vec<u8> {
     let full_len: usize = extras.xray_full_configs.iter().map(|s| s.len() + 8).sum();
     let mut buf = Vec::with_capacity(
-        core_config.len()
-            + xray_config.len()
-            + tun_ipv4_cidr.len()
-            + extras.xray_outbound_dns_address.len()
-            + full_len
-            + 128,
+        core_config.len() + xray_config.len() + tun_ipv4_cidr.len() + full_len + 128,
     );
     write_string(&mut buf, 1, core_config);
     write_varint_field(&mut buf, 2, u64::from(disable_stats));
@@ -53,9 +50,7 @@ pub fn encode_load_config_req_ex(
     if !tun_ipv4_cidr.is_empty() {
         write_string(&mut buf, 11, tun_ipv4_cidr);
     }
-    if !extras.xray_outbound_dns_address.is_empty() {
-        write_string(&mut buf, 12, &extras.xray_outbound_dns_address);
-    }
+    // field 12 is reserved in 1.3.0-beta.1 (was xray_outbound_dns_address).
     if !extras.xray_outbound_dns_strategy.is_empty() {
         write_string(&mut buf, 13, &extras.xray_outbound_dns_strategy);
     }
@@ -67,11 +62,7 @@ pub fn encode_load_config_req_ex(
             write_string(&mut buf, 16, full);
         }
     }
-    write_varint_field(
-        &mut buf,
-        17,
-        extras.xray_full_idle_seconds.max(0) as u64,
-    );
+    write_varint_field(&mut buf, 17, extras.xray_full_idle_seconds.max(0) as u64);
     buf
 }
 
@@ -193,7 +184,9 @@ fn decode_url_test_item(data: &[u8]) -> Result<UrlTestResult, CoreError> {
 }
 
 /// Decode `QueryStatsResp` maps `ups` / `downs`.
-pub fn decode_query_stats_resp(data: &[u8]) -> Result<(HashMap<String, i64>, HashMap<String, i64>), CoreError> {
+pub fn decode_query_stats_resp(
+    data: &[u8],
+) -> Result<(HashMap<String, i64>, HashMap<String, i64>), CoreError> {
     let mut ups = HashMap::new();
     let mut downs = HashMap::new();
     let mut i = 0;
@@ -264,6 +257,8 @@ pub struct ConnectionRow {
     pub domain: String,
     pub process: String,
     pub closed_at: i64,
+    /// Client address `ip:port` (proto field 14, 1.3.0-beta.2). Empty when unknown.
+    pub source: String,
 }
 
 /// Decode `QueryConnectionsResp` (`active` field 1, `closed` field 2).
@@ -298,6 +293,44 @@ pub fn decode_query_connections_resp(
         }
     }
     Ok((active, closed))
+}
+
+/// Encode `CloseConnectionsRequest` (`repeated string ids = 1`).
+pub fn encode_close_connections_req(ids: &[String]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for id in ids {
+        if !id.is_empty() {
+            write_string(&mut buf, 1, id);
+        }
+    }
+    buf
+}
+
+/// Decode `CloseConnectionsResponse` (`closed` field 1, `error` field 2).
+pub fn decode_close_connections_resp(data: &[u8]) -> Result<(i32, String), CoreError> {
+    let mut closed = 0i32;
+    let mut error = String::new();
+    let mut i = 0;
+    while i < data.len() {
+        let (key, ni) = read_varint(data, i)?;
+        i = ni;
+        let field = (key >> 3) as u32;
+        let wire = (key & 0x7) as u8;
+        match (field, wire) {
+            (1, 0) => {
+                let (v, ni) = read_varint(data, i)?;
+                closed = v as i32;
+                i = ni;
+            }
+            (2, 2) => {
+                let (s, ni) = read_string(data, i)?;
+                error = s;
+                i = ni;
+            }
+            _ => i = skip_field(data, i, wire)?,
+        }
+    }
+    Ok((closed, error))
 }
 
 fn decode_connection_meta(data: &[u8]) -> Result<ConnectionRow, CoreError> {
@@ -362,6 +395,11 @@ fn decode_connection_meta(data: &[u8]) -> Result<ConnectionRow, CoreError> {
             (13, 0) => {
                 let (v, ni) = read_varint(data, i)?;
                 r.closed_at = v as i64;
+                i = ni;
+            }
+            (14, 2) => {
+                let (s, ni) = read_string(data, i)?;
+                r.source = s;
                 i = ni;
             }
             _ => i = skip_field(data, i, wire)?,
@@ -633,7 +671,9 @@ pub fn decode_query_auto_selectors_resp(
                 i = ni;
                 let len = len as usize;
                 if i + len > data.len() {
-                    return Err(CoreError::Rpc("truncated QueryAutoSelectorsResponse".into()));
+                    return Err(CoreError::Rpc(
+                        "truncated QueryAutoSelectorsResponse".into(),
+                    ));
                 }
                 out.push(decode_auto_selector_status(&data[i..i + len])?);
                 i += len;
@@ -950,6 +990,32 @@ mod tests {
     }
 
     #[test]
+    fn encode_load_skips_reserved_xray_dns_address_field() {
+        let extras = LoadConfigExtras {
+            xray_outbound_dns_strategy: "UseIPv4".into(),
+            ..Default::default()
+        };
+        let b = encode_load_config_req_ex("{}", false, false, "", "", &extras);
+        // field 12 string tag = (12 << 3) | 2 = 0x62 — reserved in 1.3.0-beta.1
+        assert!(
+            !b.contains(&0x62),
+            "reserved field 12 must not be encoded: {b:02x?}"
+        );
+        // field 13 string tag = (13 << 3) | 2 = 0x6a
+        assert!(
+            b.contains(&0x6a),
+            "xray_outbound_dns_strategy field tag missing: {b:02x?}"
+        );
+    }
+
+    #[test]
+    fn encode_close_connections_writes_ids() {
+        let b = encode_close_connections_req(&["abc".into(), "def".into()]);
+        let s = String::from_utf8_lossy(&b);
+        assert!(s.contains("abc") && s.contains("def"), "{s}");
+    }
+
+    #[test]
     fn encode_test_req_has_required_bools() {
         let b = encode_test_req(
             r#"{"outbounds":[]}"#,
@@ -980,5 +1046,22 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].outbound_tag, "proxy");
         assert_eq!(r[0].latency_ms, 42);
+    }
+
+    #[test]
+    fn decode_connection_source_field() {
+        let mut meta = Vec::new();
+        write_string(&mut meta, 1, "cid");
+        write_string(&mut meta, 7, "1.2.3.4:443");
+        write_string(&mut meta, 14, "10.0.0.8:52341");
+        let mut outer = Vec::new();
+        write_varint(&mut outer, (1 << 3) | 2);
+        write_varint(&mut outer, meta.len() as u64);
+        outer.extend_from_slice(&meta);
+        let (active, _) = decode_query_connections_resp(&outer).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, "cid");
+        assert_eq!(active[0].dest, "1.2.3.4:443");
+        assert_eq!(active[0].source, "10.0.0.8:52341");
     }
 }

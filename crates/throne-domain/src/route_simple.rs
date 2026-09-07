@@ -1,7 +1,7 @@
 //! Simple-mode route rules — mirrors upstream `RouteProfile::GetSimpleRules` /
 //! `UpdateSimpleRules` (`RouteProfile.cpp`).
 
-use crate::models::{DefaultOutbound, RouteProfile, RouteRule, outbound_ids};
+use crate::models::{outbound_ids, DefaultOutbound, RouteProfile, RouteRule};
 
 /// One of the four simple-mode buckets in the Route Profile editor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,8 +208,7 @@ impl RouteProfile {
             *r = RouteRule::blank_simple(rule_type, action);
             return;
         }
-        self.rules
-            .push(RouteRule::blank_simple(rule_type, action));
+        self.rules.push(RouteRule::blank_simple(rule_type, action));
     }
 
     fn simple_rule_mut(&mut self, rule_type: i32) -> Option<&mut RouteRule> {

@@ -232,8 +232,7 @@ pub fn sync_menu_state(state: TrayMenuState) {
         h.allow_lan.set_checked(state.allow_lan);
         h.sp_system_proxy.set_checked(state.system_proxy);
         h.sp_tun.set_checked(state.tun);
-        h.sp_disabled
-            .set_checked(!state.system_proxy && !state.tun);
+        h.sp_disabled.set_checked(!state.system_proxy && !state.tun);
     });
 }
 
@@ -407,8 +406,8 @@ mod tests {
 
     #[test]
     fn left_click_and_double_click_show_window() {
-        use tray_icon::{MouseButton, MouseButtonState, Rect, TrayIconEvent, TrayIconId};
         use tray_icon::dpi::PhysicalPosition;
+        use tray_icon::{MouseButton, MouseButtonState, Rect, TrayIconEvent, TrayIconId};
 
         let id = TrayIconId::new("throne");
         let rect = Rect {

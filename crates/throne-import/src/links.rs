@@ -2,8 +2,8 @@ use url::Url;
 
 use throne_domain::{ParsedOutbound, ProfileType};
 
-use crate::ImportedProfile;
 use crate::decode::{decode_b64_flexible, percent_decode};
+use crate::ImportedProfile;
 
 /// Parse one share link into a profile draft. Returns `None` if scheme unknown
 /// or required fields missing (mirrors upstream `ParseFromLink` failure).
@@ -37,6 +37,12 @@ pub fn parse_share_link(raw: &str) -> Option<ImportedProfile> {
     }
     if lower.starts_with("socks://") || lower.starts_with("socks5://") {
         return parse_socks(link);
+    }
+    if lower.starts_with("snell://") {
+        return parse_snell(link);
+    }
+    if lower.starts_with("wg://") || lower.starts_with("wireguard://") {
+        return parse_wireguard_link(link);
     }
     if lower.starts_with("http://") || lower.starts_with("https://") {
         // Only treat as HTTP proxy share link when userinfo is present.
@@ -75,7 +81,9 @@ fn qget<'a>(q: &'a [(String, String)], key: &str) -> Option<&'a str> {
 fn parse_ss(link: &str) -> Option<ImportedProfile> {
     // SIP002 / 2022: ss://method:pass@host:port#name
     // v2rayN: ss://base64(method:pass@host:port)#name
-    let after = link.strip_prefix("ss://").or_else(|| link.strip_prefix("SS://"))?;
+    let after = link
+        .strip_prefix("ss://")
+        .or_else(|| link.strip_prefix("SS://"))?;
     let (main, frag) = match after.split_once('#') {
         Some((m, f)) => (m, Some(percent_decode(f))),
         None => (after, None),
@@ -180,10 +188,7 @@ fn parse_vmess(link: &str) -> Option<ImportedProfile> {
                 server: Some(server),
                 server_port: Some(port),
                 uuid: Some(uuid),
-                security: v
-                    .get("scy")
-                    .and_then(|x| x.as_str())
-                    .map(|s| s.to_string()),
+                security: v.get("scy").and_then(|x| x.as_str()).map(|s| s.to_string()),
                 alter_id: Some(alter_id),
                 transport: Some(net),
                 host: v
@@ -195,10 +200,7 @@ fn parse_vmess(link: &str) -> Option<ImportedProfile> {
                     .and_then(|x| x.as_str())
                     .map(|s| s.to_string()),
                 tls: Some(tls_on),
-                sni: v
-                    .get("sni")
-                    .and_then(|x| x.as_str())
-                    .map(|s| s.to_string()),
+                sni: v.get("sni").and_then(|x| x.as_str()).map(|s| s.to_string()),
                 ..Default::default()
             };
             return Some(finish(
@@ -266,6 +268,9 @@ fn parse_vless(link: &str) -> Option<ImportedProfile> {
         sid: qget(&q, "sid").map(|s| s.to_string()),
         spx: qget(&q, "spx").map(|s| s.to_string()),
         security: Some(security.to_string()),
+        finalmask: qget(&q, "fm")
+            .or_else(|| qget(&q, "finalmask"))
+            .map(|s| s.to_string()),
         ..Default::default()
     };
     Some(finish(
@@ -327,7 +332,11 @@ fn parse_hysteria(link: &str) -> Option<ImportedProfile> {
         .filter(|s| !s.is_empty())
         .or_else(|| {
             let u = percent_decode(url.username());
-            if u.is_empty() { None } else { Some(u) }
+            if u.is_empty() {
+                None
+            } else {
+                Some(u)
+            }
         })
         .or_else(|| qget(&q, "auth").map(|s| s.to_string()))
         .or_else(|| qget(&q, "password").map(|s| s.to_string()));
@@ -429,6 +438,87 @@ fn parse_http_proxy(link: &str) -> Option<ImportedProfile> {
     Some(finish(
         name_or("HTTP", &name),
         ProfileType::Http,
+        outbound,
+        link,
+    ))
+}
+
+fn parse_wireguard_link(link: &str) -> Option<ImportedProfile> {
+    if link.contains("[Interface]") && link.contains("[Peer]") {
+        return crate::parse_wireguard_file(link);
+    }
+    let url = Url::parse(link).ok()?;
+    let q = query_map(&url);
+    let (host, port, name) = base_from_url(&url);
+    let private_key = qget(&q, "private_key")
+        .or_else(|| qget(&q, "privatekey"))
+        .map(|s| s.to_string())
+        .or_else(|| {
+            let u = percent_decode(url.username());
+            if u.is_empty() {
+                None
+            } else {
+                Some(u)
+            }
+        })?;
+    let public_key = qget(&q, "public_key")
+        .or_else(|| qget(&q, "publickey"))
+        .or_else(|| qget(&q, "peer_public_key"))
+        .map(|s| s.to_string())?;
+    let local_addr = qget(&q, "local_address")
+        .or_else(|| qget(&q, "address"))
+        .or_else(|| qget(&q, "ip"))
+        .map(|s| s.replace('-', ",").replace(' ', ""));
+    let server = if host.is_empty() { None } else { Some(host) };
+    let server_port = port.or(Some(51820));
+    if server.as_ref().is_none_or(|s| s.is_empty()) {
+        return None;
+    }
+    let outbound = ParsedOutbound {
+        server,
+        server_port,
+        password: Some(private_key),
+        username: Some(public_key),
+        path: local_addr,
+        ..Default::default()
+    };
+    Some(finish(
+        name_or("WireGuard", &name),
+        ProfileType::Wireguard,
+        outbound,
+        link,
+    ))
+}
+
+fn parse_snell(link: &str) -> Option<ImportedProfile> {
+    let url = Url::parse(link).ok()?;
+    let (host, port, name) = base_from_url(&url);
+    if host.is_empty() {
+        return None;
+    }
+    let q = query_map(&url);
+    let psk = percent_decode(url.username());
+    let psk = if psk.is_empty() {
+        qget(&q, "psk").unwrap_or("").to_string()
+    } else {
+        psk
+    };
+    let version = qget(&q, "version")
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(4);
+    if version != 4 && version != 6 {
+        return None;
+    }
+    let outbound = ParsedOutbound {
+        server: Some(host),
+        server_port: port.or(Some(440)),
+        password: Some(psk),
+        method: Some(version.to_string()),
+        ..Default::default()
+    };
+    Some(finish(
+        name_or("Snell", &name),
+        ProfileType::Snell,
         outbound,
         link,
     ))

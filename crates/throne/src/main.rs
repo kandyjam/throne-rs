@@ -264,6 +264,25 @@ mod tests {
         assert!(source.contains("ConfirmDeleteUnavailable"));
         assert!(source.contains("ConfirmUpdateAllSubscriptions"));
         assert!(source.contains("SubscriptionDiff"));
+        // gpui-component 0.6 Dialog no longer paints button_props as a footer
+        // (0.5 `.confirm()`). Confirmation UIs must attach DialogFooter.
+        for marker in [
+            "Dialog::ConfirmDeleteUnavailable { count, .. }",
+            "Dialog::ConfirmRemoveGroup { name, .. }",
+            "Dialog::ConfirmUpdateAllSubscriptions => {",
+            "Dialog::SubscriptionDiff { title, body }",
+        ] {
+            let idx = source.find(marker).unwrap_or_else(|| panic!("{marker}"));
+            let rest = &source[idx..];
+            let arm_end = rest
+                .find("\n        Dialog::")
+                .unwrap_or(rest.len().min(2800));
+            let arm = &rest[..arm_end];
+            assert!(
+                arm.contains("confirm_dialog_footer"),
+                "{marker} must attach confirm_dialog_footer so OK/Cancel stay visible"
+            );
+        }
     }
 
     #[test]

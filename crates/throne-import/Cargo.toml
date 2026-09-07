@@ -15,6 +15,7 @@ url = { workspace = true }
 urlencoding = { workspace = true }
 serde_yaml = { workspace = true }
 ureq = { workspace = true }
+flate2 = "1"
 
 [dev-dependencies]
 serde_json = { workspace = true }

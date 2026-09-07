@@ -26,15 +26,17 @@ pub fn try_import_clash(text: &str) -> Option<Vec<ImportedProfile>> {
 
 fn proxy_from_yaml(v: &serde_yaml::Value) -> Option<ImportedProfile> {
     let map = v.as_mapping()?;
-    let get = |k: &str| -> Option<&serde_yaml::Value> {
-        map.get(serde_yaml::Value::String(k.into()))
-    };
+    let get =
+        |k: &str| -> Option<&serde_yaml::Value> { map.get(serde_yaml::Value::String(k.into())) };
     let ty = get("type")?.as_str()?.to_ascii_lowercase();
     let name = get("name")
         .and_then(|v| v.as_str())
         .unwrap_or(&ty)
         .to_string();
-    let server = get("server").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let server = get("server")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let port = get("port")
         .and_then(|v| {
             v.as_u64()

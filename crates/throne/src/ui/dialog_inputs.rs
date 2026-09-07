@@ -32,6 +32,7 @@ pub enum DialogInputs {
     },
     Tun {
         mtu: Entity<InputState>,
+        private_ranges: Entity<InputState>,
     },
     AddFromInput {
         text: Entity<TextareaState>,
@@ -409,9 +410,20 @@ impl DialogInputs {
         }
     }
 
-    pub fn tun<V: 'static>(window: &mut Window, cx: &mut Context<V>, mtu: &str) -> Self {
+    pub fn tun<V: 'static>(
+        window: &mut Window,
+        cx: &mut Context<V>,
+        mtu: &str,
+        private_ranges: &str,
+    ) -> Self {
         Self::Tun {
             mtu: single_line(window, cx, mtu.to_string(), "MTU"),
+            private_ranges: single_line(
+                window,
+                cx,
+                private_ranges.to_string(),
+                "10.0.0.0/8, 172.16.0.0/12, …",
+            ),
         }
     }
 

@@ -14,19 +14,19 @@ mod rule_set_list;
 mod sys_proxy;
 
 pub use config_build::{
-    AutoSelectorBuild, BuiltConfig, apply_ruleset_mirror, build_load_config, build_load_config_ex,
-    build_url_test_config,
+    apply_ruleset_mirror, build_load_config, build_load_config_ex, build_url_test_config,
+    AutoSelectorBuild, BuiltConfig,
 };
-pub use rule_set_list::{RULE_SET_LIST, lookup_rule_set_url};
 pub use privilege::{
-    ElevatedPermissions, PrivilegeOutcome, core_has_setuid, core_is_root_setuid,
-    core_path_beside_gui, find_core_real_path, is_setuid_set, path_on_nosuid_volume,
-    reexec_off_nosuid_volume, request_core_privileges,
+    core_has_setuid, core_is_root_setuid, core_path_beside_gui, find_core_real_path, is_setuid_set,
+    path_on_nosuid_volume, reexec_off_nosuid_volume, request_core_privileges, ElevatedPermissions,
+    PrivilegeOutcome,
 };
 pub use proto_wire::{
     AutoSelectorGroupStatus, AutoSelectorMemberStatus, ConnectionRow, IpTestResult,
     SpeedTestResult, UrlTestResult,
 };
+pub use rule_set_list::{lookup_rule_set_url, RULE_SET_LIST};
 pub use sys_proxy::{
     force_clear_system_proxy, proxy_client_host, set_system_proxy, set_tun_system_dns,
     tun_dns_address,
@@ -81,20 +81,16 @@ pub fn format_core_error(err: &str) -> String {
     if let Some(idx) = err.find(MARKER) {
         let after = &err[idx + MARKER.len()..];
         // Cause is after the JSON blob, usually `\n: reason` or `: reason`.
-        if let Some(cause) = after
-            .rsplit_once("\n:")
-            .map(|(_, c)| c.trim())
-            .or_else(|| {
-                // Fallback: last ": " that looks like a prose reason (not JSON).
-                after
-                    .rmatch_indices(": ")
-                    .find(|(i, _)| {
-                        let rest = after.get(i + 2..).unwrap_or("");
-                        !rest.starts_with('{') && !rest.starts_with('[') && rest.len() < 400
-                    })
-                    .map(|(i, _)| after[i + 2..].trim())
-            })
-        {
+        if let Some(cause) = after.rsplit_once("\n:").map(|(_, c)| c.trim()).or_else(|| {
+            // Fallback: last ": " that looks like a prose reason (not JSON).
+            after
+                .rmatch_indices(": ")
+                .find(|(i, _)| {
+                    let rest = after.get(i + 2..).unwrap_or("");
+                    !rest.starts_with('{') && !rest.starts_with('[') && rest.len() < 400
+                })
+                .map(|(i, _)| after[i + 2..].trim())
+        }) {
             if !cause.is_empty() {
                 return format!("decode config: {cause}");
             }
@@ -166,9 +162,8 @@ pub fn resolve_core_binary() -> PathBuf {
         "/Applications/Throne.app/Contents/MacOS/ThroneCore",
     ));
     if let Some(home) = std::env::var_os("HOME") {
-        candidates.push(
-            PathBuf::from(home).join("Applications/Throne.app/Contents/MacOS/ThroneCore"),
-        );
+        candidates
+            .push(PathBuf::from(home).join("Applications/Throne.app/Contents/MacOS/ThroneCore"));
     }
     for c in &candidates {
         if c.exists() {
@@ -326,9 +321,8 @@ impl CoreSession {
         let socket_path = PathBuf::from("/tmp").join(&sock_name);
         let _ = std::fs::remove_file(&socket_path);
 
-        let listener = UnixListener::bind(&socket_path).map_err(|e| {
-            CoreError::IpcListen(format!("{} ({e})", socket_path.display()))
-        })?;
+        let listener = UnixListener::bind(&socket_path)
+            .map_err(|e| CoreError::IpcListen(format!("{} ({e})", socket_path.display())))?;
         listener
             .set_nonblocking(true)
             .map_err(|e| CoreError::IpcListen(e.to_string()))?;
@@ -470,7 +464,6 @@ impl CoreSession {
         }
 
         let extras = proto_wire::LoadConfigExtras {
-            xray_outbound_dns_address: built.xray_outbound_dns_address.clone(),
             xray_outbound_dns_strategy: built.xray_outbound_dns_strategy.clone(),
             xray_lazy_start: built.xray_lazy_start,
             xray_idle_seconds: built.xray_idle_seconds,
@@ -653,9 +646,7 @@ impl CoreSession {
             ElevatedPermissions::RetryAfterPassword { hint } => {
                 Err(CoreError::TunPrivilegeRequired(hint))
             }
-            ElevatedPermissions::Denied { reason } => {
-                Err(CoreError::TunPrivilegeRequired(reason))
-            }
+            ElevatedPermissions::Denied { reason } => Err(CoreError::TunPrivilegeRequired(reason)),
         }
     }
 
@@ -746,7 +737,11 @@ impl CoreSession {
     }
 
     /// URL-test the currently running instance's `proxy` outbound.
-    pub fn url_test_current(&mut self, url: &str, timeout_ms: i32) -> Result<UrlTestResult, CoreError> {
+    pub fn url_test_current(
+        &mut self,
+        url: &str,
+        timeout_ms: i32,
+    ) -> Result<UrlTestResult, CoreError> {
         self.ensure_connected()?;
         if self.running_profile.is_none() {
             return Err(CoreError::NotRunning);
@@ -784,15 +779,7 @@ impl CoreSession {
         } else {
             settings.test_latency_url.trim()
         };
-        let payload = proto_wire::encode_test_req(
-            &config,
-            &tags,
-            url,
-            false,
-            false,
-            8,
-            8000,
-        );
+        let payload = proto_wire::encode_test_req(&config, &tags, url, false, false, 8, 8000);
         // Batch can take a while with many nodes.
         let resp = self.call(
             "Test",
@@ -816,8 +803,11 @@ impl CoreSession {
         if !self.connected || self.running_profile.is_none() {
             return Err(CoreError::NotRunning);
         }
-        let resp =
-            self.call("QueryStats", &proto_wire::encode_empty_req(), Duration::from_secs(5))?;
+        let resp = self.call(
+            "QueryStats",
+            &proto_wire::encode_empty_req(),
+            Duration::from_secs(5),
+        )?;
         let (ups, downs) = proto_wire::decode_query_stats_resp(&resp)?;
         let proxy_up = ups.get("proxy").copied().unwrap_or(0);
         let proxy_down = downs.get("proxy").copied().unwrap_or(0);
@@ -842,6 +832,27 @@ impl CoreSession {
         )?;
         let (active, _closed) = proto_wire::decode_query_connections_resp(&resp)?;
         Ok(active)
+    }
+
+    /// Close live clash connections by id (core ≥ 1.3.0-beta.1). Stale ids are a no-op.
+    pub fn close_connections(&mut self, ids: &[String]) -> Result<i32, CoreError> {
+        if !self.connected || self.running_profile.is_none() {
+            return Err(CoreError::NotRunning);
+        }
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let resp = self.call(
+            "CloseConnections",
+            &proto_wire::encode_close_connections_req(ids),
+            Duration::from_secs(5),
+        )?;
+        let (closed, error) = proto_wire::decode_close_connections_resp(&resp)?;
+        if error.is_empty() {
+            Ok(closed)
+        } else {
+            Err(CoreError::Rpc(error))
+        }
     }
 
     /// Idempotent snapshot of every running auto-selector group (core ≥ 1.2.3).
@@ -939,11 +950,13 @@ impl CoreSession {
     }
 
     #[cfg(unix)]
-    fn call(&mut self, method: &str, payload: &[u8], timeout: Duration) -> Result<Vec<u8>, CoreError> {
-        let stream = self
-            .stream
-            .as_mut()
-            .ok_or(CoreError::NotRunning)?;
+    fn call(
+        &mut self,
+        method: &str,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<Vec<u8>, CoreError> {
+        let stream = self.stream.as_mut().ok_or(CoreError::NotRunning)?;
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
 
@@ -1007,7 +1020,12 @@ impl CoreSession {
     }
 
     #[cfg(not(unix))]
-    fn call(&mut self, _method: &str, _payload: &[u8], _timeout: Duration) -> Result<Vec<u8>, CoreError> {
+    fn call(
+        &mut self,
+        _method: &str,
+        _payload: &[u8],
+        _timeout: Duration,
+    ) -> Result<Vec<u8>, CoreError> {
         Err(CoreError::NotImplemented("Windows RPC"))
     }
 
@@ -1064,12 +1082,11 @@ impl Drop for CoreSession {
 /// - parent process basename == `Throne`
 /// - `ThroneCore` directory == parent directory
 fn prepare_core_beside_gui(config: &CoreConfig) -> Result<PathBuf, CoreError> {
-    let gui = std::env::current_exe().map_err(|e| {
-        CoreError::Spawn(format!("cannot resolve current_exe: {e}"))
-    })?;
-    let gui_dir = gui.parent().ok_or_else(|| {
-        CoreError::Spawn("current_exe has no parent directory".into())
-    })?;
+    let gui = std::env::current_exe()
+        .map_err(|e| CoreError::Spawn(format!("cannot resolve current_exe: {e}")))?;
+    let gui_dir = gui
+        .parent()
+        .ok_or_else(|| CoreError::Spawn("current_exe has no parent directory".into()))?;
 
     let dest = gui_dir.join("ThroneCore");
     let source = find_core_source(config)?;
@@ -1140,7 +1157,9 @@ fn find_core_source(config: &CoreConfig) -> Result<PathBuf, CoreError> {
     if let Some(p) = which_in_path("Core") {
         return Ok(p);
     }
-    Err(CoreError::BinaryMissing(config.binary_path.display().to_string()))
+    Err(CoreError::BinaryMissing(
+        config.binary_path.display().to_string(),
+    ))
 }
 
 fn clear_quarantine(path: &Path) {
@@ -1177,19 +1196,21 @@ fn spawn_pipe_reader(
     pipe: impl Read + Send + 'static,
     buf: Arc<Mutex<VecDeque<String>>>,
 ) {
-    let _ = std::thread::Builder::new().name(name.into()).spawn(move || {
-        let reader = BufReader::new(pipe);
-        for line in reader.lines() {
-            match line {
-                Ok(raw) => {
-                    if let Some(msg) = normalize_core_log_line(&raw) {
-                        push_core_log_line(&buf, msg);
+    let _ = std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            let reader = BufReader::new(pipe);
+            for line in reader.lines() {
+                match line {
+                    Ok(raw) => {
+                        if let Some(msg) = normalize_core_log_line(&raw) {
+                            push_core_log_line(&buf, msg);
+                        }
                     }
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
-        }
-    });
+        });
 }
 
 /// Trim noise from a core log line. Returns `None` for empty / pure whitespace.
@@ -1354,7 +1375,10 @@ mod tests {
 : inbounds[0]: legacy inbound fields are deprecated in sing-box 1.11.0"#;
         let short = format_core_error(raw);
         assert!(short.contains("legacy inbound"), "got: {short}");
-        assert!(!short.contains("\"sniff\""), "should drop JSON blob: {short}");
+        assert!(
+            !short.contains("\"sniff\""),
+            "should drop JSON blob: {short}"
+        );
     }
 
     #[test]
@@ -1376,7 +1400,8 @@ mod tests {
 
     #[test]
     fn normalize_core_log_strips_go_std_prefix() {
-        let line = normalize_core_log_line("2026/08/04 15:30:01 Start: {\"log\":{}}").expect("line");
+        let line =
+            normalize_core_log_line("2026/08/04 15:30:01 Start: {\"log\":{}}").expect("line");
         assert_eq!(line, "Start: {\"log\":{}}");
         assert!(normalize_core_log_line("   \n").is_none());
     }

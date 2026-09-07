@@ -5,7 +5,7 @@ use serde_json::Value;
 use throne_domain::{DefaultOutbound, RouteProfile, RouteRule};
 
 use crate::decode::decode_b64_flexible;
-use crate::deeplink::{Deeplink, parse_deeplink};
+use crate::deeplink::{parse_deeplink, Deeplink};
 
 #[derive(Debug, Clone, Default)]
 pub struct RouteImportReport {
@@ -116,9 +116,7 @@ fn import_remote_route_payload(payload: &str) -> RouteImportReport {
         }
     }
     if report.routes.is_empty() {
-        report
-            .errors
-            .push("remoteRoute payload had no URLs".into());
+        report.errors.push("remoteRoute payload had no URLs".into());
     }
     report
 }
@@ -228,10 +226,7 @@ fn rules_from_array(arr: &[Value], warnings: &mut Vec<String>) -> Vec<RouteRule>
                 token
             },
             outbound_id,
-            invert: obj
-                .get("invert")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
+            invert: obj.get("invert").and_then(|v| v.as_bool()).unwrap_or(false),
             action: obj
                 .get("action")
                 .and_then(|v| v.as_str())
@@ -366,7 +361,10 @@ mod tests {
         assert_eq!(r.routes[0].name, "Home");
         assert_eq!(r.routes[0].rules.len(), 1);
         assert_eq!(r.routes[0].rules[0].domain_suffix[0], "ads.example");
-        assert_eq!(r.routes[0].rules[0].outbound_id, DefaultOutbound::Block.as_id());
+        assert_eq!(
+            r.routes[0].rules[0].outbound_id,
+            DefaultOutbound::Block.as_id()
+        );
     }
 
     #[test]

@@ -182,10 +182,7 @@ pub fn set_tun_system_dns(enable: bool, tun_ipv4_cidr: &str) -> Result<(), Strin
 /// Derive system DNS IP from Tun CIDR (upstream: tunIP + 1 → `172.19.0.2`).
 pub fn tun_dns_address(tun_ipv4_cidr: &str) -> Option<String> {
     let (addr, _pfx) = tun_ipv4_cidr.trim().split_once('/')?;
-    let parts: Vec<u8> = addr
-        .split('.')
-        .filter_map(|p| p.parse().ok())
-        .collect();
+    let parts: Vec<u8> = addr.split('.').filter_map(|p| p.parse().ok()).collect();
     if parts.len() != 4 {
         return None;
     }
@@ -262,8 +259,7 @@ fn list_network_services() -> Result<Vec<String>, String> {
 #[cfg(target_os = "macos")]
 fn is_primary_service(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    if n.contains("wi-fi") || n.contains("wifi") || n == "ethernet" || n.starts_with("ethernet ")
-    {
+    if n.contains("wi-fi") || n.contains("wifi") || n == "ethernet" || n.starts_with("ethernet ") {
         return true;
     }
     if n.contains("usb 10/100") {

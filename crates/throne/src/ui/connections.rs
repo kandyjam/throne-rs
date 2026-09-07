@@ -1,12 +1,16 @@
 //! Connections tab table — aligned with upstream `connections` QTableWidget.
 //!
-//! Columns: Destination (Domain) | Process | Protocol | Outbound | Traffic | Speed
+//! Columns: [Source] Destination (Domain) | Process | Protocol | Outbound | Traffic | Speed
+//!
+//! Source is shown only when mixed inbound is reachable from the LAN
+//! (upstream 1.3.0-beta.2).
 
 use std::collections::HashMap;
 use std::time::Instant;
 
-use gpui::{SharedString, div, prelude::*, px};
+use gpui::{div, prelude::*, px, App, SharedString, Window};
 use throne_core_client::ConnectionRow;
+use throne_domain::{endpoint_host, is_own_address};
 
 use crate::theme::Theme;
 
@@ -46,11 +50,17 @@ pub fn display_protocol(network: &str, protocol: &str) -> String {
 
 /// Traffic cell: `3.15 KiB↑ 5.24 KiB↓`
 pub fn display_traffic(upload: i64, download: i64) -> String {
-    format!(
-        "{}↑ {}↓",
-        readable_size(upload),
-        readable_size(download)
-    )
+    format!("{}↑ {}↓", readable_size(upload), readable_size(download))
+}
+
+/// Source cell: own addresses collapse to `Local` (upstream `sourceDisplay`).
+pub fn display_source(source: &str) -> String {
+    let host = endpoint_host(source);
+    if host.is_empty() || is_own_address(&host) {
+        "Local".into()
+    } else {
+        host
+    }
 }
 
 /// Speed cell: `0.00 B/s↑ 0.00 B/s↓`
@@ -119,11 +129,13 @@ impl ConnectionSpeedTracker {
 }
 
 // Fixed column widths (Destination flexes). Keep header + rows in lockstep.
+const COL_SOURCE: f32 = 110.;
 const COL_PROCESS: f32 = 120.;
 const COL_PROTO: f32 = 88.;
 const COL_OUT: f32 = 72.;
 const COL_TRAFFIC: f32 = 140.;
 const COL_SPEED: f32 = 150.;
+const COL_CLOSE: f32 = 36.;
 
 fn col_fixed(width: f32, text: impl Into<SharedString>, color: gpui::Hsla) -> impl IntoElement {
     div()
@@ -152,7 +164,7 @@ fn col_flex(text: impl Into<SharedString>, color: gpui::Hsla) -> impl IntoElemen
 }
 
 /// Header row for the Connections table.
-pub fn connections_header() -> impl IntoElement {
+pub fn connections_header(show_source: bool) -> impl IntoElement {
     div()
         .flex()
         .items_center()
@@ -165,12 +177,16 @@ pub fn connections_header() -> impl IntoElement {
         .text_xs()
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .text_color(Theme::text_muted())
+        .when(show_source, |el| {
+            el.child(col_fixed(COL_SOURCE, "Source", Theme::text_muted()))
+        })
         .child(col_flex("Destination (Domain)", Theme::text_muted()))
         .child(col_fixed(COL_PROCESS, "Process", Theme::text_muted()))
         .child(col_fixed(COL_PROTO, "Protocol", Theme::text_muted()))
         .child(col_fixed(COL_OUT, "Outbound", Theme::text_muted()))
         .child(col_fixed(COL_TRAFFIC, "Traffic", Theme::text_muted()))
         .child(col_fixed(COL_SPEED, "Speed", Theme::text_muted()))
+        .child(col_fixed(COL_CLOSE, "", Theme::text_muted()))
 }
 
 /// One data row.
@@ -179,6 +195,8 @@ pub fn connection_row(
     up_speed: i64,
     down_speed: i64,
     stripe: bool,
+    show_source: bool,
+    on_close: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let bg = if stripe {
         Theme::bg_app()
@@ -196,6 +214,9 @@ pub fn connection_row(
         .border_b_1()
         .border_color(Theme::border_light())
         .text_xs()
+        .when(show_source, |el| {
+            el.child(col_fixed(COL_SOURCE, display_source(&c.source), fg))
+        })
         .child(col_flex(display_dest(&c.dest, &c.domain), fg))
         .child(col_fixed(COL_PROCESS, c.process.clone(), fg))
         .child(col_fixed(
@@ -214,6 +235,19 @@ pub fn connection_row(
             display_speed(up_speed, down_speed),
             fg,
         ))
+        .child(
+            div()
+                .w(px(COL_CLOSE))
+                .flex_shrink_0()
+                .id(SharedString::from(format!("conn-x-{}", c.id)))
+                .cursor_pointer()
+                .text_color(Theme::text_muted())
+                .on_click(move |_, w, cx| {
+                    cx.stop_propagation();
+                    on_close(w, cx);
+                })
+                .child("×"),
+        )
 }
 
 /// Full Connections panel body (header + rows or empty state).
@@ -221,6 +255,8 @@ pub fn connections_panel(
     running: bool,
     rows: &[ConnectionRow],
     speeds: &ConnectionSpeedTracker,
+    show_source: bool,
+    on_close: impl Fn(String, &mut Window, &mut App) + Clone + 'static,
 ) -> impl IntoElement {
     if !running {
         return div()
@@ -233,16 +269,29 @@ pub fn connections_panel(
         return div()
             .text_xs()
             .text_color(Theme::text_muted())
-            .child(
-                "Connections — none active (traffic will appear when apps use the proxy)",
-            )
+            .child("Connections — none active (traffic will appear when apps use the proxy)")
             .into_any_element();
     }
 
-    let mut list = div().flex().flex_col().w_full().child(connections_header());
+    let mut list = div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .child(connections_header(show_source));
     for (i, c) in rows.iter().take(80).enumerate() {
         let (up_s, down_s) = speeds.speeds(&c.id);
-        list = list.child(connection_row(c, up_s, down_s, i % 2 == 1));
+        let id = c.id.clone();
+        let close = on_close.clone();
+        list = list.child(connection_row(
+            c,
+            up_s,
+            down_s,
+            i % 2 == 1,
+            show_source,
+            move |w, cx| {
+                close(id.clone(), w, cx);
+            },
+        ));
     }
     if rows.len() > 80 {
         list = list.child(
@@ -264,7 +313,10 @@ mod tests {
     #[test]
     fn display_dest_matches_upstream() {
         assert_eq!(display_dest("1.2.3.4:443", ""), "1.2.3.4:443");
-        assert_eq!(display_dest("example.com:443", "example.com"), "example.com:443");
+        assert_eq!(
+            display_dest("example.com:443", "example.com"),
+            "example.com:443"
+        );
         assert_eq!(
             display_dest("1.2.3.4:443", "cdn.example.com"),
             "1.2.3.4:443 (cdn.example.com)"
@@ -282,6 +334,15 @@ mod tests {
         let s = display_speed(0, 0);
         assert!(s.contains("/s↑"));
         assert!(s.contains("/s↓"));
+    }
+
+    #[test]
+    fn source_collapses_loopback_to_local() {
+        assert_eq!(display_source("127.0.0.1:9"), "Local");
+        assert_eq!(display_source("[::1]:9"), "Local");
+        assert_eq!(display_source("::1"), "Local");
+        assert_eq!(display_source("10.8.8.8:443"), "10.8.8.8");
+        assert_eq!(display_source(""), "Local");
     }
 
     #[test]
@@ -313,5 +374,4 @@ mod tests {
         assert!(up > 0);
         assert!(down > 0);
     }
-
 }

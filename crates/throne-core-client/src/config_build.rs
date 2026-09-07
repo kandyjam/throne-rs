@@ -3,10 +3,10 @@
 //! This is intentionally smaller than upstream `BuildSingBoxConfig` but enough
 //! to make mixed-inbound proxy actually work for common outbound types.
 
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use throne_domain::{
-    AppSettings, AutoSelectorConfig, DefaultOutbound, ParsedOutbound, Profile, ProfileType,
-    RouteProfile, RouteRule, RulesetMirror, is_xray_full_config_member,
+    is_xray_full_config_member, AppSettings, AutoSelectorConfig, DefaultOutbound, ParsedOutbound,
+    Profile, ProfileType, RouteProfile, RouteRule, RulesetMirror,
 };
 
 use crate::CoreError;
@@ -28,8 +28,7 @@ pub struct BuiltConfig {
     pub xray_idle_seconds: i32,
     /// Idle seconds for full-config gates; 0 keeps resident (1.2.4 auto-selector).
     pub xray_full_idle_seconds: i32,
-    /// Loopback DNS-in for Xray outbound resolution (e.g. `127.0.0.1:15353`).
-    pub xray_outbound_dns_address: String,
+    /// Xray domain strategy through the box dns-direct transport (1.3.0-beta.1).
     pub xray_outbound_dns_strategy: String,
 }
 
@@ -67,38 +66,38 @@ pub fn build_load_config_ex(
     let mut xray_idle_seconds = 0;
     let mut xray_full_idle_seconds = 0;
 
-    let (proxy_outbound, extra_outbounds, proxy_direct_domains) =
-        if let Some(auto) = auto_selector {
-            let built = build_auto_selector_outbounds(auto, settings)?;
-            xray_full_configs = built.xray_full_configs;
-            // Pool Xray members may be probe-only: keep sidecar cold between dials.
-            // Idle must outlast the probe interval or it restarts every round.
-            if built.any_xray_member || !xray_full_configs.is_empty() {
-                xray_lazy_start = true;
-                xray_idle_seconds = auto.config.interval_sec.max(60) * 2;
-                if xray_idle_seconds < 120 {
-                    xray_idle_seconds = 120;
-                }
-                // Resident on purpose: recycling would put an instance build in
-                // front of every failover (upstream 1.2.4).
-                xray_full_idle_seconds = 0;
+    let (proxy_outbound, extra_outbounds, proxy_direct_domains) = if let Some(auto) = auto_selector
+    {
+        let built = build_auto_selector_outbounds(auto, settings)?;
+        xray_full_configs = built.xray_full_configs;
+        // Pool Xray members may be probe-only: keep sidecar cold between dials.
+        // Idle must outlast the probe interval or it restarts every round.
+        if built.any_xray_member || !xray_full_configs.is_empty() {
+            xray_lazy_start = true;
+            xray_idle_seconds = auto.config.interval_sec.max(60) * 2;
+            if xray_idle_seconds < 120 {
+                xray_idle_seconds = 120;
             }
-            (built.group, built.member_outbounds, built.domains)
-        } else if profile.profile_type == ProfileType::AutoSelector {
-            return Err(CoreError::Config(
-                "Auto Selector requires resolved members — call resolve_auto_selector_members first"
-                    .into(),
-            ));
-        } else if is_xray_full_config_member(profile) {
-            let bridge = build_xray_full_member(profile)?;
-            xray_full_configs.push(bridge.xray_config);
-            let domains = collect_outbound_server_domains(profile);
-            (bridge.socks_outbound, Vec::new(), domains)
-        } else {
-            let outbound = build_proxy_outbound(profile)?;
-            let domains = collect_outbound_server_domains(profile);
-            (outbound, Vec::new(), domains)
-        };
+            // Resident on purpose: recycling would put an instance build in
+            // front of every failover (upstream 1.2.4).
+            xray_full_idle_seconds = 0;
+        }
+        (built.group, built.member_outbounds, built.domains)
+    } else if profile.profile_type == ProfileType::AutoSelector {
+        return Err(CoreError::Config(
+            "Auto Selector requires resolved members — call resolve_auto_selector_members first"
+                .into(),
+        ));
+    } else if is_xray_full_config_member(profile) {
+        let bridge = build_xray_full_member(profile)?;
+        xray_full_configs.push(bridge.xray_config);
+        let domains = collect_outbound_server_domains(profile);
+        (bridge.socks_outbound, Vec::new(), domains)
+    } else {
+        let outbound = build_proxy_outbound(profile)?;
+        let domains = collect_outbound_server_domains(profile);
+        (outbound, Vec::new(), domains)
+    };
     // Upstream `buildInboundSection`: mixed inbound listen = settings.inbound_address
     // as-is. Tray "Allow other devices to connect" sets `::` (or user sets
     // `0.0.0.0`); system-proxy *clients* still use loopback via `proxy_client_host`.
@@ -157,7 +156,8 @@ pub fn build_load_config_ex(
         //   repointed at tunIP+1 (inside that subnet), and excluding the whole
         //   172.16.0.0/12 would black-hole every DNS query.
         if !settings.disable_private_range_bypass {
-            let excludes = build_tun_route_exclude_addrs(&tun_ipv4_cidr);
+            let excludes =
+                build_tun_route_exclude_addrs(&tun_ipv4_cidr, &settings.vpn_private_ranges);
             tun.as_object_mut()
                 .unwrap()
                 .insert("route_exclude_address".into(), json!(excludes));
@@ -241,17 +241,12 @@ pub fn build_load_config_ex(
     let core_config_json =
         serde_json::to_string(&config).map_err(|e| CoreError::Config(e.to_string()))?;
 
-    // When any Xray path is used, point outbound DNS at sing-box loopback DNS-in
-    // (upstream mainwindow_profile_lifecycle 1.2.4). Default port matches
-    // SettingsRepo::core_dns_in_port when the GUI has not exposed it yet.
+    // 1.3.0-beta.1: core injects sing-box direct-dns into Xray; GUI only sends strategy.
     let need_xray_dns = !xray_full_configs.is_empty() || xray_lazy_start;
-    let (xray_outbound_dns_address, xray_outbound_dns_strategy) = if need_xray_dns {
-        (
-            "127.0.0.1:15353".to_string(),
-            xray_outbound_domain_strategy(settings),
-        )
+    let xray_outbound_dns_strategy = if need_xray_dns {
+        xray_outbound_domain_strategy(settings)
     } else {
-        (String::new(), String::new())
+        String::new()
     };
 
     Ok(BuiltConfig {
@@ -263,7 +258,6 @@ pub fn build_load_config_ex(
         xray_lazy_start,
         xray_idle_seconds,
         xray_full_idle_seconds,
-        xray_outbound_dns_address,
         xray_outbound_dns_strategy,
     })
 }
@@ -457,7 +451,12 @@ fn route_rule_to_json(rule: &RouteRule) -> Option<Value> {
     if !rule.network.is_empty() {
         // network may be "tcp" / "udp" or JSON array string — keep as string or split
         if rule.network.contains(',') {
-            let parts: Vec<&str> = rule.network.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+            let parts: Vec<&str> = rule
+                .network
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
             obj.insert("network".into(), json!(parts));
         } else {
             obj.insert("network".into(), json!(rule.network));
@@ -495,7 +494,10 @@ fn route_rule_to_json(rule: &RouteRule) -> Option<Value> {
         }
         _ => {
             // route (default)
-            if matches!(DefaultOutbound::from_id(rule.outbound_id), DefaultOutbound::Block) {
+            if matches!(
+                DefaultOutbound::from_id(rule.outbound_id),
+                DefaultOutbound::Block
+            ) {
                 obj.insert("action".into(), json!("reject"));
             } else {
                 obj.insert("action".into(), json!("route"));
@@ -580,7 +582,10 @@ pub fn apply_ruleset_mirror(link: &str, mirror: RulesetMirror) -> String {
 }
 
 fn rewrite_gh_raw_path(base: &str, path_after_host: &str) -> String {
-    let parts: Vec<&str> = path_after_host.split('/').filter(|s| !s.is_empty()).collect();
+    let parts: Vec<&str> = path_after_host
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
     // Expect: user / repo / ref / rest...
     if parts.len() < 3 {
         return format!("https://raw.githubusercontent.com/{path_after_host}");
@@ -620,9 +625,7 @@ fn well_known_rule_set_url(tag: &str) -> Option<String> {
     // Common aliases seen in older / hand-edited profiles.
     let alias = match t {
         "geosite-anticensorship" => Some("geosite-category-anticensorship"),
-        "geosite-geolocation-notcn" | "geosite-geolocation-!cn" => {
-            Some("geosite-geolocation-!cn")
-        }
+        "geosite-geolocation-notcn" | "geosite-geolocation-!cn" => Some("geosite-geolocation-!cn"),
         _ => None,
     };
     if let Some(a) = alias {
@@ -750,21 +753,18 @@ fn normalize_tun_ipv4_cidr(raw: &str) -> String {
     }
 }
 
-/// Upstream `tunBypassablePrivateRanges` + unconditional loopback/broadcast.
+/// Upstream `vpn_private_ranges` + unconditional loopback/broadcast.
 ///
 /// On Darwin, `subtract_prefix` carves the Tun CIDR out of the exclude list so
-/// system DNS at tunIP+1 stays on the Tun (upstream #1738 / 1.2.4).
-fn build_tun_route_exclude_addrs(tun_ipv4_cidr: &str) -> Vec<String> {
+/// system DNS at the Tun address stays on the Tun (1.2.4 #1738 / 1.3.0-beta.1).
+fn build_tun_route_exclude_addrs(tun_ipv4_cidr: &str, private_ranges: &[String]) -> Vec<String> {
     // Unconditional: never route loopback/broadcast into Tun.
     let mut excludes = vec!["127.0.0.0/8".into(), "255.255.255.255/32".into()];
-    // Bypassable private ranges (upstream RouteProfile.h).
-    let mut private = vec![
-        "10.0.0.0/8".into(),
-        "172.16.0.0/12".into(),
-        "192.168.0.0/16".into(),
-        "169.254.0.0/16".into(),
-        "224.0.0.0/4".into(),
-    ];
+    let mut private: Vec<String> = if private_ranges.is_empty() {
+        throne_domain::default_tun_private_ranges()
+    } else {
+        private_ranges.to_vec()
+    };
     #[cfg(target_os = "macos")]
     {
         private = subtract_ipv4_prefix(&private, tun_ipv4_cidr);
@@ -832,10 +832,7 @@ fn parse_ipv4_prefix(cidr: &str) -> Option<Ipv4Prefix> {
     if bits > 32 {
         return None;
     }
-    let parts: Vec<u8> = addr
-        .split('.')
-        .filter_map(|p| p.parse().ok())
-        .collect();
+    let parts: Vec<u8> = addr.split('.').filter_map(|p| p.parse().ok()).collect();
     if parts.len() != 4 {
         return None;
     }
@@ -850,7 +847,10 @@ fn parse_ipv4_prefix(cidr: &str) -> Option<Ipv4Prefix> {
 }
 
 fn format_ipv4_prefix(p: &Ipv4Prefix) -> String {
-    format!("{}.{}.{}.{}/{}", p.addr[0], p.addr[1], p.addr[2], p.addr[3], p.bits)
+    format!(
+        "{}.{}.{}.{}/{}",
+        p.addr[0], p.addr[1], p.addr[2], p.addr[3], p.bits
+    )
 }
 
 fn prefix_contains_v4(outer: &Ipv4Prefix, inner: &Ipv4Prefix) -> bool {
@@ -1244,6 +1244,9 @@ fn is_singbox_outbound_type(ty: &str) -> bool {
             | "selector"
             | "urltest"
             | "auto-selector"
+            | "snell"
+            | "openvpn"
+            | "openconnect"
     )
 }
 
@@ -1417,6 +1420,21 @@ fn from_parsed(ty: ProfileType, o: &ParsedOutbound) -> Result<Value, CoreError> 
             }
             v
         }
+        ProfileType::Snell => {
+            let psk = o.password.clone().unwrap_or_default();
+            let version: i32 = o
+                .method
+                .as_deref()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(4);
+            json!({
+                "type": "snell",
+                "server": server,
+                "server_port": port,
+                "psk": psk,
+                "version": version
+            })
+        }
         other => {
             return Err(CoreError::Config(format!(
                 "cannot auto-build outbound for type {}",
@@ -1523,7 +1541,11 @@ fn apply_tls(v: &mut Value, o: &ParsedOutbound, default_on: bool) {
     }
     if let Some(alpn) = &o.alpn {
         if !alpn.is_empty() {
-            let list: Vec<&str> = alpn.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+            let list: Vec<&str> = alpn
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
             if !list.is_empty() {
                 t.insert("alpn".into(), json!(list));
             }
@@ -1740,10 +1762,7 @@ fn validate_darwin_tun_underlying_dns(settings: &AppSettings) -> Result<(), Core
 fn underlying_dns_address(settings: &AppSettings) -> Result<String, CoreError> {
     validate_darwin_tun_underlying_dns(settings)?;
     let t = settings.core_box_underlying_dns.trim();
-    if !t.is_empty()
-        && !t.eq_ignore_ascii_case("local")
-        && !t.eq_ignore_ascii_case("localhost")
-    {
+    if !t.is_empty() && !t.eq_ignore_ascii_case("local") && !t.eq_ignore_ascii_case("localhost") {
         return Ok(t.to_string());
     }
     // Non-Darwin: allow empty → "local" type; callers pass through build_dns_obj.
@@ -1901,7 +1920,9 @@ mod tests {
             "expected sibling prefixes, got {out:?}"
         );
         // The hole itself is never listed as an exclude.
-        assert!(!out.iter().any(|s| s == "172.19.0.0/24" || s == "172.19.0.1/24"));
+        assert!(!out
+            .iter()
+            .any(|s| s == "172.19.0.0/24" || s == "172.19.0.1/24"));
     }
 
     #[test]
@@ -1929,7 +1950,9 @@ mod tests {
         assert_eq!(built.tun_ipv4_cidr, "172.19.0.1/24");
         // Upstream: private ranges only (not bare proxy IPs).
         let excludes = tun["route_exclude_address"].as_array().unwrap();
-        assert!(excludes.iter().any(|e| e.as_str() == Some("192.168.0.0/16")));
+        assert!(excludes
+            .iter()
+            .any(|e| e.as_str() == Some("192.168.0.0/16")));
         assert!(!excludes.iter().any(|e| e.as_str() == Some("1.2.3.4/32")));
         #[cfg(target_os = "macos")]
         {
@@ -1950,12 +1973,17 @@ mod tests {
             );
         }
         // Upstream buildRouteSection
-        assert_eq!(v["route"]["default_domain_resolver"]["server"], "dns-direct");
+        assert_eq!(
+            v["route"]["default_domain_resolver"]["server"],
+            "dns-direct"
+        );
         assert_eq!(v["route"]["auto_detect_interface"], true);
         // Upstream dns object has no top-level final
         assert!(v["dns"].get("final").is_none());
         let servers = v["dns"]["servers"].as_array().unwrap();
-        assert!(servers.iter().any(|s| s["tag"] == "dns-remote" && s["detour"] == "proxy"));
+        assert!(servers
+            .iter()
+            .any(|s| s["tag"] == "dns-remote" && s["detour"] == "proxy"));
         assert!(servers.iter().any(|s| {
             s["tag"] == "dns-local" && s["type"] == "udp" && s["server"] == "223.5.5.5"
         }));
@@ -2007,7 +2035,10 @@ mod tests {
             has_proxy_direct,
             "proxy hostname must resolve via dns-direct: {rules:?}"
         );
-        assert_eq!(v["route"]["default_domain_resolver"]["server"], "dns-direct");
+        assert_eq!(
+            v["route"]["default_domain_resolver"]["server"],
+            "dns-direct"
+        );
         let servers = v["dns"]["servers"].as_array().unwrap();
         let direct = servers.iter().find(|s| s["tag"] == "dns-direct").unwrap();
         assert_eq!(direct["server"], "223.5.5.5");
@@ -2096,13 +2127,11 @@ mod tests {
         assert_eq!(v["outbounds"][0]["type"], "vless");
         assert_eq!(v["outbounds"][0]["tag"], "proxy");
         // No legacy block outbound.
-        assert!(
-            v["outbounds"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|o| o["type"] != "block")
-        );
+        assert!(v["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|o| o["type"] != "block"));
         assert_eq!(v["route"]["final"], "proxy");
         assert_eq!(v["route"]["rules"][0]["action"], "sniff");
         // OS local DNS is the only reliable default dial resolver here.
@@ -2152,7 +2181,7 @@ mod tests {
 
     #[test]
     fn compiles_bypass_china_like_route() {
-        use throne_domain::{DefaultOutbound, RouteProfile, RouteRule, outbound_ids};
+        use throne_domain::{outbound_ids, DefaultOutbound, RouteProfile, RouteRule};
 
         let mut p = Profile::new(1, 1, "n1", ProfileType::Vless);
         p.outbound = ParsedOutbound {
@@ -2251,8 +2280,7 @@ mod tests {
             let url = s["url"].as_str().unwrap();
             // Default mirror is Cloudflare jsDelivr (upstream default).
             assert!(
-                url.contains("testingcf.jsdelivr.net/gh/")
-                    || url.contains("jsdelivr.net/gh/"),
+                url.contains("testingcf.jsdelivr.net/gh/") || url.contains("jsdelivr.net/gh/"),
                 "{url}"
             );
             assert!(url.ends_with(".srs"), "{url}");
@@ -2262,10 +2290,7 @@ mod tests {
             );
         }
         // geosite-cn → MetaCubeX path via jsDelivr.
-        let cn = sets
-            .iter()
-            .find(|s| s["tag"] == "geosite-cn")
-            .unwrap();
+        let cn = sets.iter().find(|s| s["tag"] == "geosite-cn").unwrap();
         let cn_url = cn["url"].as_str().unwrap();
         assert!(
             cn_url.contains("MetaCubeX/meta-rules-dat@sing/geo/geosite/cn.srs")
@@ -2276,7 +2301,8 @@ mod tests {
 
     #[test]
     fn jsdelivr_mirror_rewrites_github_raw() {
-        let raw = "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs";
+        let raw =
+            "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs";
         let cf = apply_ruleset_mirror(raw, RulesetMirror::Cloudflare);
         assert_eq!(
             cf,
@@ -2305,8 +2331,7 @@ mod tests {
         let v: Value = serde_json::from_str(&built.core_config_json).unwrap();
         let sets = v["route"]["rule_set"].as_array().unwrap();
         assert!(
-            sets.iter()
-                .any(|s| s["tag"] == "throne-adblocksingbox"),
+            sets.iter().any(|s| s["tag"] == "throne-adblocksingbox"),
             "{sets:?}"
         );
         let rules = v["route"]["rules"].as_array().unwrap();
@@ -2388,8 +2413,7 @@ mod tests {
             "tls":{"enabled":true,"server_name":"localhost","insecure":true}
         }"#
         .into();
-        let (cfg, tags) =
-            build_url_test_config(&[&trojan, &hy2], &AppSettings::default()).unwrap();
+        let (cfg, tags) = build_url_test_config(&[&trojan, &hy2], &AppSettings::default()).unwrap();
         let v: Value = serde_json::from_str(&cfg).unwrap();
         assert_eq!(tags, vec!["p56213".to_string(), "p56206".to_string()]);
         let outs = v["outbounds"].as_array().unwrap();

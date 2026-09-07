@@ -4,7 +4,7 @@
 //! `entity.read`). Keeping the dialog layer as a sibling of `MainWindow` under this
 //! shell avoids the "cannot read while already being updated" panic.
 
-use gpui::{Context, Entity, IntoElement, Render, Window, div, prelude::*};
+use gpui::{div, prelude::*, Context, Entity, IntoElement, Render, Window};
 use gpui_component::Root;
 
 use crate::ui::main_window::MainWindow;
@@ -20,7 +20,6 @@ impl AppShell {
         let _main_obs = cx.observe(&main, |_, _, cx| cx.notify());
         Self { main, _main_obs }
     }
-
 }
 
 impl Render for AppShell {

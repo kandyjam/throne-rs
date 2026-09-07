@@ -55,8 +55,11 @@ use crate::ui::widgets::{
     TOOLBAR_BTN_W, TOOLBAR_MENU_TOP, TOOLBAR_PAD_X,
 };
 use gpui_component::{
-    button::ButtonVariant,
-    dialog::{Dialog as GpuiDialog, DialogButtonProps},
+    button::{Button, ButtonVariant, ButtonVariants as _},
+    dialog::{
+        Cancel as DialogCancel, Confirm as DialogConfirm, Dialog as GpuiDialog, DialogButtonProps,
+        DialogFooter,
+    },
     ActiveTheme as _, WindowExt as _,
 };
 
@@ -771,7 +774,10 @@ impl MainWindow {
         // Tray glyph follows scheme (template on macOS; light/dark swap on Win/Linux).
         crate::tray::apply_scheme(scheme);
         // Dock icon: light/dark tiles with upstream green crown (macOS runtime switch).
-        crate::dock_icon::apply_for_scheme(scheme.is_dark());
+        crate::dock_icon::apply_for_scheme(
+            scheme.is_dark(),
+            self.state.settings().follow_status_in_taskbar,
+        );
         // Dialog / Button / Switch / TabBar / Alert read gpui-component Theme.
         Self::sync_gpui_component_theme(scheme, None, cx);
     }
@@ -1455,9 +1461,10 @@ impl MainWindow {
         self.dialog = Dialog::tun_from_state(&self.state);
         let mtu = match &self.dialog {
             Dialog::TunSettings { vpn_mtu, .. } => vpn_mtu.clone(),
-            _ => "9000".into(),
+            _ => "1500".into(),
         };
-        self.dialog_inputs = Some(DialogInputs::tun(window, cx, &mtu));
+        let ranges = self.state.settings().vpn_private_ranges.join(", ");
+        self.dialog_inputs = Some(DialogInputs::tun(window, cx, &mtu, &ranges));
         self.present_gpui_dialog(window, cx);
         cx.notify();
     }
@@ -2568,12 +2575,32 @@ impl MainWindow {
             _ => return,
         };
         let mtu_str = match &self.dialog_inputs {
-            Some(DialogInputs::Tun { mtu }) => DialogInputs::read_string(mtu, cx),
+            Some(DialogInputs::Tun { mtu, .. }) => DialogInputs::read_string(mtu, cx),
             _ => return,
         };
         let mtu = mtu_str.parse::<i32>().unwrap_or(1500);
-        self.state
-            .apply_tun_settings(mtu, vpn_strict_route, disable_private_range_bypass, None);
+        let ranges = match &self.dialog_inputs {
+            Some(DialogInputs::Tun { private_ranges, .. }) => Some(
+                DialogInputs::read_string(private_ranges, cx)
+                    .split([',', '\n', ' '])
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        };
+        let l3 = match &self.dialog {
+            Dialog::TunSettings { vpn_l3_bridge, .. } => Some(*vpn_l3_bridge),
+            _ => None,
+        };
+        self.state.apply_tun_settings(
+            mtu,
+            vpn_strict_route,
+            disable_private_range_bypass,
+            None,
+            ranges,
+            l3,
+        );
         self.close_dialog();
         let _ = self.persist_db();
         cx.notify();
@@ -2702,6 +2729,81 @@ impl MainWindow {
                     Err(e) => this
                         .state
                         .set_status_message(format!("IP Test failed: {e}")),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn speed_test_group_id(&mut self, gid: GroupId, cx: &mut Context<Self>) {
+        self.close_menus();
+        if self.background_busy {
+            self.state.set_status_message("Busy — wait for current job");
+            cx.notify();
+            return;
+        }
+        let Some(profile) = self
+            .state
+            .all_profiles()
+            .into_iter()
+            .find(|p| p.group_id == gid)
+            .cloned()
+        else {
+            self.state
+                .set_status_message("No profiles in group to speed-test");
+            cx.notify();
+            return;
+        };
+        let id = profile.id;
+        let settings = self.state.settings().clone();
+        let test_current = matches!(
+            self.state.core_status(),
+            CoreStatus::Running { profile_id, .. } if *profile_id == id
+        );
+        let core = Arc::clone(&self.core);
+        self.background_busy = true;
+        self.state
+            .set_status_message("Speedtest selected group (first profile) …");
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut guard = core.lock().map_err(|e| format!("lock: {e}"))?;
+                    guard
+                        .speed_test_simple(Some(&profile), &settings, test_current)
+                        .map_err(|e| e.to_string())
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.background_busy = false;
+                match result {
+                    Ok(r) if r.error.is_empty() => {
+                        this.state
+                            .set_profile_speeds(id, &r.dl_speed, &r.ul_speed, r.latency);
+                        this.state.set_status_message(format!(
+                            "Speedtest group · ↓{} ↑{}",
+                            if r.dl_speed.is_empty() {
+                                "-"
+                            } else {
+                                r.dl_speed.as_str()
+                            },
+                            if r.ul_speed.is_empty() {
+                                "-"
+                            } else {
+                                r.ul_speed.as_str()
+                            }
+                        ));
+                        let _ = this.persist_db();
+                    }
+                    Ok(r) => this
+                        .state
+                        .set_status_message(format!("Speedtest group fail · {}", r.error)),
+                    Err(e) => this
+                        .state
+                        .set_status_message(format!("Speedtest group failed: {e}")),
                 }
                 cx.notify();
             })
@@ -3526,6 +3628,10 @@ impl MainWindow {
     }
 
     fn url_test_group(&mut self, cx: &mut Context<Self>) {
+        self.url_test_group_id(self.state.active_group_id(), cx);
+    }
+
+    fn url_test_group_id(&mut self, gid: GroupId, cx: &mut Context<Self>) {
         self.close_menus();
         if self.background_busy {
             self.state.set_status_message("Busy — wait for current job");
@@ -3536,7 +3642,7 @@ impl MainWindow {
             .state
             .all_profiles()
             .into_iter()
-            .filter(|profile| profile.group_id == self.state.active_group_id())
+            .filter(|profile| profile.group_id == gid)
             .cloned()
             .collect();
         if profiles.is_empty() {
@@ -3906,6 +4012,36 @@ impl MainWindow {
         true
     }
 
+    fn close_connection(&mut self, id: &str, cx: &mut Context<Self>) {
+        if id.is_empty() {
+            return;
+        }
+        let id = id.to_string();
+        let core = Arc::clone(&self.core);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut guard = core.lock().map_err(|e| format!("lock: {e}"))?;
+                    guard.close_connections(&[id]).map_err(|e| e.to_string())
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(n) => this
+                        .state
+                        .set_status_message(format!("Closed {n} connection(s)")),
+                    Err(e) => this
+                        .state
+                        .set_status_message(format!("Close connection failed: {e}")),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn poll_core_runtime(&mut self, cx: &mut Context<Self>) {
         // Always pull core stdout/stderr so Logs shows inbound/outbound traffic
         // like upstream, and so pipe buffers cannot block ThroneCore.
@@ -4267,6 +4403,7 @@ impl MainWindow {
             sub_send_hwid,
             sub_auto_update_enable,
             route_auto_update_enable,
+            url_scheme_auto_register,
         ) = match &self.dialog {
             Dialog::BasicSettings {
                 ruleset_mirror,
@@ -4279,6 +4416,7 @@ impl MainWindow {
                 sub_send_hwid,
                 sub_auto_update_enable,
                 route_auto_update_enable,
+                url_scheme_auto_register,
                 ..
             } => (
                 *ruleset_mirror,
@@ -4291,6 +4429,7 @@ impl MainWindow {
                 *sub_send_hwid,
                 *sub_auto_update_enable,
                 *route_auto_update_enable,
+                *url_scheme_auto_register,
             ),
             _ => return,
         };
@@ -4367,6 +4506,7 @@ impl MainWindow {
             adblock_enable,
             subscription,
         );
+        self.state.settings_mut().url_scheme_auto_register = url_scheme_auto_register;
         for n in notices {
             self.state.push_log(n);
         }
@@ -5126,6 +5266,12 @@ impl MainWindow {
                             t.start_subscription_group(gid, UpdateOrigin::Manual, cx);
                         });
                     }
+                    item!("gt-url", "Url Test selected Group", |t, _w, cx| {
+                        t.url_test_group_id(gid, cx);
+                    });
+                    item!("gt-spd", "Speed Test selected Group", |t, _w, cx| {
+                        t.speed_test_group_id(gid, cx);
+                    });
                 }
             }
             OpenMenu::None => {}
@@ -5747,6 +5893,15 @@ impl MainWindow {
                             self.state.core_status().is_running(),
                             &self.connections,
                             &self.connection_speeds,
+                            throne_domain::lan_inbound_enabled(
+                                &self.state.settings().inbound_address,
+                            ),
+                            {
+                                let entity = cx.entity().clone();
+                                move |id, _, cx| {
+                                    entity.update(cx, |this, cx| this.close_connection(&id, cx));
+                                }
+                            },
                         ))
                     })
                     .when(tab == 2, |el| {
@@ -6264,6 +6419,33 @@ fn lines_to_vec(s: &str) -> Vec<String> {
         .collect()
 }
 
+/// gpui-component 0.6 dropped `Dialog::confirm()`: `button_props` no longer
+/// paints a footer. Attach OK/Cancel the same way AlertDialog does.
+fn confirm_dialog_footer(
+    ok_text: impl Into<SharedString>,
+    ok_variant: ButtonVariant,
+    cancel_text: Option<&'static str>,
+) -> DialogFooter {
+    let mut footer = DialogFooter::new();
+    if let Some(cancel) = cancel_text {
+        footer = footer.child(
+            Button::new("cancel")
+                .label(cancel)
+                .on_click(|_, window, cx| {
+                    window.dispatch_action(Box::new(DialogCancel), cx);
+                }),
+        );
+    }
+    footer.child(
+        Button::new("ok")
+            .label(ok_text)
+            .with_variant(ok_variant)
+            .on_click(|_, window, cx| {
+                window.dispatch_action(Box::new(DialogConfirm { secondary: false }), cx);
+            }),
+    )
+}
+
 /// Build a gpui-component Dialog for the current MainWindow dialog state.
 ///
 /// Rebuilds every paint via `Root::render_dialog_layer` so toggles / list
@@ -6299,6 +6481,7 @@ fn build_gpui_dialog(
             sub_send_hwid,
             sub_auto_update_enable,
             route_auto_update_enable,
+            url_scheme_auto_register,
             tab,
             ..
         } => {
@@ -6327,6 +6510,7 @@ fn build_gpui_dialog(
             let sub_send_hwid = *sub_send_hwid;
             let sub_auto_update_enable = *sub_auto_update_enable;
             let route_auto_update_enable = *route_auto_update_enable;
+            let url_scheme_auto_register = *url_scheme_auto_register;
             let tab = *tab;
             let e_tab = entity.clone();
             let e_mirror = entity.clone();
@@ -6377,6 +6561,7 @@ fn build_gpui_dialog(
                     sub_send_hwid,
                     sub_auto_update_enable,
                     route_auto_update_enable,
+                    url_scheme_auto_register,
                     move |new_tab, _, cx| {
                         e_tab.update(cx, |t, cx| {
                             if let Dialog::BasicSettings { tab, .. } = &mut t.dialog {
@@ -6412,6 +6597,7 @@ fn build_gpui_dialog(
                                 sub_send_hwid,
                                 sub_auto_update_enable,
                                 route_auto_update_enable,
+                                url_scheme_auto_register,
                                 ..
                             } = &mut t.dialog
                             {
@@ -6432,6 +6618,9 @@ fn build_gpui_dialog(
                                     }
                                     BasicSubToggle::RouteAutoUpdate => {
                                         *route_auto_update_enable = !*route_auto_update_enable
+                                    }
+                                    BasicSubToggle::UrlSchemeAutoRegister => {
+                                        *url_scheme_auto_register = !*url_scheme_auto_register
                                     }
                                 }
                             }
@@ -6651,6 +6840,13 @@ fn build_gpui_dialog(
                         .cancel_text("No")
                         .show_cancel(true),
                 )
+                .footer(confirm_dialog_footer(
+                    "Yes",
+                    ButtonVariant::Primary,
+                    Some("No"),
+                ))
+                .close_button(false)
+                .overlay_closable(false)
                 .w(px(420.))
                 .on_ok(move |_, window, cx| {
                     e_yes.update(cx, |t, cx| t.confirm_remove_group(window, cx));
@@ -6723,15 +6919,22 @@ fn build_gpui_dialog(
         Dialog::TunSettings {
             vpn_strict_route,
             disable_private_range_bypass,
+            vpn_l3_bridge,
             ..
         } => {
-            let Some(DialogInputs::Tun { mtu }) = this.dialog_inputs.as_ref() else {
+            let Some(DialogInputs::Tun {
+                mtu,
+                private_ranges,
+            }) = this.dialog_inputs.as_ref()
+            else {
                 return dialog.title("Tun Settings").child(div().child("…"));
             };
             let vpn_strict_route = *vpn_strict_route;
             let disable_private_range_bypass = *disable_private_range_bypass;
+            let vpn_l3_bridge = *vpn_l3_bridge;
             let e_strict = entity.clone();
             let e_bypass = entity.clone();
+            let e_l3 = entity.clone();
             let e_save = entity.clone();
             let e_cancel = entity.clone();
             dialog
@@ -6750,8 +6953,10 @@ fn build_gpui_dialog(
                 .on_close(on_dismiss)
                 .child(tun_settings_body(
                     mtu,
+                    private_ranges,
                     vpn_strict_route,
                     disable_private_range_bypass,
+                    vpn_l3_bridge,
                     move |_, cx| {
                         e_strict.update(cx, |t, cx| {
                             if let Dialog::TunSettings {
@@ -6771,6 +6976,14 @@ fn build_gpui_dialog(
                             } = &mut t.dialog
                             {
                                 *disable_private_range_bypass = !*disable_private_range_bypass;
+                            }
+                            cx.notify();
+                        });
+                    },
+                    move |_, cx| {
+                        e_l3.update(cx, |t, cx| {
+                            if let Dialog::TunSettings { vpn_l3_bridge, .. } = &mut t.dialog {
+                                *vpn_l3_bridge = !*vpn_l3_bridge;
                             }
                             cx.notify();
                         });
@@ -6884,6 +7097,13 @@ fn build_gpui_dialog(
                         .cancel_text("Cancel")
                         .show_cancel(true),
                 )
+                .footer(confirm_dialog_footer(
+                    "Remove",
+                    ButtonVariant::Danger,
+                    Some("Cancel"),
+                ))
+                .close_button(false)
+                .overlay_closable(false)
                 .w(px(420.))
                 .on_ok(move |_, window, cx| {
                     e_confirm.update(cx, |t, cx| t.confirm_delete_unavailable(window, cx));
@@ -6931,6 +7151,13 @@ fn build_gpui_dialog(
                         .cancel_text("No")
                         .show_cancel(true),
                 )
+                .footer(confirm_dialog_footer(
+                    "Yes",
+                    ButtonVariant::Primary,
+                    Some("No"),
+                ))
+                .close_button(false)
+                .overlay_closable(false)
                 .w(px(420.))
                 .on_ok(move |_, window, cx| {
                     e_confirm.update(cx, |t, cx| {
@@ -6971,6 +7198,7 @@ fn build_gpui_dialog(
             dialog
                 .title(title)
                 .button_props(DialogButtonProps::default().ok_text("Close"))
+                .footer(confirm_dialog_footer("Close", ButtonVariant::Primary, None))
                 .w(px(560.))
                 .on_ok(move |_, window, cx| {
                     restore_ok(window, cx);

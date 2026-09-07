@@ -12,9 +12,6 @@ import (
 // addr is "Empty"). Prefer the always-on boxdns monitor — it excludes TUN/loopback
 // — so we never call networksetup against utun after auto_route flips the default
 // route. Falling back to sing-box's monitor keeps prior behavior if boxdns is down.
-//
-// networksetup commits through configd; only its plist backup copy needs root, so its
-// "Permission denied" is noise unless the command itself failed (upstream 1.2.4).
 func SetSystemDNS(addr string, interfaceMonitor tun.DefaultInterfaceMonitor) error {
 	interfaceName := physicalInterfaceName(interfaceMonitor)
 	if interfaceName == "" {
@@ -25,6 +22,7 @@ func SetSystemDNS(addr string, interfaceMonitor tun.DefaultInterfaceMonitor) err
 		return err
 	}
 
+	// networksetup commits through configd; only its plist backup needs root, so its "Permission denied" is noise.
 	output, err := shell.Exec("/usr/sbin/networksetup", "-setdnsservers", interfaceDisplayName, addr).Read()
 	if err != nil {
 		if output = strings.TrimSpace(output); output != "" {

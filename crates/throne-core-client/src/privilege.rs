@@ -89,9 +89,7 @@ pub fn core_path_beside_gui() -> Option<PathBuf> {
 
 /// True if `path`'s mount has the `nosuid` flag (setuid bit ignored by kernel).
 pub fn path_on_nosuid_volume(path: &Path) -> bool {
-    let abs = path
-        .canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf());
+    let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let abs_s = abs.to_string_lossy();
 
     let Ok(out) = Command::new("mount").output() else {
@@ -119,7 +117,9 @@ pub fn path_on_nosuid_volume(path: &Path) -> bool {
             continue;
         }
         let len = mnt.len();
-        let nosuid = opts.split(|c| c == ',' || c == ' ' || c == ')').any(|t| t == "nosuid");
+        let nosuid = opts
+            .split(|c| c == ',' || c == ' ' || c == ')')
+            .any(|t| t == "nosuid");
         if best.map(|(l, _)| len >= l).unwrap_or(true) {
             best = Some((len, nosuid));
         }
@@ -137,7 +137,8 @@ fn copy_file(src: &Path, dst: &Path) -> Result<(), String> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    std::fs::copy(src, dst).map_err(|e| format!("copy {} → {}: {e}", src.display(), dst.display()))?;
+    std::fs::copy(src, dst)
+        .map_err(|e| format!("copy {} → {}: {e}", src.display(), dst.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -309,11 +310,7 @@ pub fn elevate_core_setuid_macos(core_path: &Path) -> Result<(), String> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let msg = stderr.trim();
-    let msg = if msg.is_empty() {
-        stdout.trim()
-    } else {
-        msg
-    };
+    let msg = if msg.is_empty() { stdout.trim() } else { msg };
     if msg.contains("User canceled") || msg.contains("-128") {
         Err("administrator authentication cancelled".into())
     } else if msg.is_empty() {
@@ -348,9 +345,7 @@ pub fn get_elevated_permissions_for_core(core_path: &Path) -> ElevatedPermission
             Ok(true) => return ElevatedPermissions::Reexecing,
             Err(e) => {
                 return ElevatedPermissions::Denied {
-                    reason: format!(
-                        "Tun Mode cannot use setuid on this volume (nosuid). {e}"
-                    ),
+                    reason: format!("Tun Mode cannot use setuid on this volume (nosuid). {e}"),
                 };
             }
         }

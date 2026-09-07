@@ -34,10 +34,7 @@ impl FetchOptions {
     ///
     /// Proxy is used when `net_use_proxy` **or** system proxy mode is on, matching
     /// upstream `HTTPRequestHelper::HttpGet`.
-    pub fn from_settings(
-        settings: &AppSettings,
-        core_running: bool,
-    ) -> Result<Self, String> {
+    pub fn from_settings(settings: &AppSettings, core_running: bool) -> Result<Self, String> {
         let use_proxy = settings.net_use_proxy || settings.system_proxy_enabled;
         let mut options = if use_proxy {
             if !core_running {
@@ -268,10 +265,7 @@ mod tests {
     #[test]
     fn proxy_url_uses_normalized_mixed_inbound() {
         let options = FetchOptions::with_http_proxy("::", 2080).unwrap();
-        assert_eq!(
-            options.proxy_url.as_deref(),
-            Some("http://127.0.0.1:2080")
-        );
+        assert_eq!(options.proxy_url.as_deref(), Some("http://127.0.0.1:2080"));
     }
 
     #[test]
@@ -316,11 +310,9 @@ mod tests {
         settings.sub_send_hwid = true;
         settings.sub_custom_hwid_params = "hwid=test-id".into();
         let options = FetchOptions::from_settings(&settings, false).unwrap();
-        assert!(
-            options
-                .extra_headers
-                .iter()
-                .any(|(k, v)| k == "x-hwid" && v == "test-id")
-        );
+        assert!(options
+            .extra_headers
+            .iter()
+            .any(|(k, v)| k == "x-hwid" && v == "test-id"));
     }
 }

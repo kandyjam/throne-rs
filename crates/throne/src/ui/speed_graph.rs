@@ -3,9 +3,7 @@
 //! Keeps a fixed-size ring of rate samples (bytes/s) for proxy/direct up/down
 //! and paints a multi-line chart with GPUI `canvas` + `PathBuilder`.
 
-use gpui::{
-    Bounds, Hsla, PathBuilder, Pixels, Window, canvas, div, point, prelude::*, px, rgb,
-};
+use gpui::{canvas, div, point, prelude::*, px, rgb, Bounds, Hsla, PathBuilder, Pixels, Window};
 use throne_domain::TrafficSnapshot;
 
 use crate::theme::Theme;
@@ -97,11 +95,7 @@ pub fn nice_y_scale(max_value: i64) -> i64 {
         r as f64
     } else {
         const TABLE: [f64; 9] = [1.2, 1.6, 2.0, 2.4, 2.8, 3.2, 4.0, 6.0, 8.0];
-        TABLE
-            .iter()
-            .copied()
-            .find(|&r| value <= r)
-            .unwrap_or(10.0)
+        TABLE.iter().copied().find(|&r| value <= r).unwrap_or(10.0)
     };
     let mut out = rounded;
     for _ in 0..unit_pow {
@@ -132,10 +126,10 @@ pub fn format_rate_label(bytes_per_sec: i64) -> String {
 fn series_colors() -> [(Hsla, bool); 4] {
     // (color, dashed) — proxy solid, direct dashed
     [
-        (hsla_rgb(134, 196, 63), false),  // proxy ↑ green
-        (hsla_rgb(50, 153, 255), false),  // proxy ↓ blue
-        (hsla_rgb(0, 210, 240), true),    // direct ↑ cyan dashed
-        (hsla_rgb(235, 220, 42), true),   // direct ↓ yellow dashed
+        (hsla_rgb(134, 196, 63), false), // proxy ↑ green
+        (hsla_rgb(50, 153, 255), false), // proxy ↓ blue
+        (hsla_rgb(0, 210, 240), true),   // direct ↑ cyan dashed
+        (hsla_rgb(235, 220, 42), true),  // direct ↓ yellow dashed
     ]
 }
 
@@ -246,21 +240,17 @@ pub fn speed_graph_element(graph: &SpeedGraph) -> impl IntoElement {
                 .child(legend_chip(hsla_rgb(0, 210, 240), "Direct ↑"))
                 .child(legend_chip(hsla_rgb(235, 220, 42), "Direct ↓"))
                 .child(div().flex_1())
-                .child(
-                    div()
-                        .text_color(Theme::text_muted())
-                        .child(if empty {
-                            "Start a profile to record rates".to_string()
-                        } else {
-                            format!(
-                                "P ↑{} ↓{} · D ↑{} ↓{}",
-                                format_rate_label(latest.proxy_up),
-                                format_rate_label(latest.proxy_down),
-                                format_rate_label(latest.direct_up),
-                                format_rate_label(latest.direct_down),
-                            )
-                        }),
-                ),
+                .child(div().text_color(Theme::text_muted()).child(if empty {
+                    "Start a profile to record rates".to_string()
+                } else {
+                    format!(
+                        "P ↑{} ↓{} · D ↑{} ↓{}",
+                        format_rate_label(latest.proxy_up),
+                        format_rate_label(latest.proxy_down),
+                        format_rate_label(latest.direct_up),
+                        format_rate_label(latest.direct_down),
+                    )
+                })),
         )
         .child(
             div()
@@ -278,18 +268,15 @@ pub fn speed_graph_element(graph: &SpeedGraph) -> impl IntoElement {
                         .children(y_labels.into_iter().map(|l| div().child(l))),
                 )
                 .child(
-                    div()
-                        .flex_1()
-                        .min_h(px(80.))
-                        .child(
-                            canvas(
-                                move |_, _, _| {},
-                                move |bounds, _, window, _| {
-                                    paint_speed_graph(bounds, &samples, window);
-                                },
-                            )
-                            .size_full(),
-                        ),
+                    div().flex_1().min_h(px(80.)).child(
+                        canvas(
+                            move |_, _, _| {},
+                            move |bounds, _, window, _| {
+                                paint_speed_graph(bounds, &samples, window);
+                            },
+                        )
+                        .size_full(),
+                    ),
                 ),
         )
 }
@@ -299,13 +286,7 @@ fn legend_chip(color: Hsla, label: &'static str) -> impl IntoElement {
         .flex()
         .items_center()
         .gap_1()
-        .child(
-            div()
-                .w(px(10.))
-                .h(px(3.))
-                .rounded_full()
-                .bg(color),
-        )
+        .child(div().w(px(10.)).h(px(3.)).rounded_full().bg(color))
         .child(div().text_color(Theme::text_muted()).child(label))
 }
 

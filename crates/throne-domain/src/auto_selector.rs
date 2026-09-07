@@ -9,7 +9,7 @@
 //! instance + socks bridge). Sing-box full configs still skip as [`AutoSelectorSkip::FullConfig`].
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::models::{Group, GroupId, Profile, ProfileId, ProfileType};
 
@@ -29,6 +29,8 @@ pub enum AutoSelectorSkip {
     Unavailable,
     /// Xray full config cannot be combined with the group's landing/front proxies.
     XrayFullChained,
+    /// OpenVPN/OpenConnect endpoints are started alongside a route, not as selector members.
+    VpnEndpoint,
 }
 
 impl AutoSelectorSkip {
@@ -43,9 +45,8 @@ impl AutoSelectorSkip {
             Self::NameFilter => "filtered out by name",
             Self::CountryFilter => "filtered out by country",
             Self::Unavailable => "last test failed",
-            Self::XrayFullChained => {
-                "Xray full config cannot be combined with the group's proxies"
-            }
+            Self::XrayFullChained => "Xray full config cannot be combined with the group's proxies",
+            Self::VpnEndpoint => "OpenVPN/OpenConnect endpoint",
         }
     }
 }
@@ -588,6 +589,9 @@ fn member_skip(
         }
         ProfileType::Tailscale => return Some(AutoSelectorSkip::Tailscale),
         ProfileType::ExtraCore => return Some(AutoSelectorSkip::ExtraCore),
+        ProfileType::OpenVpn | ProfileType::OpenConnect => {
+            return Some(AutoSelectorSkip::VpnEndpoint);
+        }
         ProfileType::Custom => match classify_custom_member(member) {
             // 1.2.4: only sing-box full config is excluded; Xray full is fine
             // unless the group chains landing/front proxies (XrayFullChained).
@@ -612,10 +616,7 @@ fn member_skip(
     {
         return Some(AutoSelectorSkip::CountryFilter);
     }
-    if selector.exclude_unavailable
-        && member.latency_ms < 0
-        && has_fresh_result(member, selector)
-    {
+    if selector.exclude_unavailable && member.latency_ms < 0 && has_fresh_result(member, selector) {
         return Some(AutoSelectorSkip::Unavailable);
     }
     None
@@ -823,16 +824,14 @@ mod tests {
         assert_eq!(plan.eligible, 2);
         assert_eq!(plan.build[0], 2);
         assert_eq!(plan.build[1], 1);
-        assert!(
-            plan.skipped
-                .iter()
-                .any(|(s, n)| *s == AutoSelectorSkip::MetaType && *n == 1)
-        );
-        assert!(
-            plan.skipped
-                .iter()
-                .any(|(s, n)| *s == AutoSelectorSkip::Unavailable && *n == 1)
-        );
+        assert!(plan
+            .skipped
+            .iter()
+            .any(|(s, n)| *s == AutoSelectorSkip::MetaType && *n == 1));
+        assert!(plan
+            .skipped
+            .iter()
+            .any(|(s, n)| *s == AutoSelectorSkip::Unavailable && *n == 1));
     }
 
     #[test]
@@ -889,11 +888,10 @@ mod tests {
         assert!(plan.error.is_none(), "{:?}", plan.error);
         assert_eq!(plan.eligible, 1);
         assert_eq!(plan.build, vec![1]);
-        assert!(
-            plan.skipped
-                .iter()
-                .any(|(s, n)| *s == AutoSelectorSkip::FullConfig && *n == 1)
-        );
+        assert!(plan
+            .skipped
+            .iter()
+            .any(|(s, n)| *s == AutoSelectorSkip::FullConfig && *n == 1));
     }
 
     #[test]
