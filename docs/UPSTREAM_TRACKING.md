@@ -2,9 +2,9 @@
 
 Remote: `upstream` → `https://github.com/throneproj/Throne.git`  
 Baseline branch: `upstream/dev`  
-**Target release (this audit):** tag **`1.3.0-beta.2`** (`2feab171`, prerelease 2026-09-05).  
-Last local `upstream/dev` tip at audit: describe `1.3.0-beta.2-1-g…`.  
-**Product version:** `1.3.0-beta.2` (root [`VERSION`](../VERSION) + workspace Cargo version = this pin).
+**Target release (this audit):** tag **`1.3.0-beta.3`** (`848ff42b`, prerelease 2026-09-11).  
+Last local `upstream/dev` tip at audit: tag **`1.3.0-beta.3`**.  
+**Product version:** `1.3.0-beta.3` (root [`VERSION`](../VERSION) + workspace Cargo version = this pin).
 
 Agent skill for ongoing parity work: [`skills/throne-upstream-parity/SKILL.md`](../skills/throne-upstream-parity/SKILL.md).
 
@@ -52,6 +52,10 @@ Status legend: ✅ done · 🧩 partial · ⏳ planned · ❌ out of scope (Go c
 | WARP generate | `0957b8d5`, `61ff7a37` | ⏳ | `throne-import` |
 | Mieru | `64f74878` | 🧩 type enum | `throne-import` |
 | Config security / remove insecure | `cd7cb259` | 🧩 `security` field | `throne-domain` |
+| **Global skip_cert (1.3.0-beta.3)** | `c42111b6` | ✅ `skip_cert` setting + outbound TLS `insecure` | `throne-domain`, `throne-core-client`, `throne` |
+| **Auto Selector outage recovery (1.3.0-beta.3)** | `66c7612b` | ✅ keep unavailable members when they are the whole pool | `throne-domain` |
+| **Connections add-to-route (1.3.0-beta.3)** | `5c322220` | ✅ right-click dest/domain → current route simple rules | `throne`, `throne-domain` |
+| **Inner hop endpoints (1.3.0-beta.3)** | `8a844c5e` | 🧩 `inner_hop_endpoint_ids` persisted; generate later | `throne-domain`, `throne-storage` |
 | Tray profile + route selector | `688d1cb4`, `c632c4e9` | 🧩 tray icon + show/start-stop/quit; profile and route selector later | `throne` |
 | Sub update diff popup | `58276dd2`, `a05cc8fd` | 🧩 status bar + kept-in-use line (no modal list yet) | `throne` / `throne-domain` |
 | Proxy list search UX | `8e726191` | 🧩 text filter | `throne` |
@@ -60,7 +64,7 @@ Status legend: ✅ done · 🧩 partial · ⏳ planned · ❌ out of scope (Go c
 | Profile editor tab order (1.2.4) | `33777e27` | ⏳ GPUI focus order later | `throne` |
 | Linux CLI installer | `89f3ec1d` | ⏳ | `script/` / xtask |
 | Windows unwritable config dir (1.2.4) | `d8e663cc` | ⏳ NSI; macOS package already uses AppConfig | `script/`, `throne` |
-| Core: sing-box / xray / TUN / DNS | Go `core/server` | ❌ keep Go binary (`ThroneCore`) — **synced to 1.3.0-beta.2 sources** (sing-box replace `4db236a56cd3`, wireguard-go `cdac29e5a25e`) | `core/server` |
+| Core: sing-box / xray / TUN / DNS | Go `core/server` | ❌ keep Go binary (`ThroneCore`) — **synced to 1.3.0-beta.3 sources** (sing-box replace `b801a09c9742`, xray `7b26dbd842dc`, wireguard-go `3c774d9c2177`) | `core/server` |
 | Core IPC Start/Stop | `dispatch.go` + Qt framing | 🧩 Start/Stop/Test/QueryStats/QueryConnections/**CloseConnections** + AutoSelector RPC + Xray strategy (field 12 reserved) + **connection source field 14** | `throne-core-client`, `core/server` |
 | **Close connections (1.3.0-beta.1)** | `96d079c9` | ✅ Connections tab × + `CloseConnections` RPC | `throne`, `throne-core-client` |
 | **Connection source + LAN inbound (1.3.0-beta.2)** | `a1b6ac4b` | ✅ proto `source` + Source column when LAN inbound + wildcard listen shows LAN IP | `throne-core-client`, `throne-domain`, `throne` |
@@ -70,7 +74,7 @@ Status legend: ✅ done · 🧩 partial · ⏳ planned · ❌ out of scope (Go c
 | **Tun private ranges (1.3.0-beta.1)** | `1a512bf3` | ✅ `vpn_private_ranges` + Tun Settings editor | `throne-domain`, `throne` |
 | **Snell / OpenVPN / OpenConnect** | `e5f31546`, `3ab8b595` | 🧩 types + Snell share-link import + sing-box outbound types; VPN challenge UI later | `throne-domain`, `throne-import`, `throne-core-client` |
 | **Group URL/Speed test** | `09e49039` | ✅ group-tab context menu | `throne` |
-| **Route endpoints** | `3ab8b595` | 🧩 `endpoint_profile_ids` persisted; share/materialize later | `throne-domain`, `throne-storage` |
+| **Route endpoints** | `3ab8b595`, `8a844c5e` | 🧩 `endpoint_profile_ids` + `inner_hop_endpoint_ids` persisted; share/materialize later | `throne-domain`, `throne-storage` |
 | **Xray DNS inject (1.3.0-beta.1)** | `a7f20dd1` | ✅ stop sending reserved field 12; core injects direct-dns | `throne-core-client`, `core/server` |
 | **macOS Tun DNS addr** | `6e9848c2` | ✅ core uses tun prefix addr (not Next) + local physical iface helper | `core/server` |
 | **OTP / dashboard / JSON editor / L3 twins** | 1.3.0-beta.1 | ⏳ / 🧩 `vpn_l3_bridge` setting stored; dashboard RPC present in core, GUI later | `throne` |
@@ -99,6 +103,29 @@ Status legend: ✅ done · 🧩 partial · ⏳ planned · ❌ out of scope (Go c
 7. **Wave 1.2.4** — version pin · core sync (egress, xray full gates, DNS quiet) · Auto Selector Xray full · Tun exclude hole · sub kept-in-use ✅  
 8. **Wave 1.3.0-beta.1** — core sync (Tun/DNS, CloseConnections, VPN RPCs, sing-box 1.14) · Snell import · Tun ranges · group URL test · connection close ✅  
 9. **Wave 1.3.0-beta.2** — connection source · LAN inbound label · WG/vpn schemes · FinalMask · url_scheme_auto_register · core sing-box/WG bump ✅  
+10. **Wave 1.3.0-beta.3** — skip_cert · Auto Selector empty-pool recovery · connections add-to-route · inner-hop ids · core sing-box/Xray bump ✅  
+
+## Commit triage notes (1.3.0-beta.2 → 1.3.0-beta.3)
+
+17 commits. User-visible / core must-port vs Qt-only:
+
+| SHA | Summary | Action |
+|-----|---------|--------|
+| `66c7612b` | Auto Selector recovery from outage | ✅ keep unavailable when they are the whole pool |
+| `5e009c11` | i18n / translation context | ⏳ |
+| `e7a13b5a` | Route dialog width | N/A Qt |
+| `8a844c5e` | Inner endpoint hops | 🧩 persist `inner_hop_endpoint_ids`; generate later |
+| `25c3dac7` / `8a270ae9` | Connections focus line | N/A Qt |
+| `c42111b6` | Global insecure / skip_cert | ✅ outbound TLS `insecure` |
+| `d82783a1` | Xray asset downloader history | ⏳ combo history later |
+| `1d5bc45b` | Update sing-box | ✅ `go.mod` / `box.go` / `boxmain` |
+| `1ff14ded` | Update Xray-core v26.9.9 | ✅ replace pin |
+| `61863537` / `2d024adb` | Windows NSI process searcher | ✅ go.mod (Windows core) |
+| `c981c732` | Revert Xray pin tweak | ✅ |
+| `e00806d1` / `bc13197d` | Runtime stats in main window | 🧩 Traffic Graph already in main window |
+| `5c322220` | Connections add dest/domain to route | ✅ right-click menu |
+| `848ff42b` | Data view / EndpointHost | 🧩 `endpoint_host` already; Qt HTML N/A |
+| Inno installer / MASQUE | release notes | ⏳ Windows packager; MASQUE via sing-box bump |
 
 ## Commit triage notes (1.3.0-beta.1 → 1.3.0-beta.2)
 

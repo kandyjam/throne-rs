@@ -65,6 +65,8 @@ pub struct AutoSelectorPlan {
     pub truncated: bool,
     pub pool_cap_used: i32,
     pub build_limit_used: i32,
+    /// Failed-last-test members kept because excluding them would have emptied the pool (1.3.0-beta.3).
+    pub kept_unavailable: usize,
     /// True when ordering is untrusted and a URL test should run first.
     pub needs_ranking: bool,
     pub error: Option<String>,
@@ -660,6 +662,7 @@ pub fn plan_auto_selector(
     };
 
     let mut members: Vec<ProfileId> = Vec::new();
+    let mut unavailable: Vec<ProfileId> = Vec::new();
     for &id in &group.profile_ids {
         if id == selector_profile.id {
             continue;
@@ -667,6 +670,9 @@ pub fn plan_auto_selector(
         plan.members_in_group += 1;
         let member = lookup(id);
         if let Some(skip) = member_skip(member.as_ref(), selector, Some(group)) {
+            if skip == AutoSelectorSkip::Unavailable {
+                unavailable.push(id);
+            }
             bump(skip);
             continue;
         }
@@ -676,6 +682,13 @@ pub fn plan_auto_selector(
             }
         }
         members.push(id);
+    }
+    // Network outage: every remaining member failed its last test. Keep them
+    // rather than emitting an empty pool that can never recover.
+    if members.is_empty() && !unavailable.is_empty() {
+        plan.kept_unavailable = unavailable.len();
+        members = unavailable;
+        skip_counts.retain(|(s, _)| *s != AutoSelectorSkip::Unavailable);
     }
     plan.skipped = skip_counts;
     plan.eligible = members.len();
@@ -918,5 +931,28 @@ mod tests {
             "{:?}",
             plan.skipped
         );
+    }
+
+    #[test]
+    fn keeps_unavailable_members_when_they_are_the_whole_pool() {
+        let mut map = HashMap::new();
+        map.insert(1, make_node(1, 10, "a", -1));
+        map.insert(2, make_node(2, 10, "b", -1));
+        let selector_profile = Profile::new(99, 10, "auto", ProfileType::AutoSelector);
+        let mut cfg = AutoSelectorConfig::new_for_group(10, "auto");
+        cfg.exclude_unavailable = true;
+        let group = make_group(10, &[1, 2, 99]);
+        let plan = plan_auto_selector(&selector_profile, &cfg, Some(&group), |id| {
+            map.get(&id).cloned()
+        });
+        assert!(plan.error.is_none(), "{:?}", plan.error);
+        assert_eq!(plan.kept_unavailable, 2);
+        assert_eq!(plan.eligible, 2);
+        assert_eq!(plan.pool.len(), 2);
+        assert!(plan.pool.contains(&1) && plan.pool.contains(&2));
+        assert!(!plan
+            .skipped
+            .iter()
+            .any(|(s, _)| *s == AutoSelectorSkip::Unavailable));
     }
 }

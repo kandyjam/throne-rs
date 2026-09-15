@@ -16,7 +16,8 @@ pub use auto_selector::{
     CustomMemberKind,
 };
 pub use local_network::{
-    endpoint_host, is_own_address, lan_address, lan_inbound_enabled, lan_inbound_is_wildcard,
+    connection_route_rule, endpoint_host, is_own_address, lan_address, lan_inbound_enabled,
+    lan_inbound_is_wildcard,
 };
 pub use models::*;
 pub use route_simple::SimpleAction;

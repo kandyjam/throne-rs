@@ -19,8 +19,8 @@ Keep **throne-rs** (`rewrite/rust-gpui`) behaviorally aligned with
 |------|--------|
 | Upstream remote | `upstream` → `https://github.com/throneproj/Throne.git` |
 | Baseline branch | `upstream/dev` (or a release tag e.g. `1.2.4`) |
-| **Current pin** | tag **`1.3.0-beta.2`** (`2feab171`) |
-| **Tip tracked** | `upstream/dev` describe `1.3.0-beta.2-1-g…` |
+| **Current pin** | tag **`1.3.0-beta.3`** (`848ff42b`) |
+| **Tip tracked** | `upstream/dev` describe `1.3.0-beta.3` |
 | **1.2.5** | Never tagged; line jumped to **1.3.0-beta.1**. |
 | Product version | root [`VERSION`](../../VERSION) + workspace `Cargo.toml` `version` (= latest **released** upstream tag / `NKR_VERSION`) |
 | Parity matrix | [`docs/UPSTREAM_TRACKING.md`](../../docs/UPSTREAM_TRACKING.md) |
@@ -101,7 +101,13 @@ Packaging scripts already read root `VERSION`.
 
 When **1.2.5** is tagged: `git log --oneline 1.2.4..1.2.5` → triage → bump `VERSION` + skill pin + matrix.
 
-## 1.2.4 feature notes (current pin)
+## 1.3.0-beta.3 feature notes (current pin)
+
+Requires ThroneCore rebuilt from `core/server` ≥ **1.3.0-beta.3** (`./script/build-core`).
+
+See `docs/UPSTREAM_TRACKING.md` wave 10.
+
+## 1.2.4 feature notes
 
 Headline commits `1.2.3...1.2.4` (8 commits):
 

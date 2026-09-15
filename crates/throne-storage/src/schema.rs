@@ -77,6 +77,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), StorageError> {
             auto_update INTEGER NOT NULL DEFAULT 0,
             remote_last_update INTEGER NOT NULL DEFAULT 0,
             endpoint_profile_ids TEXT NOT NULL DEFAULT '[]',
+            inner_hop_endpoint_ids TEXT NOT NULL DEFAULT '[]',
             created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
             updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
         );
@@ -178,6 +179,12 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), StorageError> {
         conn,
         "route_profiles",
         "endpoint_profile_ids",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    add_column_if_missing(
+        conn,
+        "route_profiles",
+        "inner_hop_endpoint_ids",
         "TEXT NOT NULL DEFAULT '[]'",
     )?;
     add_column_if_missing(conn, "route_rules", "wifi_ssid_json", "TEXT")?;

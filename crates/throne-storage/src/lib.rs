@@ -209,8 +209,8 @@ impl Database {
                 r#"INSERT INTO route_profiles (
                     id, name, default_outbound_id, is_raw, raw_route,
                     prevent_modifications, is_remote, remote_url, auto_update,
-                    remote_last_update, endpoint_profile_ids
-                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)"#,
+                    remote_last_update, endpoint_profile_ids, inner_hop_endpoint_ids
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)"#,
                 params![
                     r.id,
                     r.name,
@@ -223,6 +223,7 @@ impl Database {
                     r.auto_update as i32,
                     r.remote_last_update,
                     to_json_i64_array(&r.endpoint_profile_ids),
+                    to_json_i64_array(&r.inner_hop_endpoint_ids),
                 ],
             )?;
             for (order, rule) in r.rules.iter().enumerate() {
@@ -358,7 +359,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             r#"SELECT id, name, default_outbound_id, is_raw, raw_route,
                       prevent_modifications, is_remote, remote_url, auto_update,
-                      remote_last_update, endpoint_profile_ids
+                      remote_last_update, endpoint_profile_ids, inner_hop_endpoint_ids
                FROM route_profiles ORDER BY id ASC"#,
         )?;
         let mut profiles = Vec::new();
@@ -380,6 +381,9 @@ impl Database {
                     remote_last_update: row.get::<_, Option<i64>>(9)?.unwrap_or(0),
                     endpoint_profile_ids: json_i64_list(
                         row.get::<_, Option<String>>(10)?.unwrap_or_default(),
+                    ),
+                    inner_hop_endpoint_ids: json_i64_list(
+                        row.get::<_, Option<String>>(11)?.unwrap_or_default(),
                     ),
                 })
             })?;
@@ -683,6 +687,7 @@ fn merge_settings_tx(tx: &rusqlite::Transaction<'_>, s: &AppSettings) -> Result<
         ("user_agent", s.user_agent.clone()),
         ("net_use_proxy", bool_str(s.net_use_proxy)),
         ("net_insecure", bool_str(s.net_insecure)),
+        ("skip_cert", bool_str(s.skip_cert)),
         ("sub_clear", bool_str(s.sub_clear)),
         ("sub_show_change_popup", bool_str(s.sub_show_change_popup)),
         (
@@ -798,6 +803,7 @@ fn apply_setting(s: &mut AppSettings, key: &str, value: &str) {
         "user_agent" => s.user_agent = value.to_string(),
         "net_use_proxy" => s.net_use_proxy = parse_bool(value),
         "net_insecure" => s.net_insecure = parse_bool(value),
+        "skip_cert" => s.skip_cert = parse_bool(value),
         "sub_clear" => s.sub_clear = parse_bool(value),
         "sub_show_change_popup" => s.sub_show_change_popup = parse_bool(value),
         "allow_stopping_active_profile" => s.allow_stopping_active_profile = parse_bool(value),

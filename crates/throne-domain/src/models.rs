@@ -1120,6 +1120,9 @@ pub struct AppSettings {
     /// Skip TLS certificate verification for subscription / asset downloads.
     #[serde(default)]
     pub net_insecure: bool,
+    /// Skip TLS certificate verification on outbound TLS (`SettingsRepo.skip_cert`, 1.3.0-beta.3).
+    #[serde(default)]
+    pub skip_cert: bool,
     /// Delete existing group profiles before applying a subscription snapshot.
     #[serde(default)]
     pub sub_clear: bool,
@@ -1290,6 +1293,7 @@ impl Default for AppSettings {
             user_agent: String::new(),
             net_use_proxy: false,
             net_insecure: false,
+            skip_cert: false,
             sub_clear: false,
             sub_show_change_popup: true,
             // Upstream SettingsRepo default: false (keep running profile on sub update).
@@ -1358,6 +1362,7 @@ pub struct BasicSubscriptionSettings {
     pub user_agent: String,
     pub net_use_proxy: bool,
     pub net_insecure: bool,
+    pub skip_cert: bool,
     pub sub_clear: bool,
     pub sub_show_change_popup: bool,
     pub allow_stopping_active_profile: bool,
@@ -1374,6 +1379,7 @@ impl BasicSubscriptionSettings {
             user_agent: s.user_agent.clone(),
             net_use_proxy: s.net_use_proxy,
             net_insecure: s.net_insecure,
+            skip_cert: s.skip_cert,
             sub_clear: s.sub_clear,
             sub_show_change_popup: s.sub_show_change_popup,
             allow_stopping_active_profile: s.allow_stopping_active_profile,
@@ -1646,6 +1652,9 @@ pub struct RouteProfile {
     /// OpenVPN/OpenConnect profile ids run alongside this routing profile (1.3.0-beta.1).
     #[serde(default)]
     pub endpoint_profile_ids: Vec<i64>,
+    /// Subset of `endpoint_profile_ids` whose inner chain hops are also addressable (1.3.0-beta.3).
+    #[serde(default)]
+    pub inner_hop_endpoint_ids: Vec<i64>,
 }
 
 impl RouteProfile {
@@ -1663,6 +1672,7 @@ impl RouteProfile {
             auto_update: false,
             remote_last_update: 0,
             endpoint_profile_ids: Vec::new(),
+            inner_hop_endpoint_ids: Vec::new(),
         }
     }
 

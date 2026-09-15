@@ -219,6 +219,37 @@ impl RouteProfile {
         self.rules.retain(|r| !r.is_empty_rule());
     }
 
+    /// Add one `prefix:value` line to the matching simple rule (upstream `AppendSimpleRule`).
+    pub fn append_simple_rule(&mut self, raw: &str, action: SimpleAction) -> Result<(), String> {
+        if self.is_raw {
+            return Err("cannot edit a raw routing profile".into());
+        }
+        if self.prevent_modifications {
+            return Err("routing profile is locked".into());
+        }
+        let line = raw.trim();
+        if line.is_empty() {
+            return Err("empty rule".into());
+        }
+        let Some(rule_type) = classify_simple_line(line, action) else {
+            return Err(format!("invalid rule:{raw}"));
+        };
+        if self.simple_rule_mut(rule_type).is_none() {
+            self.reset_simple_rule(rule_type, action);
+        }
+        let Some(rule) = self.simple_rule_mut(rule_type) else {
+            return Err(format!(
+                "internal error, failed to get rule for: {}",
+                SimpleAction::type_name(rule_type)
+            ));
+        };
+        if !add_simple_line(line, rule) {
+            return Err(format!("invalid rule:{raw}"));
+        }
+        self.filter_empty_rules();
+        Ok(())
+    }
+
     /// True when there are no rules and no raw body (upstream `IsEmpty`).
     pub fn is_empty_profile(&self) -> bool {
         if self.is_raw {
@@ -333,5 +364,16 @@ mod tests {
         let mut p = RouteProfile::new(1, "t");
         let err = p.update_simple_rules("nope:x", SimpleAction::Proxy);
         assert!(err.contains("invalid rule"));
+    }
+
+    #[test]
+    fn append_simple_rule_adds_one_domain_line() {
+        let mut p = RouteProfile::new(1, "t");
+        p.append_simple_rule("domain:cdn.example.com", SimpleAction::Proxy)
+            .unwrap();
+        p.append_simple_rule("domain:cdn.example.com", SimpleAction::Proxy)
+            .unwrap();
+        let text = p.simple_rules_text(SimpleAction::Proxy);
+        assert_eq!(text.matches("domain:cdn.example.com").count(), 1);
     }
 }

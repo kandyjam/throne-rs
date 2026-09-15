@@ -14,8 +14,9 @@
 //! Toolbar menus are **relative under each button** (no absolute left offsets).
 //! Secondary features open as modal dialogs: Basic Settings / Manage Groups / Add from input.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::ops::Range;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use gpui::{
@@ -30,8 +31,8 @@ use throne_core_client::{
     CoreSession,
 };
 use throne_domain::{
-    AppSettings, AppState, CoreStatus, Group, GroupId, Profile, ProfileId, ProfileSortColumn,
-    ProfileType, TrafficSnapshot,
+    connection_route_rule, AppSettings, AppState, CoreStatus, Group, GroupId, Profile, ProfileId,
+    ProfileSortColumn, ProfileType, SimpleAction, TrafficSnapshot,
 };
 use throne_import::{fetch_url_with_options, import_subscription_response, FetchOptions};
 
@@ -96,6 +97,8 @@ enum OpenMenu {
     ProfileCtx,
     /// Right-click on a group tab (or empty tab bar area).
     GroupTabCtx,
+    /// Right-click on a live connection row (add dest/domain to the current route).
+    ConnectionCtx,
 }
 
 /// Profile table sort column (click header to toggle).
@@ -344,6 +347,29 @@ fn test_progress_view(panel: &TestProgressPanel) -> (Option<f32>, String) {
     }
 }
 
+/// Record completed group URL-test rows. Duplicates (poll + final Test) are ignored.
+fn merge_group_url_test_progress(
+    completed: &mut HashSet<ProfileId>,
+    ok: &mut HashSet<ProfileId>,
+    rows: &[(ProfileId, i32, &str)],
+) {
+    for (id, lat, err) in rows {
+        if *id <= 0 {
+            continue;
+        }
+        completed.insert(*id);
+        if err.is_empty() && *lat > 0 {
+            ok.insert(*id);
+        }
+    }
+}
+
+enum GroupUrlTestEvent {
+    Partial(Vec<(i64, i32, String)>),
+    Failed(String),
+    Finished,
+}
+
 fn runtime_poll_is_current(poll_generation: u64, current_generation: u64) -> bool {
     poll_generation == current_generation
 }
@@ -561,6 +587,8 @@ pub struct MainWindow {
     ctx_menu_at: Option<(f32, f32)>,
     /// Target group for [`OpenMenu::GroupTabCtx`] (`None` = empty tab-bar area).
     ctx_group_id: Option<GroupId>,
+    /// Simple-mode rule line for [`OpenMenu::ConnectionCtx`].
+    connection_rule: Option<String>,
     dialog: Dialog,
     /// Real InputState entities for the open dialog (text source of truth while open).
     dialog_inputs: Option<DialogInputs>,
@@ -704,6 +732,7 @@ impl MainWindow {
             rendered_connection_ids: String::new(),
             ctx_menu_at: None,
             ctx_group_id: None,
+            connection_rule: None,
             dialog: Dialog::None,
             dialog_inputs: None,
             pending_nested_simple_sync: false,
@@ -1120,6 +1149,7 @@ impl MainWindow {
         self.open_menu = OpenMenu::None;
         self.ctx_menu_at = None;
         self.ctx_group_id = None;
+        self.connection_rule = None;
     }
 
     fn close_dialog(&mut self) {
@@ -3665,56 +3695,94 @@ impl MainWindow {
             .set_status_message(format!("URL Test group · {n} profile(s) …"));
         cx.notify();
         let chunks: Vec<Vec<Profile>> = profiles.chunks(16).map(|c| c.to_vec()).collect();
+        let (tx, rx) = mpsc::channel::<GroupUrlTestEvent>();
+        cx.background_executor()
+            .spawn(async move {
+                for chunk in chunks {
+                    let mut guard = match core.lock() {
+                        Ok(g) => g,
+                        Err(e) => {
+                            let _ = tx.send(GroupUrlTestEvent::Failed(format!("core lock: {e}")));
+                            return;
+                        }
+                    };
+                    let refs: Vec<&Profile> = chunk.iter().collect();
+                    let tx_progress = tx.clone();
+                    let result = guard.url_test_profiles_with_progress(&refs, &settings, |rows| {
+                        let mapped: Vec<(i64, i32, String)> = rows
+                            .iter()
+                            .map(|(pid, r)| (*pid, r.latency_ms, r.error.clone()))
+                            .collect();
+                        if !mapped.is_empty() {
+                            let _ = tx_progress.send(GroupUrlTestEvent::Partial(mapped));
+                        }
+                    });
+                    match result {
+                        Ok(rows) => {
+                            let mapped: Vec<(i64, i32, String)> = rows
+                                .into_iter()
+                                .map(|(pid, r)| (pid, r.latency_ms, r.error))
+                                .collect();
+                            if !mapped.is_empty() {
+                                let _ = tx.send(GroupUrlTestEvent::Partial(mapped));
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(GroupUrlTestEvent::Failed(e.to_string()));
+                            return;
+                        }
+                    }
+                }
+                let _ = tx.send(GroupUrlTestEvent::Finished);
+            })
+            .detach();
+
         cx.spawn(async move |this, cx| {
-            let mut total_ok = 0usize;
+            let mut completed: HashSet<ProfileId> = HashSet::new();
+            let mut ok: HashSet<ProfileId> = HashSet::new();
             let mut total_updated = 0usize;
-            let mut done = 0usize;
             let mut fatal: Option<String> = None;
 
-            for chunk in chunks {
-                let chunk_len = chunk.len();
-                let core = Arc::clone(&core);
-                let settings = settings.clone();
-                let result = cx
-                    .background_executor()
-                    .spawn(async move {
-                        let mut guard = core.lock().map_err(|e| format!("core lock: {e}"))?;
-                        let refs: Vec<&Profile> = chunk.iter().collect();
-                        let rows = guard
-                            .url_test_profiles(&refs, &settings)
-                            .map_err(|e| e.to_string())?;
-                        Ok::<Vec<(i64, i32, String)>, String>(
-                            rows.into_iter()
-                                .map(|(pid, r)| (pid, r.latency_ms, r.error))
-                                .collect(),
-                        )
-                    })
-                    .await;
+            loop {
+                let event = match rx.try_recv() {
+                    Ok(ev) => ev,
+                    Err(mpsc::TryRecvError::Empty) => {
+                        smol::Timer::after(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        if fatal.is_none() {
+                            fatal = Some("URL test worker ended unexpectedly".into());
+                        }
+                        break;
+                    }
+                };
 
-                match result {
-                    Ok(rows) => {
-                        let apply: Vec<(i64, i32, &str)> =
-                            rows.iter().map(|(a, b, c)| (*a, *b, c.as_str())).collect();
-                        let ok = rows
+                match event {
+                    GroupUrlTestEvent::Partial(rows) => {
+                        let apply: Vec<(i64, i32, &str)> = rows
                             .iter()
-                            .filter(|(_, l, e)| e.is_empty() && *l > 0)
-                            .count();
-                        done = (done + chunk_len).min(n);
+                            .filter(|(id, _, _)| *id > 0 && !completed.contains(id))
+                            .map(|(a, b, c)| (*a, *b, c.as_str()))
+                            .collect();
+                        if apply.is_empty() {
+                            continue;
+                        }
+                        merge_group_url_test_progress(&mut completed, &mut ok, &apply);
+                        let done = completed.len().min(n);
                         let _ = this.update(cx, |this, cx| {
-                            total_updated += this.state.apply_url_test_results(&apply);
-                            total_ok += ok;
+                            total_updated += this.state.apply_url_test_results_quiet(&apply);
                             if let Some(panel) = this.test_progress.as_mut() {
                                 panel.done = done;
                             }
-                            // Intermediate status stays in the top-right panel;
-                            // avoid flooding logs with per-chunk progress lines.
                             cx.notify();
                         });
                     }
-                    Err(e) => {
+                    GroupUrlTestEvent::Failed(e) => {
                         fatal = Some(e);
                         break;
                     }
+                    GroupUrlTestEvent::Finished => break,
                 }
             }
 
@@ -3724,13 +3792,14 @@ impl MainWindow {
                 if let Some(e) = fatal {
                     this.state
                         .set_status_message(format!("URL Test failed: {e}"));
-                    // Keep any completed chunk results from earlier batches.
                     if total_updated > 0 {
                         let _ = this.persist_db();
                     }
                 } else {
                     this.state.set_status_message(format!(
-                        "URL Test done · {total_ok}/{total_updated} ok"
+                        "URL Test done · {}/{} ok",
+                        ok.len(),
+                        completed.len()
                     ));
                     let _ = this.persist_db();
                 }
@@ -4010,6 +4079,25 @@ impl MainWindow {
             self.state.push_log_only(line);
         }
         true
+    }
+
+    fn add_connection_route(&mut self, action: SimpleAction, cx: &mut Context<Self>) {
+        let Some(rule) = self.connection_rule.clone() else {
+            self.state.set_status_message("No host on this connection");
+            cx.notify();
+            return;
+        };
+        match self.state.append_simple_rule_to_current(&rule, action) {
+            Ok(()) => {
+                let _ = self.persist_db();
+                if self.state.core_status().is_running() {
+                    self.state
+                        .set_status_message(format!("Added {rule} — restart to apply"));
+                }
+            }
+            Err(e) => self.state.set_status_message(e),
+        }
+        cx.notify();
     }
 
     fn close_connection(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -4400,6 +4488,7 @@ impl MainWindow {
             sub_clear,
             sub_show_change_popup,
             net_insecure,
+            skip_cert,
             sub_send_hwid,
             sub_auto_update_enable,
             route_auto_update_enable,
@@ -4413,6 +4502,7 @@ impl MainWindow {
                 sub_clear,
                 sub_show_change_popup,
                 net_insecure,
+                skip_cert,
                 sub_send_hwid,
                 sub_auto_update_enable,
                 route_auto_update_enable,
@@ -4426,6 +4516,7 @@ impl MainWindow {
                 *sub_clear,
                 *sub_show_change_popup,
                 *net_insecure,
+                *skip_cert,
                 *sub_send_hwid,
                 *sub_auto_update_enable,
                 *route_auto_update_enable,
@@ -4481,6 +4572,7 @@ impl MainWindow {
             user_agent,
             net_use_proxy,
             net_insecure,
+            skip_cert,
             sub_clear,
             sub_show_change_popup,
             allow_stopping_active_profile,
@@ -5274,6 +5366,23 @@ impl MainWindow {
                     });
                 }
             }
+            OpenMenu::ConnectionCtx => {
+                let rule = self.connection_rule.clone().unwrap_or_default();
+                if rule.is_empty() {
+                    panel = panel.child(menu_label("No host on this connection"));
+                } else {
+                    panel = panel.child(menu_label(rule));
+                    item!("cr-proxy", "Add to Proxy", |t, _w, cx| {
+                        t.add_connection_route(SimpleAction::Proxy, cx);
+                    });
+                    item!("cr-direct", "Add to Direct", |t, _w, cx| {
+                        t.add_connection_route(SimpleAction::Bypass, cx);
+                    });
+                    item!("cr-block", "Add to Block", |t, _w, cx| {
+                        t.add_connection_route(SimpleAction::Block, cx);
+                    });
+                }
+            }
             OpenMenu::None => {}
         }
 
@@ -5327,7 +5436,10 @@ impl MainWindow {
             OpenMenu::Groups => Some(2),
             OpenMenu::Routing => Some(3),
             OpenMenu::Tools => Some(4),
-            OpenMenu::ProfileCtx | OpenMenu::GroupTabCtx | OpenMenu::None => None,
+            OpenMenu::ProfileCtx
+            | OpenMenu::GroupTabCtx
+            | OpenMenu::ConnectionCtx
+            | OpenMenu::None => None,
         }
     }
 
@@ -5902,6 +6014,16 @@ impl MainWindow {
                                     entity.update(cx, |this, cx| this.close_connection(&id, cx));
                                 }
                             },
+                            {
+                                let entity = cx.entity().clone();
+                                move |dest, domain, x, y, _, cx| {
+                                    entity.update(cx, |this, cx| {
+                                        this.connection_rule =
+                                            connection_route_rule(&dest, &domain);
+                                        this.show_menu(OpenMenu::ConnectionCtx, Some((x, y)), cx);
+                                    });
+                                }
+                            },
                         ))
                     })
                     .when(tab == 2, |el| {
@@ -6266,7 +6388,10 @@ impl Render for MainWindow {
         }
 
         let dialog_open = !matches!(self.dialog, Dialog::None);
-        let ctx_open = self.open_menu == OpenMenu::ProfileCtx;
+        let ctx_open = matches!(
+            self.open_menu,
+            OpenMenu::ProfileCtx | OpenMenu::ConnectionCtx
+        );
         let group_tab_ctx_open = self.open_menu == OpenMenu::GroupTabCtx;
         let toolbar_menu_open = Self::toolbar_menu_index(self.open_menu).is_some();
 
@@ -6478,6 +6603,7 @@ fn build_gpui_dialog(
             sub_clear,
             sub_show_change_popup,
             net_insecure,
+            skip_cert,
             sub_send_hwid,
             sub_auto_update_enable,
             route_auto_update_enable,
@@ -6507,6 +6633,7 @@ fn build_gpui_dialog(
             let sub_clear = *sub_clear;
             let sub_show_change_popup = *sub_show_change_popup;
             let net_insecure = *net_insecure;
+            let skip_cert = *skip_cert;
             let sub_send_hwid = *sub_send_hwid;
             let sub_auto_update_enable = *sub_auto_update_enable;
             let route_auto_update_enable = *route_auto_update_enable;
@@ -6558,6 +6685,7 @@ fn build_gpui_dialog(
                     sub_clear,
                     sub_show_change_popup,
                     net_insecure,
+                    skip_cert,
                     sub_send_hwid,
                     sub_auto_update_enable,
                     route_auto_update_enable,
@@ -6594,6 +6722,7 @@ fn build_gpui_dialog(
                                 sub_clear,
                                 sub_show_change_popup,
                                 net_insecure,
+                                skip_cert,
                                 sub_send_hwid,
                                 sub_auto_update_enable,
                                 route_auto_update_enable,
@@ -6612,6 +6741,7 @@ fn build_gpui_dialog(
                                         *sub_show_change_popup = !*sub_show_change_popup
                                     }
                                     BasicSubToggle::NetInsecure => *net_insecure = !*net_insecure,
+                                    BasicSubToggle::SkipCert => *skip_cert = !*skip_cert,
                                     BasicSubToggle::SubSendHwid => *sub_send_hwid = !*sub_send_hwid,
                                     BasicSubToggle::SubAutoUpdate => {
                                         *sub_auto_update_enable = !*sub_auto_update_enable
@@ -7487,16 +7617,18 @@ fn build_nested_routing_dialog(
 mod tests {
     use super::{
         adjacent_profile_id, connections_ids_fingerprint, eligible_subscription_ids,
-        eligible_subscription_ids_filtered, failed_start_profile_log, next_core_action,
-        next_runtime_generation, next_sort_state, resolve_stop_profile_display,
-        running_mode_marker, runtime_poll_health, runtime_poll_is_current, runtime_profile_display,
-        should_queue_recovery_restart, should_scroll_connections_to_bottom,
-        should_scroll_logs_to_bottom, should_show_subscription_diff,
-        should_update_rendered_log_text, start_profile_log, stop_profile_log,
-        subscription_fetch_options, test_progress_bar, test_progress_lines, test_progress_percent,
-        try_take_core_logs, CoreAction, PendingProfileSwitch, SortColumn, SubscriptionUpdateQueue,
-        TestProgressKind, TestProgressPanel, UpdateOrigin, FAILED_STOP_PROFILE_LOG,
+        eligible_subscription_ids_filtered, failed_start_profile_log,
+        merge_group_url_test_progress, next_core_action, next_runtime_generation, next_sort_state,
+        resolve_stop_profile_display, running_mode_marker, runtime_poll_health,
+        runtime_poll_is_current, runtime_profile_display, should_queue_recovery_restart,
+        should_scroll_connections_to_bottom, should_scroll_logs_to_bottom,
+        should_show_subscription_diff, should_update_rendered_log_text, start_profile_log,
+        stop_profile_log, subscription_fetch_options, test_progress_bar, test_progress_lines,
+        test_progress_percent, try_take_core_logs, CoreAction, PendingProfileSwitch, SortColumn,
+        SubscriptionUpdateQueue, TestProgressKind, TestProgressPanel, UpdateOrigin,
+        FAILED_STOP_PROFILE_LOG,
     };
+    use std::collections::HashSet;
     use std::sync::Mutex;
     use throne_core_client::{ConnectionRow, CoreConfig, CoreSession};
     use throne_domain::{AppSettings, CoreStatus, Group, ProfileType};
@@ -7822,7 +7954,37 @@ mod tests {
         assert_eq!(test_progress_bar(50, 100), "#####-----");
         assert_eq!(test_progress_bar(100, 100), "##########");
         assert_eq!(test_progress_percent(1, 3), 33);
+        assert_eq!(test_progress_percent(1, 48), 2);
         assert_eq!(test_progress_percent(0, 0), 0);
+    }
+
+    #[test]
+    fn group_url_test_progress_advances_once_per_completed_node() {
+        let mut completed = HashSet::new();
+        let mut ok = HashSet::new();
+
+        merge_group_url_test_progress(&mut completed, &mut ok, &[(11, 80, "")]);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(ok.len(), 1);
+        assert_eq!(test_progress_percent(completed.len(), 48), 2);
+
+        merge_group_url_test_progress(&mut completed, &mut ok, &[(12, -1, "timeout")]);
+        assert_eq!(completed.len(), 2);
+        assert_eq!(ok.len(), 1);
+
+        // Poll + final Test both report the same tag — do not jump the bar.
+        merge_group_url_test_progress(&mut completed, &mut ok, &[(11, 80, "")]);
+        assert_eq!(completed.len(), 2);
+        assert_eq!(test_progress_percent(completed.len(), 48), 4);
+    }
+
+    #[test]
+    fn group_url_test_applies_query_url_test_poll_results() {
+        let source = include_str!("main_window.rs");
+        assert!(source.contains("url_test_profiles_with_progress"));
+        assert!(source.contains("merge_group_url_test_progress"));
+        assert!(source.contains("GroupUrlTestEvent::Partial"));
+        assert!(source.contains("panel.done = done"));
     }
 
     #[test]

@@ -197,6 +197,7 @@ pub fn connection_row(
     stripe: bool,
     show_source: bool,
     on_close: impl Fn(&mut Window, &mut App) + 'static,
+    on_context: impl Fn(f32, f32, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let bg = if stripe {
         Theme::bg_app()
@@ -214,6 +215,10 @@ pub fn connection_row(
         .border_b_1()
         .border_color(Theme::border_light())
         .text_xs()
+        .on_mouse_down(gpui::MouseButton::Right, move |ev, w, cx| {
+            cx.stop_propagation();
+            on_context(f32::from(ev.position.x), f32::from(ev.position.y), w, cx);
+        })
         .when(show_source, |el| {
             el.child(col_fixed(COL_SOURCE, display_source(&c.source), fg))
         })
@@ -257,6 +262,7 @@ pub fn connections_panel(
     speeds: &ConnectionSpeedTracker,
     show_source: bool,
     on_close: impl Fn(String, &mut Window, &mut App) + Clone + 'static,
+    on_context: impl Fn(String, String, f32, f32, &mut Window, &mut App) + Clone + 'static,
 ) -> impl IntoElement {
     if !running {
         return div()
@@ -282,6 +288,9 @@ pub fn connections_panel(
         let (up_s, down_s) = speeds.speeds(&c.id);
         let id = c.id.clone();
         let close = on_close.clone();
+        let dest = c.dest.clone();
+        let domain = c.domain.clone();
+        let context = on_context.clone();
         list = list.child(connection_row(
             c,
             up_s,
@@ -290,6 +299,9 @@ pub fn connections_panel(
             show_source,
             move |w, cx| {
                 close(id.clone(), w, cx);
+            },
+            move |x, y, w, cx| {
+                context(dest.clone(), domain.clone(), x, y, w, cx);
             },
         ));
     }

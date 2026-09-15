@@ -69,6 +69,23 @@ pub fn is_own_address(host: &str) -> bool {
         .is_some_and(|lan| lan == ip.to_string())
 }
 
+/// Simple-mode rule line for a live connection dest/domain (1.3.0-beta.3).
+pub fn connection_route_rule(dest: &str, domain: &str) -> Option<String> {
+    let domain = domain.trim();
+    if !domain.is_empty() {
+        return Some(format!("domain:{domain}"));
+    }
+    let host = endpoint_host(dest);
+    if host.is_empty() {
+        return None;
+    }
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        Some(format!("ip:{host}"))
+    } else {
+        Some(format!("domain:{host}"))
+    }
+}
+
 /// Host part of `"ip:port"` / `"[ip]:port"`. Does not split bare IPv6.
 pub fn endpoint_host(endpoint: &str) -> String {
     let s = endpoint.trim();
@@ -154,6 +171,22 @@ mod tests {
         assert_eq!(endpoint_host("10.0.0.2"), "10.0.0.2");
         assert_eq!(endpoint_host("::1"), "::1");
         assert_eq!(endpoint_host("2001:db8::1"), "2001:db8::1");
+    }
+
+    #[test]
+    fn connection_route_rule_prefers_domain_then_ip() {
+        assert_eq!(
+            connection_route_rule("1.2.3.4:443", "cdn.example.com").as_deref(),
+            Some("domain:cdn.example.com")
+        );
+        assert_eq!(
+            connection_route_rule("1.2.3.4:443", "").as_deref(),
+            Some("ip:1.2.3.4")
+        );
+        assert_eq!(
+            connection_route_rule("example.com:443", "").as_deref(),
+            Some("domain:example.com")
+        );
     }
 
     #[test]

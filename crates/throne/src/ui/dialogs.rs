@@ -108,6 +108,7 @@ pub enum Dialog {
         sub_clear: bool,
         sub_show_change_popup: bool,
         net_insecure: bool,
+        skip_cert: bool,
         sub_send_hwid: bool,
         sub_auto_update_enable: bool,
         route_auto_update_enable: bool,
@@ -212,6 +213,7 @@ impl Dialog {
             sub_clear: s.sub_clear,
             sub_show_change_popup: s.sub_show_change_popup,
             net_insecure: s.net_insecure,
+            skip_cert: s.skip_cert,
             sub_send_hwid: s.sub_send_hwid,
             sub_auto_update_enable: s.sub_auto_update_enabled(),
             route_auto_update_enable: s.route_auto_update_enabled(),
@@ -331,6 +333,7 @@ pub enum BasicSubToggle {
     SubClear,
     SubShowChangePopup,
     NetInsecure,
+    SkipCert,
     SubSendHwid,
     SubAutoUpdate,
     RouteAutoUpdate,
@@ -363,6 +366,7 @@ pub fn basic_settings_body(
     sub_clear: bool,
     sub_show_change_popup: bool,
     net_insecure: bool,
+    skip_cert: bool,
     sub_send_hwid: bool,
     sub_auto_update_enable: bool,
     route_auto_update_enable: bool,
@@ -523,6 +527,12 @@ pub fn basic_settings_body(
                     "Ignore TLS errors",
                     net_insecure,
                     BasicSubToggle::NetInsecure,
+                ))
+                .child(toggle(
+                    "bs-skip-cert",
+                    "Skip TLS certificate verification (outbounds)",
+                    skip_cert,
+                    BasicSubToggle::SkipCert,
                 ))
                 .into_any_element()
         }

@@ -216,6 +216,9 @@ pub fn build_load_config_ex(
     let mut outbounds = extra_outbounds;
     outbounds.push(outbound);
     outbounds.push(json!({ "type": "direct", "tag": "direct" }));
+    if settings.skip_cert {
+        apply_skip_cert_to_outbounds(&mut outbounds);
+    }
 
     let config = json!({
         "log": { "level": log_level, "timestamp": true },
@@ -679,6 +682,9 @@ pub fn build_url_test_config(
         tags.push(tag);
     }
     outbounds.push(json!({ "type": "direct", "tag": "direct" }));
+    if settings.skip_cert {
+        apply_skip_cert_to_outbounds(&mut outbounds);
+    }
 
     let config = json!({
         "log": { "level": log_level, "timestamp": true },
@@ -1518,6 +1524,15 @@ fn apply_transport(v: &mut Value, o: &ParsedOutbound) {
     }
 }
 
+/// Upstream `TLS.cpp`: `skip_cert` forces `insecure` on any outbound that already has TLS.
+fn apply_skip_cert_to_outbounds(outbounds: &mut [Value]) {
+    for ob in outbounds {
+        if let Some(tls) = ob.get_mut("tls").and_then(|t| t.as_object_mut()) {
+            tls.insert("insecure".into(), json!(true));
+        }
+    }
+}
+
 fn apply_tls(v: &mut Value, o: &ParsedOutbound, default_on: bool) {
     let Some(obj) = v.as_object_mut() else {
         return;
@@ -1906,6 +1921,48 @@ mod tests {
         assert!(proxy.get("connectivity_url").is_some());
         assert!(proxy.get("warm").is_some()); // latency_ms set on members
         assert_eq!(proxy["active_size"], 8);
+    }
+
+    #[test]
+    fn skip_cert_marks_tls_outbounds_insecure() {
+        let mut p = Profile::new(1, 1, "n1", ProfileType::Vless);
+        p.outbound = ParsedOutbound {
+            server: Some("1.2.3.4".into()),
+            server_port: Some(443),
+            uuid: Some("11111111-1111-1111-1111-111111111111".into()),
+            tls: Some(true),
+            insecure: Some(false),
+            ..Default::default()
+        };
+        let mut settings = AppSettings::default();
+        settings.skip_cert = true;
+        let built = build_load_config(&p, &settings, None).unwrap();
+        let v: Value = serde_json::from_str(&built.core_config_json).unwrap();
+        let proxy = v["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"] == "proxy")
+            .expect("proxy");
+        assert_eq!(proxy["tls"]["insecure"], true);
+    }
+
+    #[test]
+    fn skip_cert_also_applies_to_url_test_and_json_outbounds() {
+        let mut p = Profile::new(1, 1, "n1", ProfileType::Vless);
+        p.outbound_json = r#"{"type":"vless","server":"1.2.3.4","server_port":443,"uuid":"11111111-1111-1111-1111-111111111111","tls":{"enabled":true}}"#.into();
+        let mut settings = AppSettings::default();
+        settings.skip_cert = true;
+        let (json, tags) = build_url_test_config(&[&p], &settings).unwrap();
+        assert_eq!(tags, vec!["p1".to_string()]);
+        let v: Value = serde_json::from_str(&json).unwrap();
+        let tested = v["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"] == "p1")
+            .expect("p1");
+        assert_eq!(tested["tls"]["insecure"], true);
     }
 
     #[test]

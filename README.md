@@ -2,10 +2,10 @@
 
 **Rust + [GPUI](https://github.com/zed-industries/zed) rewrite** of [Throne](https://github.com/throneproj/Throne) (formerly Nekoray) — a cross-platform desktop GUI proxy client powered by Sing-box / Xray.
 
-**Version:** `1.3.0-beta.2` (aligned with upstream prerelease tag / `NKR_VERSION` — see root [`VERSION`](./VERSION))
+**Version:** `1.3.0-beta.3` (aligned with upstream prerelease tag / `NKR_VERSION` — see root [`VERSION`](./VERSION))
 
-> Status: **Wave 1.3.0-beta.2** — core source field + sing-box/WG bump, `wireguard://`/`vpn://` import, FinalMask, LAN inbound label + connection Source column, `url_scheme_auto_register`.  
-> Upstream remote: `upstream` → [throneproj/Throne](https://github.com/throneproj/Throne) (`dev` / tag `1.3.0-beta.2`).  
+> Status: **Wave 1.3.0-beta.3** — skip_cert on outbound TLS, Auto Selector empty-pool recovery, connections add-to-route, inner-hop endpoint ids, core sing-box/Xray bump.  
+> Upstream remote: `upstream` → [throneproj/Throne](https://github.com/throneproj/Throne) (`dev` / tag `1.3.0-beta.3`).  
 > Parity matrix: [docs/UPSTREAM_TRACKING.md](./docs/UPSTREAM_TRACKING.md) · Skill: [skills/throne-upstream-parity/SKILL.md](./skills/throne-upstream-parity/SKILL.md).
 
 ## Architecture

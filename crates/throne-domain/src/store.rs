@@ -532,6 +532,7 @@ impl AppState {
         self.settings.user_agent = subscription.user_agent;
         self.settings.net_use_proxy = subscription.net_use_proxy;
         self.settings.net_insecure = subscription.net_insecure;
+        self.settings.skip_cert = subscription.skip_cert;
         self.settings.sub_clear = subscription.sub_clear;
         self.settings.sub_show_change_popup = subscription.sub_show_change_popup;
         self.settings.allow_stopping_active_profile = subscription.allow_stopping_active_profile;
@@ -540,6 +541,37 @@ impl AppState {
         self.settings.sub_auto_update = subscription.sub_auto_update;
         self.settings.route_auto_update = subscription.route_auto_update;
         self.push_log("Basic Settings saved");
+    }
+
+    /// Append one simple-mode line to the active routing profile (1.3.0-beta.3 connections menu).
+    pub fn append_simple_rule_to_current(
+        &mut self,
+        raw: &str,
+        action: crate::route_simple::SimpleAction,
+    ) -> Result<(), String> {
+        let Some(id) = self.active_route_id.filter(|id| *id > 0) else {
+            return Err("no routing profile selected".into());
+        };
+        let name = {
+            let Some(route) = self.routes.get_mut(&id) else {
+                return Err("routing profile not found".into());
+            };
+            if route.is_raw {
+                return Err("cannot edit a raw routing profile".into());
+            }
+            if route.prevent_modifications {
+                return Err("routing profile is locked".into());
+            }
+            route.append_simple_rule(raw, action)?;
+            route.name.clone()
+        };
+        self.push_log(format!(
+            "Added {} to {} ({})",
+            raw.trim(),
+            name,
+            action.label()
+        ));
+        Ok(())
     }
 
     pub fn add_profile(
@@ -1429,6 +1461,19 @@ impl AppState {
 
     /// Apply a batch of URL-test results. `latency_ms < 0` or non-empty error → fail.
     pub fn apply_url_test_results(&mut self, results: &[(ProfileId, i32, &str)]) -> usize {
+        self.apply_url_test_results_ex(results, true)
+    }
+
+    /// Same as [`Self::apply_url_test_results`] without a log line (group poll updates).
+    pub fn apply_url_test_results_quiet(&mut self, results: &[(ProfileId, i32, &str)]) -> usize {
+        self.apply_url_test_results_ex(results, false)
+    }
+
+    fn apply_url_test_results_ex(
+        &mut self,
+        results: &[(ProfileId, i32, &str)],
+        log: bool,
+    ) -> usize {
         let mut n = 0usize;
         for (id, lat, err) in results {
             if *id <= 0 {
@@ -1444,7 +1489,7 @@ impl AppState {
                 n += 1;
             }
         }
-        if n > 0 {
+        if log && n > 0 {
             self.push_log(format!("URL Test updated {n} profile(s)"));
         }
         n
@@ -2037,6 +2082,20 @@ mod tests {
         state.apply_url_test_results(&[(profile_id, 0, "")]);
 
         assert_eq!(state.profile(profile_id).unwrap().latency_ms, 0);
+    }
+
+    #[test]
+    fn quiet_url_test_apply_updates_latency_without_status_log() {
+        let mut state = AppState::empty();
+        let group_id = state.add_group("Active");
+        let profile_id = state.add_profile(group_id, "Node", ProfileType::Vless);
+        state.set_status_message("URL Test group · 3 profile(s) …");
+
+        let n = state.apply_url_test_results_quiet(&[(profile_id, 42, "")]);
+
+        assert_eq!(n, 1);
+        assert_eq!(state.profile(profile_id).unwrap().latency_ms, 42);
+        assert_eq!(state.status_message(), "URL Test group · 3 profile(s) …");
     }
 
     #[test]

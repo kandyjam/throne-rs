@@ -33,7 +33,7 @@ pub use sys_proxy::{
 };
 
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::Shutdown;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -769,6 +769,17 @@ impl CoreSession {
         profiles: &[&Profile],
         settings: &AppSettings,
     ) -> Result<Vec<(ProfileId, UrlTestResult)>, CoreError> {
+        self.url_test_profiles_with_progress(profiles, settings, |_| {})
+    }
+
+    /// Same as [`Self::url_test_profiles`], but reports each completed tag through
+    /// `on_progress` as `QueryURLTest` drains `URLReporter` (upstream GUI poll).
+    pub fn url_test_profiles_with_progress(
+        &mut self,
+        profiles: &[&Profile],
+        settings: &AppSettings,
+        on_progress: impl FnMut(&[(ProfileId, UrlTestResult)]),
+    ) -> Result<Vec<(ProfileId, UrlTestResult)>, CoreError> {
         if profiles.is_empty() {
             return Ok(Vec::new());
         }
@@ -780,23 +791,8 @@ impl CoreSession {
             settings.test_latency_url.trim()
         };
         let payload = proto_wire::encode_test_req(&config, &tags, url, false, false, 8, 8000);
-        // Batch can take a while with many nodes.
-        let resp = self.call(
-            "Test",
-            &payload,
-            Duration::from_secs(30 + 10 * profiles.len() as u64),
-        )?;
-        let results = proto_wire::decode_test_resp(&resp)?;
-        let mut out = Vec::with_capacity(results.len());
-        for r in results {
-            let id = r
-                .outbound_tag
-                .strip_prefix('p')
-                .and_then(|s| s.parse::<ProfileId>().ok())
-                .unwrap_or(0);
-            out.push((id, r));
-        }
-        Ok(out)
+        let timeout = Duration::from_secs(30 + 10 * profiles.len() as u64);
+        self.url_test_with_query_poll(&payload, &tags, timeout, on_progress)
     }
 
     pub fn query_stats(&mut self) -> Result<TrafficSnapshot, CoreError> {
@@ -950,71 +946,235 @@ impl CoreSession {
     }
 
     #[cfg(unix)]
+    fn url_test_with_query_poll(
+        &mut self,
+        test_payload: &[u8],
+        expected_tags: &[String],
+        overall_timeout: Duration,
+        mut on_progress: impl FnMut(&[(ProfileId, UrlTestResult)]),
+    ) -> Result<Vec<(ProfileId, UrlTestResult)>, CoreError> {
+        const POLL: Duration = Duration::from_millis(200);
+        let deadline = Instant::now() + overall_timeout;
+        let expected: std::collections::HashSet<&str> =
+            expected_tags.iter().map(|s| s.as_str()).collect();
+        if let Err(e) = self.set_stream_timeouts(overall_timeout) {
+            self.abort_url_test();
+            return Err(e);
+        }
+        let test_id = match self.write_rpc("Test", test_payload) {
+            Ok(id) => id,
+            Err(e) => {
+                self.abort_url_test();
+                return Err(e);
+            }
+        };
+        let mut leftover = Vec::new();
+        let mut query_id: Option<u32> = None;
+        let mut test_body: Option<Vec<u8>> = None;
+        let mut next_query_at = Instant::now();
+
+        loop {
+            let now = Instant::now();
+            if query_id.is_none() && test_body.is_none() && now >= next_query_at {
+                match self.write_rpc("QueryURLTest", &proto_wire::encode_empty_req()) {
+                    Ok(id) => {
+                        query_id = Some(id);
+                        next_query_at = Instant::now() + POLL;
+                    }
+                    Err(e) => {
+                        self.abort_url_test();
+                        return Err(e);
+                    }
+                }
+            }
+
+            let remain = deadline.saturating_duration_since(Instant::now());
+            if remain.is_zero() {
+                self.abort_url_test();
+                return Err(CoreError::Rpc("URL test timed out".into()));
+            }
+            let wait = url_test_poll_wait(
+                query_id.is_some(),
+                test_body.is_some(),
+                next_query_at,
+                Instant::now(),
+                remain,
+                POLL,
+            );
+            if let Err(e) = self.set_stream_timeouts(wait) {
+                self.abort_url_test();
+                return Err(e);
+            }
+
+            match self.read_rpc_frame(&mut leftover) {
+                Ok(FrameRead::Frame { id, status, data }) => {
+                    if id == test_id {
+                        if status != 0 {
+                            self.abort_url_test();
+                            return Err(rpc_status_error(status, &data));
+                        }
+                        test_body = Some(data);
+                        if query_id.is_none() {
+                            break;
+                        }
+                    } else if Some(id) == query_id {
+                        query_id = None;
+                        if status == 0 {
+                            if let Ok(results) = proto_wire::decode_test_resp(&data) {
+                                let mapped = filter_url_test_progress(
+                                    map_url_test_results(results),
+                                    &expected,
+                                );
+                                if !mapped.is_empty() {
+                                    on_progress(&mapped);
+                                }
+                            }
+                        }
+                        if test_body.is_some() {
+                            break;
+                        }
+                    } else {
+                        warn!(id, "unexpected response id during url test poll");
+                        self.abort_url_test();
+                        return Err(CoreError::Rpc(
+                            "unexpected RPC response during URL test".into(),
+                        ));
+                    }
+                }
+                Ok(FrameRead::Timeout) => {
+                    if test_body.is_some() && query_id.is_none() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    self.abort_url_test();
+                    return Err(e);
+                }
+            }
+        }
+
+        let body = test_body.ok_or_else(|| CoreError::Rpc("URL test missing response".into()))?;
+        Ok(filter_url_test_progress(
+            map_url_test_results(proto_wire::decode_test_resp(&body)?),
+            &expected,
+        ))
+    }
+
+    #[cfg(not(unix))]
+    fn url_test_with_query_poll(
+        &mut self,
+        _test_payload: &[u8],
+        _expected_tags: &[String],
+        _overall_timeout: Duration,
+        _on_progress: impl FnMut(&[(ProfileId, UrlTestResult)]),
+    ) -> Result<Vec<(ProfileId, UrlTestResult)>, CoreError> {
+        Err(CoreError::NotImplemented("Windows RPC"))
+    }
+
+    /// Best-effort: cancel the in-flight core Test and drop the stream.
+    #[cfg(unix)]
+    fn abort_url_test(&mut self) {
+        #[cfg(unix)]
+        {
+            if let Some(stream) = self.stream.as_mut() {
+                if let Ok(frame) = encode_rpc_request(
+                    self.next_id.fetch_add(1, Ordering::Relaxed),
+                    "StopTest",
+                    &proto_wire::encode_empty_req(),
+                ) {
+                    let _ = stream.write_all(&frame);
+                    let _ = stream.flush();
+                }
+            }
+        }
+        self.connected = false;
+    }
+
+    #[cfg(unix)]
+    fn set_stream_timeouts(&mut self, timeout: Duration) -> Result<(), CoreError> {
+        let stream = self.stream.as_mut().ok_or(CoreError::NotRunning)?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn write_rpc(&mut self, method: &str, payload: &[u8]) -> Result<u32, CoreError> {
+        let stream = self.stream.as_mut().ok_or(CoreError::NotRunning)?;
+        let req_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let frame = encode_rpc_request(req_id, method, payload)?;
+        stream.write_all(&frame).map_err(|e| {
+            self.connected = false;
+            CoreError::Rpc(format!("write: {e}"))
+        })?;
+        stream.flush().ok();
+        Ok(req_id)
+    }
+
+    #[cfg(unix)]
+    fn read_rpc_frame(&mut self, leftover: &mut Vec<u8>) -> Result<FrameRead, CoreError> {
+        let log_buf = Arc::clone(&self.core_log_buf);
+        let stream = self.stream.as_mut().ok_or(CoreError::NotRunning)?;
+        let mut header = [0u8; 9];
+        match read_exact_with_leftover(stream, &mut header, leftover) {
+            Ok(()) => {}
+            Err(e) if is_timeout_error(&e) => return Ok(FrameRead::Timeout),
+            Err(e) => {
+                return Err(read_header_error(&e, &log_buf));
+            }
+        }
+        let id = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let status = header[4];
+        let data_len = u32::from_le_bytes([header[5], header[6], header[7], header[8]]) as usize;
+        const MAX_RPC_BODY: usize = 8 * 1024 * 1024;
+        if data_len > MAX_RPC_BODY {
+            return Err(CoreError::Rpc(format!("RPC body too large: {data_len}")));
+        }
+        let mut data = vec![0u8; data_len];
+        if data_len > 0 {
+            match read_exact_with_leftover(stream, &mut data, leftover) {
+                Ok(()) => {}
+                Err(e) if is_timeout_error(&e) => {
+                    let mut restart = header.to_vec();
+                    restart.append(leftover);
+                    *leftover = restart;
+                    return Ok(FrameRead::Timeout);
+                }
+                Err(e) => {
+                    return Err(CoreError::Rpc(format!("read body: {e}")));
+                }
+            }
+        }
+        Ok(FrameRead::Frame { id, status, data })
+    }
+
+    #[cfg(unix)]
     fn call(
         &mut self,
         method: &str,
         payload: &[u8],
         timeout: Duration,
     ) -> Result<Vec<u8>, CoreError> {
-        let stream = self.stream.as_mut().ok_or(CoreError::NotRunning)?;
-        stream.set_read_timeout(Some(timeout))?;
-        stream.set_write_timeout(Some(timeout))?;
-
-        let req_id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let method_bytes = method.as_bytes();
-        if method_bytes.len() > u16::MAX as usize {
-            return Err(CoreError::Rpc("method name too long".into()));
-        }
-
-        let mut frame = Vec::with_capacity(4 + 2 + method_bytes.len() + 4 + payload.len());
-        frame.extend_from_slice(&req_id.to_le_bytes());
-        frame.extend_from_slice(&(method_bytes.len() as u16).to_le_bytes());
-        frame.extend_from_slice(method_bytes);
-        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        frame.extend_from_slice(payload);
-        stream.write_all(&frame).map_err(|e| {
-            self.connected = false;
-            CoreError::Rpc(format!("write: {e}"))
-        })?;
-        stream.flush().ok();
-
-        // Read response header 9 bytes
-        let mut header = [0u8; 9];
-        // Clone Arc so the error closure does not re-borrow `self` while `stream` is live.
-        let log_buf = Arc::clone(&self.core_log_buf);
-        stream.read_exact(&mut header).map_err(|e| {
-            self.connected = false;
-            // Connection drop mid-call usually means the Go core panicked
-            // (historically: nil optional bool on LoadConfigReq).
-            let t = core_log_tail_from(&log_buf, 20);
-            let tail = if t.is_empty() {
-                String::new()
-            } else {
-                format!(" · core: {t}")
-            };
-            CoreError::Rpc(format!("read header: {e}{tail}"))
-        })?;
-        let resp_id = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-        let status = header[4];
-        let data_len = u32::from_le_bytes([header[5], header[6], header[7], header[8]]) as usize;
+        self.set_stream_timeouts(timeout)?;
+        let req_id = self.write_rpc(method, payload)?;
+        let mut leftover = Vec::new();
+        let (resp_id, status, data) = match self.read_rpc_frame(&mut leftover) {
+            Ok(FrameRead::Frame { id, status, data }) => (id, status, data),
+            Ok(FrameRead::Timeout) => {
+                self.connected = false;
+                return Err(CoreError::Rpc("read header: timed out".into()));
+            }
+            Err(e) => {
+                self.connected = false;
+                return Err(e);
+            }
+        };
         if resp_id != req_id {
             // In theory concurrent replies could interleave; we only send one at a time.
             warn!(resp_id, req_id, "unexpected response id");
         }
-        let mut data = vec![0u8; data_len];
-        if data_len > 0 {
-            stream.read_exact(&mut data).map_err(|e| {
-                self.connected = false;
-                CoreError::Rpc(format!("read body: {e}"))
-            })?;
-        }
         if status != 0 {
-            let msg = String::from_utf8_lossy(&data).into_owned();
-            return Err(CoreError::Rpc(if msg.is_empty() {
-                format!("RPC status={status}")
-            } else {
-                msg
-            }));
+            return Err(rpc_status_error(status, &data));
         }
         Ok(data)
     }
@@ -1298,6 +1458,124 @@ fn uuid_simple() -> String {
     format!("{t:x}-{}", std::process::id())
 }
 
+#[cfg(unix)]
+enum FrameRead {
+    Frame { id: u32, status: u8, data: Vec<u8> },
+    Timeout,
+}
+
+fn encode_rpc_request(req_id: u32, method: &str, payload: &[u8]) -> Result<Vec<u8>, CoreError> {
+    let method_bytes = method.as_bytes();
+    if method_bytes.len() > u16::MAX as usize {
+        return Err(CoreError::Rpc("method name too long".into()));
+    }
+    let mut frame = Vec::with_capacity(4 + 2 + method_bytes.len() + 4 + payload.len());
+    frame.extend_from_slice(&req_id.to_le_bytes());
+    frame.extend_from_slice(&(method_bytes.len() as u16).to_le_bytes());
+    frame.extend_from_slice(method_bytes);
+    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    frame.extend_from_slice(payload);
+    Ok(frame)
+}
+
+fn profile_id_from_outbound_tag(tag: &str) -> ProfileId {
+    tag.strip_prefix('p')
+        .and_then(|s| s.parse::<ProfileId>().ok())
+        .unwrap_or(0)
+}
+
+fn map_url_test_results(results: Vec<UrlTestResult>) -> Vec<(ProfileId, UrlTestResult)> {
+    results
+        .into_iter()
+        .map(|r| (profile_id_from_outbound_tag(&r.outbound_tag), r))
+        .collect()
+}
+
+fn filter_url_test_progress(
+    rows: Vec<(ProfileId, UrlTestResult)>,
+    expected_tags: &std::collections::HashSet<&str>,
+) -> Vec<(ProfileId, UrlTestResult)> {
+    rows.into_iter()
+        .filter(|(_, r)| expected_tags.contains(r.outbound_tag.as_str()))
+        .collect()
+}
+
+/// How long to block on the next RPC frame while Test is in flight.
+fn url_test_poll_wait(
+    query_in_flight: bool,
+    test_done: bool,
+    next_query_at: Instant,
+    now: Instant,
+    remain: Duration,
+    poll: Duration,
+) -> Duration {
+    let slot = if query_in_flight || test_done {
+        poll
+    } else {
+        next_query_at
+            .saturating_duration_since(now)
+            .max(Duration::from_millis(1))
+    };
+    remain.min(slot)
+}
+
+fn rpc_status_error(status: u8, data: &[u8]) -> CoreError {
+    let msg = String::from_utf8_lossy(data).into_owned();
+    CoreError::Rpc(if msg.is_empty() {
+        format!("RPC status={status}")
+    } else {
+        msg
+    })
+}
+
+fn is_timeout_error(err: &io::Error) -> bool {
+    matches!(err.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock)
+}
+
+fn read_header_error(err: &io::Error, log_buf: &Arc<Mutex<VecDeque<String>>>) -> CoreError {
+    // Connection drop mid-call usually means the Go core panicked
+    // (historically: nil optional bool on LoadConfigReq).
+    let t = core_log_tail_from(log_buf, 20);
+    let tail = if t.is_empty() {
+        String::new()
+    } else {
+        format!(" · core: {t}")
+    };
+    CoreError::Rpc(format!("read header: {err}{tail}"))
+}
+
+/// Read `dest` fully, using `leftover` as a prefix buffer.
+///
+/// On timeout/WouldBlock, any bytes already consumed are pushed onto
+/// `leftover` so the next attempt can resume the same frame.
+fn read_exact_with_leftover<R: Read>(
+    reader: &mut R,
+    dest: &mut [u8],
+    leftover: &mut Vec<u8>,
+) -> io::Result<()> {
+    let mut filled = leftover.len().min(dest.len());
+    if filled > 0 {
+        dest[..filled].copy_from_slice(&leftover[..filled]);
+        leftover.drain(..filled);
+    }
+    while filled < dest.len() {
+        match reader.read(&mut dest[filled..]) {
+            Ok(0) => {
+                leftover.extend_from_slice(&dest[..filled]);
+                return Err(io::Error::new(ErrorKind::UnexpectedEof, "eof"));
+            }
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) if is_timeout_error(&e) => {
+                leftover.extend_from_slice(&dest[..filled]);
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// Whether a path looks like an executable core binary.
 pub fn looks_like_core(path: &Path) -> bool {
     path.exists() && path.is_file()
@@ -1430,5 +1708,132 @@ mod tests {
         assert!(!should_stop_before_start(None));
         // An actively tracked profile must be stopped before switching.
         assert!(should_stop_before_start(Some(42)));
+    }
+
+    #[test]
+    fn outbound_tag_p_prefix_maps_to_profile_id() {
+        assert_eq!(profile_id_from_outbound_tag("p42"), 42);
+        assert_eq!(profile_id_from_outbound_tag("p0"), 0);
+        assert_eq!(profile_id_from_outbound_tag("proxy"), 0);
+        assert_eq!(profile_id_from_outbound_tag(""), 0);
+    }
+
+    #[test]
+    fn map_url_test_results_keeps_tag_and_latency() {
+        let mapped = map_url_test_results(vec![UrlTestResult {
+            outbound_tag: "p7".into(),
+            latency_ms: 88,
+            error: String::new(),
+        }]);
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(mapped[0].0, 7);
+        assert_eq!(mapped[0].1.latency_ms, 88);
+    }
+
+    #[test]
+    fn url_test_progress_drops_tags_not_in_the_current_batch() {
+        let expected = ["p1", "p2"].into_iter().collect();
+        let rows = map_url_test_results(vec![
+            UrlTestResult {
+                outbound_tag: "p1".into(),
+                latency_ms: 10,
+                error: String::new(),
+            },
+            UrlTestResult {
+                outbound_tag: "p99".into(),
+                latency_ms: 1,
+                error: String::new(),
+            },
+        ]);
+        let kept = filter_url_test_progress(rows, &expected);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].0, 1);
+    }
+
+    #[test]
+    fn url_test_poll_wait_paces_query_writes_but_still_reads_test() {
+        let poll = Duration::from_millis(200);
+        let now = Instant::now();
+        let remain = Duration::from_secs(10);
+
+        // Query in flight: wait up to POLL for its response.
+        assert_eq!(
+            url_test_poll_wait(true, false, now + poll, now, remain, poll),
+            poll
+        );
+        // Next QueryURLTest is 150ms away — do not busy-write; still wake to read Test.
+        let wait = url_test_poll_wait(
+            false,
+            false,
+            now + Duration::from_millis(150),
+            now,
+            remain,
+            poll,
+        );
+        assert_eq!(wait, Duration::from_millis(150));
+        // Test already finished: drain any in-flight query promptly.
+        assert_eq!(
+            url_test_poll_wait(false, true, now + poll, now, remain, poll),
+            poll
+        );
+    }
+
+    struct TimeoutAfter {
+        data: Vec<u8>,
+        pos: usize,
+        max_bytes: usize,
+        given: usize,
+    }
+
+    impl Read for TimeoutAfter {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.given >= self.max_bytes {
+                return Err(io::Error::new(ErrorKind::TimedOut, "timeout"));
+            }
+            let remain = self.data.len().saturating_sub(self.pos);
+            let n = remain.min(buf.len()).min(self.max_bytes - self.given);
+            if n == 0 {
+                return Ok(0);
+            }
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            self.given += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn read_exact_with_leftover_resumes_after_timeout() {
+        let bytes: Vec<u8> = (0u8..9).collect();
+        let mut first = TimeoutAfter {
+            data: bytes.clone(),
+            pos: 0,
+            max_bytes: 4,
+            given: 0,
+        };
+        let mut leftover = Vec::new();
+        let mut dest = [0u8; 9];
+        let err = read_exact_with_leftover(&mut first, &mut dest, &mut leftover).unwrap_err();
+        assert!(is_timeout_error(&err));
+        assert_eq!(leftover, bytes[..4]);
+
+        let mut second = TimeoutAfter {
+            data: bytes[4..].to_vec(),
+            pos: 0,
+            max_bytes: 8,
+            given: 0,
+        };
+        dest = [0u8; 9];
+        read_exact_with_leftover(&mut second, &mut dest, &mut leftover).unwrap();
+        assert_eq!(dest.as_slice(), bytes.as_slice());
+        assert!(leftover.is_empty());
+    }
+
+    #[test]
+    fn group_url_test_polls_query_url_test_while_test_runs() {
+        let source = include_str!("lib.rs");
+        assert!(source.contains("QueryURLTest"));
+        assert!(source.contains("url_test_profiles_with_progress"));
+        assert!(source.contains("on_progress"));
     }
 }
