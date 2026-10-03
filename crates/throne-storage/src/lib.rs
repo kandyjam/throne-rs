@@ -670,6 +670,8 @@ fn merge_settings_tx(tx: &rusqlite::Transaction<'_>, s: &AppSettings) -> Result<
         ("vpn_strict_route", bool_str(s.vpn_strict_route)),
         ("vpn_mtu", s.vpn_mtu.to_string()),
         ("vpn_tun_ipv4_cidr", s.vpn_tun_ipv4_cidr.clone()),
+        ("vpn_ipv6", bool_str(s.vpn_ipv6)),
+        ("vpn_tun_ipv6_cidr", s.vpn_tun_ipv6_cidr.clone()),
         (
             "disable_private_range_bypass",
             bool_str(s.disable_private_range_bypass),
@@ -726,6 +728,7 @@ fn merge_settings_tx(tx: &rusqlite::Transaction<'_>, s: &AppSettings) -> Result<
         ("dns_cache_capacity", s.dns_cache_capacity.to_string()),
         ("dns_disable_cache", bool_str(s.dns_disable_cache)),
         ("dns_disable_expire", bool_str(s.dns_disable_expire)),
+        ("dns_persist_cache", bool_str(s.dns_persist_cache)),
         ("dns_reverse_mapping", bool_str(s.dns_reverse_mapping)),
         ("enable_dns_routing", bool_str(s.enable_dns_routing)),
         ("use_dns_object", bool_str(s.use_dns_object)),
@@ -841,7 +844,12 @@ fn apply_setting(s: &mut AppSettings, key: &str, value: &str) {
             }
         }
         "remember_enable" => s.remember_enable = parse_bool(value),
-        "vpn_private_ranges" => s.vpn_private_ranges = json_str_list(Some(value.to_string())),
+        "vpn_ipv6" => s.vpn_ipv6 = parse_bool(value),
+        "vpn_tun_ipv6_cidr" => s.vpn_tun_ipv6_cidr = value.to_string(),
+        "vpn_private_ranges" => {
+            s.vpn_private_ranges =
+                throne_domain::upgrade_tun_private_ranges(json_str_list(Some(value.to_string())))
+        }
         "vpn_l3_bridge" => s.vpn_l3_bridge = parse_bool(value),
         "follow_status_in_taskbar" => s.follow_status_in_taskbar = parse_bool(value),
         "url_scheme_auto_register" => s.url_scheme_auto_register = parse_bool(value),
@@ -881,6 +889,7 @@ fn apply_setting(s: &mut AppSettings, key: &str, value: &str) {
         }
         "dns_disable_cache" => s.dns_disable_cache = parse_bool(value),
         "dns_disable_expire" => s.dns_disable_expire = parse_bool(value),
+        "dns_persist_cache" => s.dns_persist_cache = parse_bool(value),
         "dns_reverse_mapping" => s.dns_reverse_mapping = parse_bool(value),
         "enable_dns_routing" => s.enable_dns_routing = parse_bool(value),
         "use_dns_object" => s.use_dns_object = parse_bool(value),

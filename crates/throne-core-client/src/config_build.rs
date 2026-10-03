@@ -122,9 +122,15 @@ pub fn build_load_config_ex(
     let mut tun_ipv4_cidr = String::new();
     let outbound = proxy_outbound;
     if settings.tun_mode_enabled {
-        // Upstream buildDNSSection: Darwin Tun requires core_box_underlying_dns.
-        validate_darwin_tun_underlying_dns(settings)?;
+        // 1.3.0: Darwin Tun no longer requires a Local override IP. `local` stays the OS resolver.
         tun_ipv4_cidr = normalize_tun_ipv4_cidr(&settings.vpn_tun_ipv4_cidr);
+        let tun_ipv6_cidr = settings
+            .vpn_ipv6
+            .then(|| normalize_tun_ipv6_cidr(&settings.vpn_tun_ipv6_cidr));
+        let mut tun_addrs = vec![json!(tun_ipv4_cidr.clone())];
+        if let Some(v6) = &tun_ipv6_cidr {
+            tun_addrs.push(json!(v6));
+        }
         // Platform stack defaults match upstream SettingsRepo (macOS → gvisor).
         let stack = default_tun_stack();
         let mut tun = json!({
@@ -134,7 +140,7 @@ pub fn build_load_config_ex(
             "strict_route": settings.vpn_strict_route,
             "mtu": settings.vpn_mtu.clamp(1280, 65535),
             "stack": stack,
-            "address": [tun_ipv4_cidr.clone()]
+            "address": tun_addrs
         });
         // Upstream genTunName(): macOS "" (omit); else "throne-tun".
         if let Some(name) = default_tun_interface_name() {
@@ -156,8 +162,11 @@ pub fn build_load_config_ex(
         //   repointed at tunIP+1 (inside that subnet), and excluding the whole
         //   172.16.0.0/12 would black-hole every DNS query.
         if !settings.disable_private_range_bypass {
-            let excludes =
-                build_tun_route_exclude_addrs(&tun_ipv4_cidr, &settings.vpn_private_ranges);
+            let excludes = build_tun_route_exclude_addrs(
+                &tun_ipv4_cidr,
+                tun_ipv6_cidr.as_deref(),
+                &settings.vpn_private_ranges,
+            );
             tun.as_object_mut()
                 .unwrap()
                 .insert("route_exclude_address".into(), json!(excludes));
@@ -235,8 +244,8 @@ pub fn build_load_config_ex(
             },
             "cache_file": {
                 "enabled": true,
-                "store_fakeip": true,
-                "store_rdrc": true
+                "store_fakeip": settings.dns_persist_cache,
+                "store_dns": settings.dns_persist_cache
             }
         }
     });
@@ -763,7 +772,11 @@ fn normalize_tun_ipv4_cidr(raw: &str) -> String {
 ///
 /// On Darwin, `subtract_prefix` carves the Tun CIDR out of the exclude list so
 /// system DNS at the Tun address stays on the Tun (1.2.4 #1738 / 1.3.0-beta.1).
-fn build_tun_route_exclude_addrs(tun_ipv4_cidr: &str, private_ranges: &[String]) -> Vec<String> {
+fn build_tun_route_exclude_addrs(
+    tun_ipv4_cidr: &str,
+    tun_ipv6_cidr: Option<&str>,
+    private_ranges: &[String],
+) -> Vec<String> {
     // Unconditional: never route loopback/broadcast into Tun.
     let mut excludes = vec!["127.0.0.0/8".into(), "255.255.255.255/32".into()];
     let mut private: Vec<String> = if private_ranges.is_empty() {
@@ -773,94 +786,123 @@ fn build_tun_route_exclude_addrs(tun_ipv4_cidr: &str, private_ranges: &[String])
     };
     #[cfg(target_os = "macos")]
     {
-        private = subtract_ipv4_prefix(&private, tun_ipv4_cidr);
+        // #1738: a bypass covering the Tun subnet black-holes system DNS (IPv4, and IPv6 when enabled).
+        private = subtract_ip_prefix(&private, tun_ipv4_cidr);
+        if let Some(v6) = tun_ipv6_cidr {
+            private = subtract_ip_prefix(&private, v6);
+        }
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = tun_ipv4_cidr;
+        let _ = (tun_ipv4_cidr, tun_ipv6_cidr);
     }
     excludes.extend(private);
     excludes
 }
 
-/// Upstream `subtractPrefix` (IPv4 only — Tun default is IPv4).
-///
-/// When `hole` sits inside a range, replace that range with the complementary
-/// siblings so the hole stays routed through Tun while the rest is still bypassed.
+fn normalize_tun_ipv6_cidr(raw: &str) -> String {
+    let t = raw.trim();
+    if t.contains(':') && t.contains('/') {
+        t.to_string()
+    } else {
+        "fdfe:dcba:9876::1/96".into()
+    }
+}
+
+#[cfg(test)]
 fn subtract_ipv4_prefix(ranges: &[String], hole: &str) -> Vec<String> {
-    let Some(cut) = parse_ipv4_prefix(hole) else {
+    subtract_ip_prefix(ranges, hole)
+}
+
+/// Upstream `subtractPrefix` for IPv4 and IPv6.
+///
+/// When `hole` sits inside a same-family range, replace that range with the
+/// complementary siblings so the hole stays on Tun and the rest is still bypassed.
+fn subtract_ip_prefix(ranges: &[String], hole: &str) -> Vec<String> {
+    let Some(cut) = parse_ip_prefix(hole) else {
         return ranges.to_vec();
     };
     let mut out = Vec::new();
     for entry in ranges {
-        let Some(range) = parse_ipv4_prefix(entry) else {
+        let Some(range) = parse_ip_prefix(entry) else {
             out.push(entry.clone());
             continue;
         };
-        // hole fully contains range → drop range
-        if prefix_contains_v4(&cut, &range) {
-            continue;
-        }
-        // range does not contain hole → keep as-is
-        if !prefix_contains_v4(&range, &cut) {
+        if range.addr.len() != cut.addr.len() {
             out.push(entry.clone());
             continue;
         }
-        // range contains hole → emit siblings that cover range \ hole
+        if prefix_contains(&cut, &range) {
+            continue;
+        }
+        if !prefix_contains(&range, &cut) {
+            out.push(entry.clone());
+            continue;
+        }
+        let width = (range.addr.len() * 8) as u8;
         for bits in (range.bits + 1)..=cut.bits {
-            let mut sibling = cut;
+            let mut sibling = cut.clone();
             sibling.bits = bits;
             let flipped = bits - 1;
             let byte = (flipped / 8) as usize;
             let bit = flipped % 8;
             sibling.addr[byte] ^= 0x80u8 >> bit;
-            // zero host bits below `bits`
-            for i in bits..32 {
+            for i in bits..width {
                 let b = (i / 8) as usize;
                 let m = 0x80u8 >> (i % 8);
                 sibling.addr[b] &= !m;
             }
-            out.push(format_ipv4_prefix(&sibling));
+            out.push(format_ip_prefix(&sibling));
         }
     }
     out
 }
 
-#[derive(Clone, Copy)]
-struct Ipv4Prefix {
-    addr: [u8; 4],
+#[derive(Clone)]
+struct IpPrefix {
+    addr: Vec<u8>,
     bits: u8,
 }
 
-fn parse_ipv4_prefix(cidr: &str) -> Option<Ipv4Prefix> {
-    let (addr, pref) = cidr.trim().split_once('/')?;
+fn parse_ip_prefix(cidr: &str) -> Option<IpPrefix> {
+    let (addr_s, pref) = cidr.trim().split_once('/')?;
     let bits: u8 = pref.parse().ok()?;
-    if bits > 32 {
+    let ip: std::net::IpAddr = addr_s
+        .trim()
+        .trim_matches(|c| c == '[' || c == ']')
+        .parse()
+        .ok()?;
+    let mut addr = match ip {
+        std::net::IpAddr::V4(v) => v.octets().to_vec(),
+        std::net::IpAddr::V6(v) => v.octets().to_vec(),
+    };
+    let width = (addr.len() * 8) as u8;
+    if bits > width {
         return None;
     }
-    let parts: Vec<u8> = addr.split('.').filter_map(|p| p.parse().ok()).collect();
-    if parts.len() != 4 {
-        return None;
-    }
-    let mut a = [parts[0], parts[1], parts[2], parts[3]];
-    // Normalize network address: zero host bits
-    for i in bits..32 {
+    for i in bits..width {
         let b = (i / 8) as usize;
         let m = 0x80u8 >> (i % 8);
-        a[b] &= !m;
+        addr[b] &= !m;
     }
-    Some(Ipv4Prefix { addr: a, bits })
+    Some(IpPrefix { addr, bits })
 }
 
-fn format_ipv4_prefix(p: &Ipv4Prefix) -> String {
-    format!(
-        "{}.{}.{}.{}/{}",
-        p.addr[0], p.addr[1], p.addr[2], p.addr[3], p.bits
-    )
+fn format_ip_prefix(p: &IpPrefix) -> String {
+    if p.addr.len() == 4 {
+        format!(
+            "{}.{}.{}.{}/{}",
+            p.addr[0], p.addr[1], p.addr[2], p.addr[3], p.bits
+        )
+    } else {
+        let mut octets = [0u8; 16];
+        octets.copy_from_slice(&p.addr);
+        format!("{}/{}", std::net::Ipv6Addr::from(octets), p.bits)
+    }
 }
 
-fn prefix_contains_v4(outer: &Ipv4Prefix, inner: &Ipv4Prefix) -> bool {
-    if outer.bits > inner.bits {
+fn prefix_contains(outer: &IpPrefix, inner: &IpPrefix) -> bool {
+    if outer.addr.len() != inner.addr.len() || outer.bits > inner.bits {
         return false;
     }
     let whole = (outer.bits / 8) as usize;
@@ -1754,28 +1796,10 @@ fn collect_outbound_server_domains(profile: &Profile) -> Vec<String> {
     out
 }
 
-/// Upstream generate.cpp Darwin Tun guard:
-/// "Local DNS and Tun mode do not work together, please set an IP…"
-fn validate_darwin_tun_underlying_dns(settings: &AppSettings) -> Result<(), CoreError> {
-    #[cfg(target_os = "macos")]
-    {
-        if !settings.tun_mode_enabled {
-            return Ok(());
-        }
-        let t = settings.core_box_underlying_dns.trim();
-        if t.is_empty() || t.eq_ignore_ascii_case("local") || t.eq_ignore_ascii_case("localhost") {
-            return Err(CoreError::Config(
-                "Local DNS and Tun mode do not work together, please set an IP to be used as the Local DNS server in the Routing Settings -> Local override".into(),
-            ));
-        }
-    }
-    let _ = settings;
-    Ok(())
-}
-
-/// Concrete IP/host for dns-local under Tun (after Darwin validation).
+/// Concrete IP/host for dns-local under Tun.
+///
+/// 1.3.0 dropped the Darwin error that required Local override. Empty stays `local`.
 fn underlying_dns_address(settings: &AppSettings) -> Result<String, CoreError> {
-    validate_darwin_tun_underlying_dns(settings)?;
     let t = settings.core_box_underlying_dns.trim();
     if !t.is_empty() && !t.eq_ignore_ascii_case("local") && !t.eq_ignore_ascii_case("localhost") {
         return Ok(t.to_string());
@@ -1786,27 +1810,14 @@ fn underlying_dns_address(settings: &AppSettings) -> Result<String, CoreError> {
 
 /// Upstream `buildDnsObj(address, ctx)`.
 ///
-/// On Darwin + Tun, `local`/`localhost` is rewritten to UDP against
-/// `core_box_underlying_dns` (must already be validated non-empty).
+/// `local` / `localhost` stays type `local` on every OS, including Darwin Tun (1.3.0).
 fn build_dns_obj(address: &str, tun_enabled: bool, underlying: &str) -> Value {
+    let _ = (tun_enabled, underlying);
     let address = address.trim();
     if address.is_empty()
         || address.eq_ignore_ascii_case("local")
         || address.eq_ignore_ascii_case("localhost")
     {
-        if tun_enabled {
-            #[cfg(target_os = "macos")]
-            {
-                // Upstream: type udp + server = core_box_underlying_dns
-                if !underlying.is_empty() {
-                    return json!({ "type": "udp", "server": underlying });
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                let _ = underlying;
-            }
-        }
         return json!({ "type": "local" });
     }
 
@@ -1875,7 +1886,6 @@ mod tests {
     fn tun_settings() -> AppSettings {
         let mut settings = AppSettings::default();
         settings.tun_mode_enabled = true;
-        // Upstream Darwin Tun hard-requires Local override (core_box_underlying_dns).
         settings.core_box_underlying_dns = "223.5.5.5".into();
         settings.direct_dns = "223.5.5.5".into();
         settings.remote_dns = "8.8.8.8".into();
@@ -2105,9 +2115,8 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
-    fn tun_requires_underlying_dns_on_darwin() {
-        // Upstream generate.cpp hard error when core_box_underlying_dns empty.
+    fn tun_allows_local_dns_without_override() {
+        // 1.3.0 dropped the Darwin "Local DNS and Tun mode do not work together" error.
         let mut p = Profile::new(1, 1, "n1", ProfileType::Vless);
         p.outbound = ParsedOutbound {
             server: Some("1.2.3.4".into()),
@@ -2118,12 +2127,40 @@ mod tests {
         let mut settings = AppSettings::default();
         settings.tun_mode_enabled = true;
         settings.core_box_underlying_dns.clear();
-        let err = build_load_config(&p, &settings, None).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("Local DNS and Tun mode do not work together"),
-            "unexpected error: {msg}"
-        );
+        let built = build_load_config(&p, &settings, None).unwrap();
+        let v: Value = serde_json::from_str(&built.core_config_json).unwrap();
+        let local = v["dns"]["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["tag"] == "dns-local")
+            .unwrap();
+        assert_eq!(local["type"], "local");
+        assert_eq!(v["experimental"]["cache_file"]["store_dns"], false);
+        assert_eq!(v["experimental"]["cache_file"]["store_fakeip"], false);
+        assert!(v["inbounds"][1]["route_exclude_address"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e.as_str() == Some("fc00::/7")));
+    }
+
+    #[test]
+    fn dns_persist_cache_opts_into_store_dns() {
+        let mut p = Profile::new(1, 1, "n1", ProfileType::Vless);
+        p.outbound = ParsedOutbound {
+            server: Some("1.2.3.4".into()),
+            server_port: Some(443),
+            uuid: Some("u".into()),
+            ..Default::default()
+        };
+        let mut settings = AppSettings::default();
+        settings.dns_persist_cache = true;
+        let built = build_load_config(&p, &settings, None).unwrap();
+        let v: Value = serde_json::from_str(&built.core_config_json).unwrap();
+        assert_eq!(v["experimental"]["cache_file"]["enabled"], true);
+        assert_eq!(v["experimental"]["cache_file"]["store_dns"], true);
+        assert_eq!(v["experimental"]["cache_file"]["store_fakeip"], true);
     }
 
     #[test]

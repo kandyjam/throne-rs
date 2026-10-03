@@ -4003,6 +4003,14 @@ impl MainWindow {
                             imported.user_info.unwrap_or_default(),
                             chrono::Utc::now().timestamp(),
                         ) {
+                            Ok(report) if report.rejected_empty => {
+                                this.state.push_log(format!(
+                                    "<<<<<<<< No profiles found in the subscription: {name} was left unchanged."
+                                ));
+                                this.state.set_status_message(format!(
+                                    "Subscription {name} unchanged (no profiles in response)"
+                                ));
+                            }
                             Ok(report) => {
                                 let body = format_subscription_changes(&report);
                                 match this.persist_db() {

@@ -2,23 +2,25 @@
 
 Remote: `upstream` → `https://github.com/throneproj/Throne.git`  
 Baseline branch: `upstream/dev`  
-**Target release (this audit):** tag **`1.3.0-beta.3`** (`848ff42b`, prerelease 2026-09-11).  
-Last local `upstream/dev` tip at audit: tag **`1.3.0-beta.3`**.  
-**Product version:** `1.3.0-beta.3` (root [`VERSION`](../VERSION) + workspace Cargo version = this pin).
+**Target release (this audit):** tag **`1.3.2`** (`9dd4fe96`, 2026-09-29).  
+`upstream/dev` at audit: **`1.3.2-20-ga7534e3d`** (20 commits past the pin; not absorbed).  
+**Product version:** `1.3.2` (root [`VERSION`](../VERSION) + workspace Cargo version = this pin).
 
 Agent skill for ongoing parity work: [`skills/throne-upstream-parity/SKILL.md`](../skills/throne-upstream-parity/SKILL.md).
 
 ## How to refresh
 
 ```bash
+./script/upstream-audit            # current VERSION → newest 1.* tag
+./script/upstream-audit 1.3.3      # explicit next tag
+```
+
+Manual equivalent:
+
+```bash
 git fetch upstream --prune --tags
-git log --oneline upstream/dev -50
-# optional: commits since last audit
-git log --oneline <last-audited>..upstream/dev
-# vs release
-git log --oneline 1.2.3..1.2.4
-# when 1.2.5 lands:
-git log --oneline 1.2.4..1.2.5
+git log --oneline 1.3.2..1.3.3
+git diff --dirstat=files,0 1.3.2 1.3.3
 ```
 
 ## Feature parity matrix
@@ -64,7 +66,7 @@ Status legend: ✅ done · 🧩 partial · ⏳ planned · ❌ out of scope (Go c
 | Profile editor tab order (1.2.4) | `33777e27` | ⏳ GPUI focus order later | `throne` |
 | Linux CLI installer | `89f3ec1d` | ⏳ | `script/` / xtask |
 | Windows unwritable config dir (1.2.4) | `d8e663cc` | ⏳ NSI; macOS package already uses AppConfig | `script/`, `throne` |
-| Core: sing-box / xray / TUN / DNS | Go `core/server` | ❌ keep Go binary (`ThroneCore`) — **synced to 1.3.0-beta.3 sources** (sing-box replace `b801a09c9742`, xray `7b26dbd842dc`, wireguard-go `3c774d9c2177`) | `core/server` |
+| Core: sing-box / xray / TUN / DNS | Go `core/` (moved out of `core/server` in 1.3.0-beta.4) | ❌ keep Go binary (`ThroneCore`) — **synced to 1.3.2** (sing-box `b4be66275d73`, xray `e662c22ab109`, wireguard-go `f60e4eda0d08`) | `core/` |
 | Core IPC Start/Stop | `dispatch.go` + Qt framing | 🧩 Start/Stop/Test/QueryStats/QueryConnections/**CloseConnections** + AutoSelector RPC + Xray strategy (field 12 reserved) + **connection source field 14** | `throne-core-client`, `core/server` |
 | **Close connections (1.3.0-beta.1)** | `96d079c9` | ✅ Connections tab × + `CloseConnections` RPC | `throne`, `throne-core-client` |
 | **Connection source + LAN inbound (1.3.0-beta.2)** | `a1b6ac4b` | ✅ proto `source` + Source column when LAN inbound + wildcard listen shows LAN IP | `throne-core-client`, `throne-domain`, `throne` |
@@ -104,6 +106,35 @@ Status legend: ✅ done · 🧩 partial · ⏳ planned · ❌ out of scope (Go c
 8. **Wave 1.3.0-beta.1** — core sync (Tun/DNS, CloseConnections, VPN RPCs, sing-box 1.14) · Snell import · Tun ranges · group URL test · connection close ✅  
 9. **Wave 1.3.0-beta.2** — connection source · LAN inbound label · WG/vpn schemes · FinalMask · url_scheme_auto_register · core sing-box/WG bump ✅  
 10. **Wave 1.3.0-beta.3** — skip_cert · Auto Selector empty-pool recovery · connections add-to-route · inner-hop ids · core sing-box/Xray bump ✅  
+11. **Wave 1.3.2** — core tree `core/` · DNS cache persist off · Darwin Tun allows local DNS · IPv6 private bypass · empty sub rejected · simple-rule domains lowercased · `reject_method` import ✅  
+
+## Commit triage notes (1.3.0-beta.3 → 1.3.2)
+
+76 commits (`1.3.0-beta.4`, `1.3.0`, `1.3.1`, `1.3.2`). Full log: `git log --oneline 1.3.0-beta.3..1.3.2`.
+
+| SHA | Summary | Action |
+|-----|---------|--------|
+| `e3e2bca4` | core folder `core/server` → `core/` | ✅ vendored tree + `script/build-core` |
+| `d7d8692c` | `dns_persist_cache` default off | ✅ `cache_file.store_fakeip/store_dns` |
+| `3f2f1880` | drop Darwin Tun local-DNS hard error | ✅ |
+| `531fd035` | IPv6 private ranges + marker repo | ✅ ranges (+ old-default upgrade); ⏳ markers |
+| `1539f5ee` | lowercase simple domain/suffix/keyword | ✅ regex unchanged |
+| `99e67ba6` | reject empty subscription body | ✅ group left unchanged |
+| `dc3acf48` | import `reject_method` | ✅ |
+| `8d251aeb` | dedupe rule-sets | ✅ already unique in `compile_route_section` |
+| `c6bd8e1e` + later go.mod | sing-box / xray / WG pins through 1.3.2 | ✅ |
+| `77fad407` | Xray DNS random + interface bind | ✅ core pin |
+| `2ce157d7` | MASQUE + `WarpRegister` | 🧩 RPC in core; GUI/import later |
+| `ccf3b459` | subscription userinfo card | 🧩 raw header already stored as `group.info`; card UI later |
+| `abf9b07d` | Update All External Resources | ⏳ `UpdateRuleSets` RPC present, no Tools action |
+| `a1814347` | chain-through-endpoint DNS | ⏳ no multi-hop builder yet |
+| `f94aadb0` | IDN domains | ⏳ |
+| `4a1005f0` | auto selector (mobile core) | N/A desktop plan |
+| `d045fc62` | deprecate hijack-dns UI | ⏳ generator still emits hijack-dns |
+| `ed8a7059` | updater exempt from insecure TLS | ⏳ no self-updater |
+| i18n / Qt a11y / Android / connections tree / diagnostics / TrustTunnel editor | | ⏳ / N/A |
+
+Local patch kept on top of the tag: `core/internal/sysdns/sysdns_darwin.go` uses `boxdns.DefaultInterface()` so system DNS is not pointed at `utun`.
 
 ## Commit triage notes (1.3.0-beta.2 → 1.3.0-beta.3)
 

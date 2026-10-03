@@ -4,7 +4,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-CORE_DIR="$ROOT/core/server"
+CORE_DIR="$ROOT/core"
 OUT_DIR="${1:-$ROOT/target/debug}"
 OUT_BIN="$OUT_DIR/ThroneCore"
 
@@ -38,7 +38,7 @@ echo "==> generating gen/ from libcore.proto"
     libcore.proto
 )
 
-# Match upstream throneproj/Throne `script/build_go.sh` (tag 1.2.4).
+# Match upstream throneproj/Throne `script/build_go.sh` (tag 1.3.2, module root `core/`).
 # Base tags + platform extras. Override with THRONE_CORE_TAGS=...
 if [[ -n "${THRONE_CORE_TAGS:-}" ]]; then
   TAGS="$THRONE_CORE_TAGS"

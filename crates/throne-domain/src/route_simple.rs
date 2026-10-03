@@ -309,7 +309,12 @@ fn add_simple_line(line: &str, rule: &mut RouteRule) -> bool {
     let Some((prefix, rest)) = line.split_once(':') else {
         return false;
     };
-    let value = rest.to_string();
+    // sing-box lowercases the host before matching but takes these values as written (1.3.1).
+    // Regex stays as written: lowercasing a pattern can change it (`\D` is not `\d`).
+    let value = match prefix {
+        "domain" | "suffix" | "keyword" => rest.to_lowercase(),
+        _ => rest.to_string(),
+    };
     if value.is_empty() {
         return false;
     }
@@ -347,6 +352,11 @@ mod tests {
         assert!(err.is_empty(), "{err}");
         let text = p.simple_rules_text(SimpleAction::Bypass);
         assert!(text.contains("domain:a.com"));
+        let err = p.update_simple_rules("domain:Example.COM\nregex:\\D+", SimpleAction::Proxy);
+        assert!(err.is_empty(), "{err}");
+        let proxy = p.rules.iter().find(|r| r.rule_type == 1).unwrap();
+        assert_eq!(proxy.domain, vec!["example.com".to_string()]);
+        assert_eq!(proxy.domain_regex, vec!["\\D+".to_string()]);
         assert!(text.contains("suffix:cn"));
         assert!(text.contains("ip:1.1.1.1/32"));
         assert!(text.contains("processName:curl"));

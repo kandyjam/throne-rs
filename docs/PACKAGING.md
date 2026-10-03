@@ -58,7 +58,7 @@ cargo install cargo-bundle --locked   # once
 
 ### Go / ThroneCore
 
-`script/lib.sh` builds `ThroneCore` from `core/server` when `go` is available
+`script/lib.sh` builds `ThroneCore` from `core/` when `go` is available
 (`PATH`, Homebrew, `/usr/local/go`, or `GO_BIN`).
 
 If Go is **not** installed, the scripts reuse a prebuilt core from (first hit wins):
@@ -97,12 +97,14 @@ crates/throne/
 ```toml
 # crates/throne/Cargo.toml
 [package.metadata.bundle]
-name = "Throne"
+name = "ThroneRs"
 identifier = "app.throne.desktop"
 icon = ["resources/app-icon.png", "resources/app-icon@2x.png", ...]
-osx_minimum_system_version = "11.0"
-osx_url_schemes = ["throne"]
 category = "Utility"
+
+[package.metadata.bundle.osx]
+minimum_system_version = "11.0"
+url_schemes = ["throne"]
 ```
 
 This is the same table Zed uses (`bundle` / channel-specific `bundle-stable` …).

@@ -51,6 +51,9 @@ pub struct SubscriptionUpdateReport {
     pub kept_in_use: Vec<SubscriptionChange>,
     pub unchanged: usize,
     pub result_order: Vec<ProfileId>,
+    /// Upstream 1.3.1: a body with zero profiles is treated as a broken response.
+    /// The group is left unchanged.
+    pub rejected_empty: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1676,6 +1679,15 @@ impl AppState {
             .ok_or(StoreError::GroupNotFound(group_id))?
             .profile_ids
             .clone();
+        // 1.3.1: an empty parse is far likelier a blocked page than an emptied list.
+        if items.is_empty() {
+            return Ok(SubscriptionUpdateReport {
+                unchanged: old_ids.len(),
+                result_order: old_ids,
+                rejected_empty: true,
+                ..SubscriptionUpdateReport::default()
+            });
+        }
         let mut available: HashMap<String, VecDeque<ProfileId>> = HashMap::new();
         for id in &old_ids {
             if let Some(profile) = self.profiles.get(id) {
@@ -2446,9 +2458,10 @@ mod tests {
             .apply_subscription_snapshot(group_id, Vec::new(), String::new(), 123)
             .unwrap();
 
-        assert_eq!(report.deleted.len(), 1);
-        assert_eq!(report.deleted[0].profile_id, removed_id);
-        assert!(state.profile(removed_id).is_none());
+        assert!(report.rejected_empty);
+        assert!(report.deleted.is_empty());
+        assert!(state.profile(removed_id).is_some());
+        assert_eq!(state.group(group_id).unwrap().sub_last_update, 0);
     }
 
     #[test]
@@ -2465,10 +2478,11 @@ mod tests {
             .apply_subscription_snapshot(group_id, Vec::new(), "new-info".into(), 123)
             .unwrap();
 
+        assert!(report.rejected_empty);
         assert!(state.profile(running_id).is_some());
         assert_eq!(state.group(group_id).unwrap().profile_ids, vec![running_id]);
+        assert!(state.group(group_id).unwrap().info.is_empty());
         assert!(report.deleted.is_empty());
-        assert_eq!(report.result_order, vec![running_id]);
     }
 
     #[test]

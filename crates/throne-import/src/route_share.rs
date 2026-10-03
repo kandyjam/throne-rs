@@ -232,6 +232,13 @@ fn rules_from_array(arr: &[Value], warnings: &mut Vec<String>) -> Vec<RouteRule>
                 .and_then(|v| v.as_str())
                 .unwrap_or("route")
                 .to_string(),
+            // Upstream writes `reject_method`; older shares used `method`.
+            reject_method: obj
+                .get("reject_method")
+                .or_else(|| obj.get("method"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
             network: obj
                 .get("network")
                 .and_then(|v| v.as_str())
@@ -328,6 +335,8 @@ pub fn to_share_object(profile: &RouteProfile) -> Value {
                 "process_name": r.process_name,
                 "network": r.network,
                 "invert": r.invert,
+                "action": r.action,
+                "reject_method": r.reject_method,
             })
         })
         .collect();
@@ -365,6 +374,20 @@ mod tests {
             r.routes[0].rules[0].outbound_id,
             DefaultOutbound::Block.as_id()
         );
+    }
+
+    #[test]
+    fn reject_method_accepts_upstream_key() {
+        let json = r#"{
+            "kind":"throne-route-profile",
+            "name":"Drop",
+            "rules":[{"name":"drop","action":"reject","reject_method":"drop"}]
+        }"#;
+        let r = import_route_payload(json);
+        assert_eq!(r.routes[0].rules[0].reject_method, "drop");
+        let legacy = r#"{"kind":"throne-route-profile","name":"Drop","rules":[{"name":"drop","method":"reset"}]}"#;
+        let r = import_route_payload(legacy);
+        assert_eq!(r.routes[0].rules[0].reject_method, "reset");
     }
 
     #[test]

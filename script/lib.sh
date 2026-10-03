@@ -113,7 +113,7 @@ ensure_core_binary() {
     fi
     log "Building Go ThroneCore with $go_bin → $core_out (tags=$tags)"
     (
-      cd "$ROOT/core/server"
+      cd "$ROOT/core"
       local ver
       ver="$("$go_bin" list -m -f '{{.Version}}' github.com/sagernet/sing-box 2>/dev/null || true)"
       local ldflags="-w -s -X 'internal/godebug.defaultGODEBUG=multipathtcp=0' -checklinkname=0"

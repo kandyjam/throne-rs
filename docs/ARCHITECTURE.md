@@ -11,7 +11,7 @@
 Unchanged from upstream:
 
 1. GUI starts (or attaches to) a privileged/unprivileged **Core** binary.
-2. Control plane is a **local socket** carrying **protobuf** messages defined in `core/server/gen/libcore.proto`.
+2. Control plane is a **local socket** carrying **protobuf** messages defined in `core/gen/libcore.proto`.
 3. Data plane (proxy, TUN, DNS) lives entirely inside the Go core / sing-box / xray.
 
 ## Crate boundaries

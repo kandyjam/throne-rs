@@ -2,10 +2,10 @@
 
 **Rust + [GPUI](https://github.com/zed-industries/zed) rewrite** of [Throne](https://github.com/throneproj/Throne) (formerly Nekoray) — a cross-platform desktop GUI proxy client powered by Sing-box / Xray.
 
-**Version:** `1.3.0-beta.3` (aligned with upstream prerelease tag / `NKR_VERSION` — see root [`VERSION`](./VERSION))
+**Version:** `1.3.2` (aligned with upstream release tag / `NKR_VERSION` — see root [`VERSION`](./VERSION))
 
-> Status: **Wave 1.3.0-beta.3** — skip_cert on outbound TLS, Auto Selector empty-pool recovery, connections add-to-route, inner-hop endpoint ids, core sing-box/Xray bump.  
-> Upstream remote: `upstream` → [throneproj/Throne](https://github.com/throneproj/Throne) (`dev` / tag `1.3.0-beta.3`).  
+> Status: **Wave 1.3.2** — core tree matches upstream `core/`, DNS cache persist off, Darwin Tun allows local DNS, IPv6 private bypass, empty subscriptions are rejected, simple-rule domains are lowercased.  
+> Upstream remote: `upstream` → [throneproj/Throne](https://github.com/throneproj/Throne) (`dev` is ahead; pin is tag `1.3.2`).  
 > Parity matrix: [docs/UPSTREAM_TRACKING.md](./docs/UPSTREAM_TRACKING.md) · Skill: [skills/throne-upstream-parity/SKILL.md](./skills/throne-upstream-parity/SKILL.md).
 
 ## Architecture
@@ -17,7 +17,7 @@
 | Import | `crates/throne-import` | Share links + `throne://` deeplinks (GroupUpdater-aligned) |
 | Storage | `crates/throne-storage` | SQLite schema compatible with upstream repos |
 | Core client | `crates/throne-core-client` | Async API toward the Go `ThroneCore` process |
-| Data plane | `core/server` | Existing Go core (sing-box / xray, TUN, DNS, tests) |
+| Data plane | `core/` | Existing Go core (sing-box / xray, TUN, DNS, tests), layout matches upstream 1.3.2 |
 
 ```
 ┌──────────────────────────┐
@@ -50,7 +50,7 @@ Legacy Qt/C++ GUI was removed on branch `rewrite/rust-gpui`. History remains on 
 ## Build & run
 
 ```bash
-# 1) Build Go core (required for Start / Auto Selector / URL Test — 1.3.0-beta.1 sources)
+# 1) Build Go core (required for Start / Auto Selector / URL Test — 1.3.2 sources)
 ./script/build-core                  # protoc + go build w/ with_quic,with_utls,… → target/debug/ThroneCore
 # Override tags: THRONE_CORE_TAGS='with_quic,…' ./script/build-core
 

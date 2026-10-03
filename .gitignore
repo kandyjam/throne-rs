@@ -13,12 +13,12 @@
 
 # Go core build artifacts (binary names — not the core/ source tree)
 /deployment/
-# Note: never use **/Core — on case-insensitive FS it ignores core/ sources.
+# Note: never ignore `Core` or `core` without an extension. On a
+# case-insensitive volume that pattern hides the vendored `core/` tree.
 **/ThroneCore
 **/nekobox_core
 **/nekobox_core.exe
 **/Core.exe
-/Core
 *.exe
 *.dll
 *.so

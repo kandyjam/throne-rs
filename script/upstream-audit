@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Diff throne-rs VERSION against an upstream throneproj/Throne tag.
+# Usage: ./script/upstream-audit [target-tag]
+# With no argument, the newest local-or-fetched 1.* tag is the target.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+if ! git remote get-url upstream >/dev/null 2>&1; then
+  echo "error: no 'upstream' remote." >&2
+  echo "  git remote add upstream https://github.com/throneproj/Throne.git" >&2
+  exit 1
+fi
+
+echo "==> fetch upstream"
+git fetch upstream --tags --prune
+
+CURRENT="$(tr -d '[:space:]' < VERSION)"
+TARGET="${1:-}"
+if [[ -z "$TARGET" ]]; then
+  TARGET="$(git tag -l '1.*' --sort=-v:refname | head -1)"
+fi
+if [[ -z "$TARGET" ]] || ! git rev-parse -q --verify "refs/tags/${TARGET}^{commit}" >/dev/null; then
+  echo "error: tag '$TARGET' not found" >&2
+  exit 1
+fi
+
+echo
+echo "VERSION=$CURRENT"
+echo "target=$TARGET $(git rev-parse --short "$TARGET") $(git log -1 --format='%ci %s' "$TARGET")"
+echo "upstream/dev=$(git describe --tags --always upstream/dev)"
+echo "local HEAD=$(git rev-parse --short HEAD) $(git branch --show-current)"
+
+if ! git rev-parse -q --verify "refs/tags/${CURRENT}^{commit}" >/dev/null; then
+  echo
+  echo "VERSION '$CURRENT' is not an upstream tag in this repo."
+  echo "Pass the previous pin explicitly: ./script/upstream-audit <new-tag>"
+  exit 1
+fi
+
+echo
+echo "==> commits ${CURRENT}..${TARGET}"
+git log --oneline "${CURRENT}..${TARGET}" || true
+
+echo
+echo "==> dirstat ${CURRENT}..${TARGET}"
+git diff --dirstat=files,0 "$CURRENT" "$TARGET" || true
+
+echo
+echo "==> libcore.proto"
+git diff -M --stat "$CURRENT" "$TARGET" -- '*libcore.proto' || true
+
+echo
+echo "==> go module replaces at ${TARGET}"
+git show "${TARGET}:core/go.mod" 2>/dev/null | awk '/^replace /{print}' || \
+  git show "${TARGET}:core/server/go.mod" 2>/dev/null | awk '/^replace /{print}' || \
+  echo "(no go.mod at core/ or core/server/)"
+
+echo
+echo "==> preserved local patches (re-apply after a core checkout)"
+echo "  core/internal/sysdns/sysdns_darwin.go  physical NIC via boxdns.DefaultInterface"
+echo
+echo "Next: triage the log into must-port / core / cosmetic / out-of-scope,"
+echo "then update VERSION, Cargo.toml, README, docs/UPSTREAM_TRACKING.md, and this skill's pin."

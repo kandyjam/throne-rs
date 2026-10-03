@@ -1,6 +1,6 @@
 //! Client for the legacy Go `ThroneCore` process.
 //!
-//! Protocol (matches `core/server/dispatch.go` + Qt `RPC.cpp`):
+//! Protocol (matches `core/dispatch.go` + Qt `RPC.cpp`):
 //! - GUI listens on a unix domain socket
 //! - Core connects (env `THRONE_CORE_SOCKET` = full path)
 //! - Request:  `[u32 le reqId][u16 le methodLen][method][u32 le payloadLen][payload]`

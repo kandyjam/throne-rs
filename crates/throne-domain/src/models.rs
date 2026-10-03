@@ -1067,11 +1067,16 @@ fn default_vpn_tun_ipv4_cidr() -> String {
     "172.19.0.1/24".into()
 }
 
+fn default_vpn_tun_ipv6_cidr() -> String {
+    "fdfe:dcba:9876::1/96".into()
+}
+
 fn default_true() -> bool {
     true
 }
 
-/// Upstream `defaultTunPrivateRanges` — loopback/broadcast are never listed here.
+/// Upstream `defaultTunPrivateRanges` (1.3.1 adds IPv6 ULA / link-local / multicast).
+/// Loopback and broadcast stay unconditional and are never listed here.
 pub fn default_tun_private_ranges() -> Vec<String> {
     vec![
         "10.0.0.0/8".into(),
@@ -1079,7 +1084,27 @@ pub fn default_tun_private_ranges() -> Vec<String> {
         "192.168.0.0/16".into(),
         "169.254.0.0/16".into(),
         "224.0.0.0/4".into(),
+        "fc00::/7".into(),
+        "fe80::/10".into(),
+        "ff00::/8".into(),
     ]
+}
+
+/// Databases saved before 1.3.1 stored the IPv4-only default. Treat that exact
+/// list as the old default and expand it; any other list is a user edit.
+pub fn upgrade_tun_private_ranges(list: Vec<String>) -> Vec<String> {
+    const OLD: [&str; 5] = [
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "169.254.0.0/16",
+        "224.0.0.0/4",
+    ];
+    if list.len() == OLD.len() && list.iter().zip(OLD).all(|(got, old)| got == old) {
+        default_tun_private_ranges()
+    } else {
+        list
+    }
 }
 
 /// Subset of upstream `SettingsRepo` defaults used by the Rust client.
@@ -1096,6 +1121,11 @@ pub struct AppSettings {
     /// Passed to sing-box `inbounds[].address` and Start RPC `tun_ipv4_cidr` (macOS system DNS).
     #[serde(default = "default_vpn_tun_ipv4_cidr")]
     pub vpn_tun_ipv4_cidr: String,
+    /// Upstream `vpn_ipv6`. When set, Tun `address` also includes `vpn_tun_ipv6_cidr`.
+    #[serde(default)]
+    pub vpn_ipv6: bool,
+    #[serde(default = "default_vpn_tun_ipv6_cidr")]
+    pub vpn_tun_ipv6_cidr: String,
     pub disable_private_range_bypass: bool,
     /// Tun private LAN CIDRs to bypass when `disable_private_range_bypass` is false
     /// (upstream `vpn_private_ranges`, 1.3.0-beta.1). Loopback/broadcast stay unconditional.
@@ -1191,6 +1221,9 @@ pub struct AppSettings {
     pub dns_disable_cache: bool,
     #[serde(default)]
     pub dns_disable_expire: bool,
+    /// Persist FakeIP and DNS answers in sing-box `cache_file` (upstream `dns_persist_cache`, default off since 1.3.0-beta.4).
+    #[serde(default)]
+    pub dns_persist_cache: bool,
     #[serde(default)]
     pub dns_reverse_mapping: bool,
     #[serde(default = "default_true")]
@@ -1285,6 +1318,8 @@ impl Default for AppSettings {
             // upstream SettingsRepo default is 1500; keep 9000 only if user already persisted it
             vpn_mtu: 1500,
             vpn_tun_ipv4_cidr: default_vpn_tun_ipv4_cidr(),
+            vpn_ipv6: false,
+            vpn_tun_ipv6_cidr: default_vpn_tun_ipv6_cidr(),
             disable_private_range_bypass: false,
             vpn_private_ranges: default_tun_private_ranges(),
             vpn_l3_bridge: false,
@@ -1328,6 +1363,7 @@ impl Default for AppSettings {
             dns_cache_capacity: default_dns_cache_capacity(),
             dns_disable_cache: false,
             dns_disable_expire: false,
+            dns_persist_cache: false,
             dns_reverse_mapping: false,
             enable_dns_routing: true,
             use_dns_object: false,
@@ -1718,6 +1754,21 @@ pub fn human_bytes(n: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_default_private_ranges_gain_ipv6() {
+        let old = vec![
+            "10.0.0.0/8".into(),
+            "172.16.0.0/12".into(),
+            "192.168.0.0/16".into(),
+            "169.254.0.0/16".into(),
+            "224.0.0.0/4".into(),
+        ];
+        let upgraded = upgrade_tun_private_ranges(old);
+        assert!(upgraded.iter().any(|r| r == "fc00::/7"));
+        let custom = vec!["10.1.0.0/16".into()];
+        assert_eq!(upgrade_tun_private_ranges(custom.clone()), custom);
+    }
 
     #[test]
     fn latency_display() {

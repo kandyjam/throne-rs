@@ -35,18 +35,17 @@ ensure_cargo_bundle() {
 prepare_binaries
 ensure_cargo_bundle
 
-log "cargo bundle --release (ThroneRs.app)"
-# cargo-bundle reads [package.metadata.bundle] from crates/throne.
-# Note: macOS /bin/bash is 3.2 — empty "${arr[@]}" under `set -u` is an error,
-# so avoid empty arrays and branch on TARGET_TRIPLE instead.
+log "cargo bundle --release -p throne (ThroneRs.app)"
+# cargo-bundle 0.12 reads [package.metadata.bundle] from the throne package.
+# Always pass -p: this workspace has no root package, and a fallback without
+# -p only reports "No root package found" after hiding the real error.
+# macOS /bin/bash is 3.2 — empty "${arr[@]}" under `set -u` is an error.
 (
   cd "$ROOT"
   if [[ -n "${TARGET_TRIPLE:-}" ]]; then
-    cargo bundle --release -p throne --target "$TARGET_TRIPLE" 2>/dev/null \
-      || cargo bundle --release --target "$TARGET_TRIPLE"
+    cargo bundle --release -p throne --target "$TARGET_TRIPLE"
   else
-    cargo bundle --release -p throne 2>/dev/null \
-      || cargo bundle --release
+    cargo bundle --release -p throne
   fi
 )
 
