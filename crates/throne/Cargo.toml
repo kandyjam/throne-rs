@@ -32,12 +32,12 @@ anyhow = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 smol = "2"
-tray-icon = "0.25"
+tray-icon = "0.26"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage", "NSResponder"] }
-objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSString"] }
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSImage", "NSResponder"] }
+objc2-foundation = { version = "0.3.2", features = ["NSGeometry", "NSString"] }
 
 # ── Desktop packaging (Zed-style) ───────────────────────────────────────
 # macOS .app via cargo-bundle; DMG/tar.gz/deb/rpm/Inno via script/bundle-*.

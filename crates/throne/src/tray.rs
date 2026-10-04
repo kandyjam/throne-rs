@@ -196,12 +196,22 @@ pub fn install(initial: TrayMenuState) -> Result<(), String> {
     let icon = Icon::from_rgba(rgba, TRAY_ICON_SIZE, TRAY_ICON_SIZE)
         .map_err(|error| format!("build tray icon: {error}"))?;
 
-    let tray = TrayIconBuilder::new()
+    let builder = TrayIconBuilder::new()
         .with_id("throne")
         .with_menu(Box::new(menu))
-        .with_icon(icon)
-        .with_icon_as_template(template)
-        .with_tooltip("ThroneRs")
+        .with_tooltip("ThroneRs");
+    #[cfg(target_os = "macos")]
+    let builder = if template {
+        builder.with_icon_templated(icon)
+    } else {
+        builder.with_icon(icon)
+    };
+    #[cfg(not(target_os = "macos"))]
+    let builder = {
+        let _ = template;
+        builder.with_icon(icon)
+    };
+    let tray = builder
         .build()
         .map_err(|error| format!("install system tray: {error}"))?;
 
@@ -257,9 +267,15 @@ pub fn apply_scheme(scheme: ColorScheme) {
         let Some(h) = guard.as_ref() else {
             return;
         };
-        let result = if cfg!(target_os = "macos") {
-            h.tray.set_icon_with_as_template(Some(icon), template)
+        #[cfg(target_os = "macos")]
+        let result = if template {
+            h.tray.set_icon_templated(Some(icon))
         } else {
+            h.tray.set_icon(Some(icon))
+        };
+        #[cfg(not(target_os = "macos"))]
+        let result = {
+            let _ = template;
             h.tray.set_icon(Some(icon))
         };
         if let Err(error) = result {

@@ -6581,7 +6581,7 @@ fn confirm_dialog_footer(
 
 /// Build a gpui-component Dialog for the current MainWindow dialog state.
 ///
-/// Rebuilds every paint via `Root::render_dialog_layer` so toggles / list
+/// Rebuilds every paint via the gpui-component dialog overlay so toggles / list
 /// selection stay live. Focus is owned by the ActiveDialog in Root.
 fn build_gpui_dialog(
     dialog: GpuiDialog,

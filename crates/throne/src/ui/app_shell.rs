@@ -5,7 +5,6 @@
 //! shell avoids the "cannot read while already being updated" panic.
 
 use gpui::{div, prelude::*, Context, Entity, IntoElement, Render, Window};
-use gpui_component::Root;
 
 use crate::ui::main_window::MainWindow;
 
@@ -30,10 +29,9 @@ impl Render for AppShell {
             main.prepare_dialog_layer(window, cx);
         });
 
-        div()
-            .size_full()
-            .relative()
-            .child(self.main.clone())
-            .children(Root::render_dialog_layer(window, cx))
+        // gpui-component 0.7 paints Sheet / Dialog / Notification from the
+        // Root plugin overlay. This shell only flushes dialog state outside
+        // MainWindow::render so builders can read that entity.
+        div().size_full().relative().child(self.main.clone())
     }
 }
