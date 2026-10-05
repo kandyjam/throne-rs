@@ -1,8 +1,7 @@
-//! Window content shell: hosts [`MainWindow`] and paints gpui-component Dialog layers.
+//! Window content shell: hosts [`MainWindow`] and flushes dialog state outside its render.
 //!
 //! Dialog builders must **not** run while `MainWindow` is mid-render (they call
-//! `entity.read`). Keeping the dialog layer as a sibling of `MainWindow` under this
-//! shell avoids the "cannot read while already being updated" panic.
+//! `entity.read`). gpui-component 0.7 paints the dialog layer from the Root plugin.
 
 use gpui::{div, prelude::*, Context, Entity, IntoElement, Render, Window};
 
@@ -23,15 +22,11 @@ impl AppShell {
 
 impl Render for AppShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Flush deferred dialog work while MainWindow is not mid-render, then
-        // paint the dialog layer as a sibling so builders can `main.read(cx)`.
+        // Flush deferred dialog work while MainWindow is not mid-render.
         self.main.update(cx, |main, cx| {
             main.prepare_dialog_layer(window, cx);
         });
 
-        // gpui-component 0.7 paints Sheet / Dialog / Notification from the
-        // Root plugin overlay. This shell only flushes dialog state outside
-        // MainWindow::render so builders can read that entity.
         div().size_full().relative().child(self.main.clone())
     }
 }

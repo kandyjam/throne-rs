@@ -1,15 +1,17 @@
 mod assets;
 mod dock_icon;
+#[cfg(target_os = "macos")]
+mod macos_hit;
 mod theme;
 mod tray;
 mod ui;
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use gpui::{
-    point, prelude::*, px, size, App, Bounds, Entity, TitlebarOptions, WindowBounds, WindowHandle,
+    prelude::*, px, size, App, Bounds, Entity, TitlebarOptions, WindowBounds, WindowHandle,
     WindowOptions,
 };
 use gpui_component::Root;
@@ -20,6 +22,18 @@ use ui::{AppShell, MainWindow};
 
 /// Set by Dock / taskbar reopen; drained on the GPUI executor (safe App borrow).
 static PENDING_SHOW_WINDOW: AtomicBool = AtomicBool::new(false);
+/// Unix millis of the last main-window close. macOS also sends
+/// `applicationShouldHandleReopen` while the last window is closing; acting on
+/// that immediately puts the window back and leaves it unable to take clicks.
+static LAST_WINDOW_CLOSED_MS: AtomicU64 = AtomicU64::new(0);
+const REOPEN_AFTER_CLOSE_GRACE_MS: u64 = 500;
+
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 fn main() {
     tracing_subscriber::fmt()
@@ -69,6 +83,7 @@ fn main() {
                     .is_some_and(|handle| handle.is_active(cx).is_some());
                 if !alive {
                     *window_slot.borrow_mut() = None;
+                    LAST_WINDOW_CLOSED_MS.store(unix_millis(), Ordering::SeqCst);
                     tracing::debug!("main window closed; waiting for dock/tray show");
                 }
             })
@@ -91,12 +106,15 @@ fn main() {
                 let dock_show = PENDING_SHOW_WINDOW.swap(false, Ordering::SeqCst);
                 let tray_cmd = tray::next_command();
 
+                #[cfg(target_os = "macos")]
+                macos_hit::route_window_clicks();
+
                 if !dock_show && tray_cmd.is_none() {
                     continue;
                 }
 
                 cx.update(|cx| {
-                    if dock_show {
+                    if dock_show && !closed_too_recently() {
                         show_main_window(cx, &window_slot, &main);
                     }
                     if let Some(command) = tray_cmd {
@@ -113,6 +131,29 @@ fn main() {
     });
 }
 
+fn closed_too_recently() -> bool {
+    let closed = LAST_WINDOW_CLOSED_MS.load(Ordering::SeqCst);
+    closed != 0 && unix_millis().saturating_sub(closed) < REOPEN_AFTER_CLOSE_GRACE_MS
+}
+
+#[cfg(target_os = "macos")]
+fn hide_main_window() {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSApplication;
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    for window in app.windows().iter() {
+        if window.title().to_string().starts_with("ThroneRs") {
+            window.orderOut(None);
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn hide_main_window() {}
+
 fn open_main_window(cx: &mut App, main: Entity<MainWindow>) -> WindowHandle<Root> {
     // Upstream mainwindow.ui minimum 800×600
     let bounds = Bounds::centered(None, size(px(960.), px(640.)), cx);
@@ -120,16 +161,28 @@ fn open_main_window(cx: &mut App, main: Entity<MainWindow>) -> WindowHandle<Root
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitlebarOptions {
-                // Upstream tray/title includes NKR_VERSION
+                // Upstream tray/title includes NKR_VERSION.
+                // Leave traffic lights at the system position. A custom origin
+                // moves the close/zoom buttons out of AppKit's hit area, so
+                // they draw but do not receive clicks.
                 title: Some(display_name().into()),
                 appears_transparent: false,
-                traffic_light_position: Some(point(px(9.), px(9.))),
+                traffic_light_position: None,
             }),
             focus: true,
             show: true,
             ..Default::default()
         },
         |window, cx| {
+            // Record the close before AppKit emits a spurious reopen for the
+            // last window. The dock icon still restores the window after the grace.
+            // Hide instead of destroying. Destroying the window makes macOS
+            // reopen it immediately, and the rebuilt window no longer takes clicks.
+            window.on_window_should_close(cx, |_, _| {
+                LAST_WINDOW_CLOSED_MS.store(unix_millis(), Ordering::SeqCst);
+                hide_main_window();
+                false
+            });
             // Follow OS light/dark and re-paint when the system appearance changes.
             main.update(cx, |view, cx| {
                 view.attach_window_appearance(window, cx);

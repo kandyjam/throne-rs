@@ -54,3 +54,5 @@ serde_yaml = "0.9"
 # block 0.1.6 declares an extern static with an uninhabited enum, which future
 # Rust versions reject. Keep its public API while correcting the opaque FFI type.
 block = { path = "vendor/block-0.1.6" }
+# tray-icon 0.26 leaves the status item without an NSMenu, so clicks do nothing.
+tray-icon = { path = "vendor/tray-icon" }

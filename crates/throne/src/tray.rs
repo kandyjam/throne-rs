@@ -214,6 +214,10 @@ pub fn install(initial: TrayMenuState) -> Result<(), String> {
     let tray = builder
         .build()
         .map_err(|error| format!("install system tray: {error}"))?;
+    // tray-icon 0.26 places its click view at the status button's *window*
+    // frame, which is outside the button, so the menu never opens.
+    #[cfg(target_os = "macos")]
+    align_tray_hit_target();
 
     TRAY.with(|cell| {
         *cell.borrow_mut() = Some(TrayHandles {
@@ -282,6 +286,8 @@ pub fn apply_scheme(scheme: ColorScheme) {
             tracing::warn!(%error, "failed to update tray icon for theme");
             return;
         }
+        #[cfg(target_os = "macos")]
+        align_tray_hit_target();
         store_applied(scheme);
     });
 }
@@ -331,6 +337,38 @@ pub fn inbound_address_for_allow_lan(allow: bool) -> &'static str {
         "::"
     } else {
         "127.0.0.1"
+    }
+}
+
+/// tray-icon 0.26's `TaoTrayTarget` is a subview of the status button, but it
+/// is framed with `button.frame()` (superview coordinates). Clicks land on the
+/// button, which has no menu of its own. Pin the target to the button's bounds.
+#[cfg(target_os = "macos")]
+fn align_tray_hit_target() {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSApplication;
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    for window in app.windows().iter() {
+        if let Some(content) = window.contentView() {
+            align_tray_view(&content);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn align_tray_view(view: &objc2_app_kit::NSView) {
+    let name = view.class().name();
+    if name.to_bytes() == b"TaoTrayTarget" {
+        if let Some(parent) = unsafe { view.superview() } {
+            view.setFrame(parent.bounds());
+        }
+    }
+    for child in view.subviews().iter() {
+        align_tray_view(&child);
     }
 }
 
