@@ -126,6 +126,31 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), StorageError> {
     )?;
 
     // Migrations for older Throne DBs (same ALTERs as upstream).
+    add_column_if_missing(
+        conn,
+        "groups",
+        "endpoint_json",
+        "TEXT NOT NULL DEFAULT '{}'",
+    )?;
+    add_column_if_missing(
+        conn,
+        "groups",
+        "sub_options_json",
+        "TEXT NOT NULL DEFAULT '{}'",
+    )?;
+    add_column_if_missing(
+        conn,
+        "groups",
+        "sub_metadata_json",
+        "TEXT NOT NULL DEFAULT '{}'",
+    )?;
+    add_column_if_missing(
+        conn,
+        "profiles",
+        "endpoint_json",
+        "TEXT NOT NULL DEFAULT '{}'",
+    )?;
+    add_column_if_missing(conn, "profiles", "latency_at", "INTEGER NOT NULL DEFAULT 0")?;
     add_column_if_missing(conn, "groups", "type_sort_by", "INTEGER NOT NULL DEFAULT 0")?;
     add_column_if_missing(
         conn,
@@ -211,10 +236,11 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), StorageError> {
         )?;
     }
 
+    crate::scanner::ensure_schema(conn)?;
     Ok(())
 }
 
-fn add_column_if_missing(
+pub(crate) fn add_column_if_missing(
     conn: &Connection,
     table: &str,
     column: &str,

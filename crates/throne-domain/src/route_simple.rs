@@ -3,6 +3,72 @@
 
 use crate::models::{outbound_ids, DefaultOutbound, RouteProfile, RouteRule};
 
+/// One selectable Connections routing target, matching upstream 1.4.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionRouteTarget {
+    pub label: String,
+    pub rule: String,
+    /// Separate a broad TLD rule or process from the narrower domain targets.
+    pub separator_before: bool,
+}
+
+/// Domain suffixes, service keyword, IP address and process targets for a connection.
+pub fn connection_route_targets(
+    dest: &str,
+    domain: &str,
+    process: &str,
+) -> Vec<ConnectionRouteTarget> {
+    let host = if domain.trim().is_empty() {
+        crate::endpoint_host(dest)
+    } else {
+        domain.trim().to_string()
+    };
+    let mut targets = Vec::new();
+    if !host.is_empty() {
+        if host.parse::<std::net::IpAddr>().is_ok() {
+            targets.push(ConnectionRouteTarget {
+                label: host.clone(),
+                rule: format!("ip:{host}"),
+                separator_before: false,
+            });
+        } else {
+            let host = host.to_lowercase();
+            let labels: Vec<_> = host.split('.').filter(|s| !s.is_empty()).collect();
+            for i in 0..labels.len() {
+                let level = labels[i..].join(".");
+                targets.push(ConnectionRouteTarget {
+                    label: format!("*.{level}"),
+                    rule: format!("suffix:{level}"),
+                    separator_before: i > 0 && i == labels.len() - 1,
+                });
+            }
+            if labels.len() > 1 {
+                let name = labels[labels.len() - 2];
+                if name.chars().count() >= 4 {
+                    targets.insert(
+                        targets.len() - 1,
+                        ConnectionRouteTarget {
+                            label: format!("*{name}*"),
+                            rule: format!("keyword:{name}"),
+                            separator_before: false,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    if !process.trim().is_empty() {
+        let process = process.trim();
+        let separator_before = !targets.is_empty();
+        targets.push(ConnectionRouteTarget {
+            label: format!("Process {process}"),
+            rule: format!("processName:{process}"),
+            separator_before,
+        });
+    }
+    targets
+}
+
 /// One of the four simple-mode buckets in the Route Profile editor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SimpleAction {
@@ -250,6 +316,96 @@ impl RouteProfile {
         Ok(())
     }
 
+    /// Whether the exact line is already in this action's simple rules.
+    pub fn has_simple_rule(&self, raw: &str, action: SimpleAction) -> bool {
+        let Some((prefix, value)) = simple_line_parts(raw.trim()) else {
+            return false;
+        };
+        let Some(rule_type) = classify_simple_line(raw.trim(), action) else {
+            return false;
+        };
+        self.rules.iter().any(|rule| {
+            rule.rule_type == rule_type
+                && simple_rule_values(rule, prefix).is_some_and(|values| values.contains(&value))
+        })
+    }
+
+    /// Remove all copies, including imported duplicate simple rules, without touching other rules.
+    pub fn remove_simple_rule(&mut self, raw: &str, action: SimpleAction) -> Result<bool, String> {
+        if self.is_raw {
+            return Err("cannot edit a raw routing profile".into());
+        }
+        if self.prevent_modifications {
+            return Err("routing profile is locked".into());
+        }
+        let Some((prefix, value)) = simple_line_parts(raw.trim()) else {
+            return Ok(false);
+        };
+        let Some(rule_type) = classify_simple_line(raw.trim(), action) else {
+            return Ok(false);
+        };
+        let mut removed = false;
+        self.rules.retain_mut(|rule| {
+            if rule.rule_type != rule_type {
+                return true;
+            }
+            let Some(values) = simple_rule_values_mut(rule, prefix) else {
+                return true;
+            };
+            let old_len = values.len();
+            values.retain(|stored| stored != &value);
+            if values.len() == old_len {
+                return true;
+            }
+            removed = true;
+            !rule.is_empty_rule()
+        });
+        Ok(removed)
+    }
+
+    /// Earlier rule from another action that shadows every host of this suffix/keyword.
+    /// Identical lines do not shadow: the Connections toggle moves them between actions.
+    pub fn covering_simple_rule(
+        &self,
+        raw: &str,
+        action: SimpleAction,
+    ) -> Option<(String, SimpleAction)> {
+        let (prefix, value) = simple_line_parts(raw.trim())?;
+        if !matches!(prefix, "suffix" | "keyword") {
+            return None;
+        }
+        for rule in &self.rules {
+            if rule.rule_type == action.address_type() {
+                break;
+            }
+            let other = match rule.rule_type {
+                1 => SimpleAction::Proxy,
+                2 => SimpleAction::Bypass,
+                3 => SimpleAction::Block,
+                10 => SimpleAction::WarpBypass,
+                _ => continue,
+            };
+            if other == action {
+                continue;
+            }
+            for keyword in &rule.domain_keyword {
+                let k = keyword.to_lowercase();
+                if !k.is_empty() && value.contains(&k) && !(prefix == "keyword" && k == value) {
+                    return Some((format!("keyword:{keyword}"), other));
+                }
+            }
+            if prefix == "suffix" {
+                for suffix in &rule.domain_suffix {
+                    let s = suffix.to_lowercase();
+                    if !s.is_empty() && value.ends_with(&format!(".{s}")) {
+                        return Some((format!("suffix:{suffix}"), other));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// True when there are no rules and no raw body (upstream `IsEmpty`).
     pub fn is_empty_profile(&self) -> bool {
         if self.is_raw {
@@ -287,28 +443,18 @@ impl RouteProfile {
 }
 
 fn classify_simple_line(line: &str, action: SimpleAction) -> Option<i32> {
-    if line.starts_with("domain")
-        || line.starts_with("suffix")
-        || line.starts_with("keyword")
-        || line.starts_with("regex")
-        || line.starts_with("ruleset")
-        || line.starts_with("ip")
-    {
-        return Some(action.address_type());
+    match simple_line_parts(line)?.0 {
+        "domain" | "suffix" | "keyword" | "regex" | "ruleset" | "ip" => Some(action.address_type()),
+        "processName" => Some(action.process_name_type()),
+        "processPath" => Some(action.process_path_type()),
+        _ => None,
     }
-    if line.starts_with("processName") {
-        return Some(action.process_name_type());
-    }
-    if line.starts_with("processPath") {
-        return Some(action.process_path_type());
-    }
-    None
 }
 
-fn add_simple_line(line: &str, rule: &mut RouteRule) -> bool {
-    let Some((prefix, rest)) = line.split_once(':') else {
-        return false;
-    };
+fn simple_line_parts(line: &str) -> Option<(&str, String)> {
+    let (prefix, rest) = line.split_once(':')?;
+    let prefix = prefix.trim();
+    let rest = rest.trim();
     // sing-box lowercases the host before matching but takes these values as written (1.3.1).
     // Regex stays as written: lowercasing a pattern can change it (`\D` is not `\d`).
     let value = match prefix {
@@ -316,19 +462,50 @@ fn add_simple_line(line: &str, rule: &mut RouteRule) -> bool {
         _ => rest.to_string(),
     };
     if value.is_empty() {
-        return false;
+        return None;
     }
+    Some((prefix, value))
+}
+
+fn simple_rule_values<'a>(rule: &'a RouteRule, prefix: &str) -> Option<&'a Vec<String>> {
     match prefix {
-        "domain" => push_unique(&mut rule.domain, value),
-        "suffix" => push_unique(&mut rule.domain_suffix, value),
-        "keyword" => push_unique(&mut rule.domain_keyword, value),
-        "regex" => push_unique(&mut rule.domain_regex, value),
-        "ruleset" => push_unique(&mut rule.rule_set, value),
-        "ip" => push_unique(&mut rule.ip_cidr, value),
-        "processName" => push_unique(&mut rule.process_name, value),
-        "processPath" => push_unique(&mut rule.process_path, value),
-        _ => return false,
+        "domain" => Some(&rule.domain),
+        "suffix" => Some(&rule.domain_suffix),
+        "keyword" => Some(&rule.domain_keyword),
+        "regex" => Some(&rule.domain_regex),
+        "ruleset" => Some(&rule.rule_set),
+        "ip" => Some(&rule.ip_cidr),
+        "processName" => Some(&rule.process_name),
+        "processPath" => Some(&rule.process_path),
+        _ => None,
     }
+}
+
+fn simple_rule_values_mut<'a>(
+    rule: &'a mut RouteRule,
+    prefix: &str,
+) -> Option<&'a mut Vec<String>> {
+    match prefix {
+        "domain" => Some(&mut rule.domain),
+        "suffix" => Some(&mut rule.domain_suffix),
+        "keyword" => Some(&mut rule.domain_keyword),
+        "regex" => Some(&mut rule.domain_regex),
+        "ruleset" => Some(&mut rule.rule_set),
+        "ip" => Some(&mut rule.ip_cidr),
+        "processName" => Some(&mut rule.process_name),
+        "processPath" => Some(&mut rule.process_path),
+        _ => None,
+    }
+}
+
+fn add_simple_line(line: &str, rule: &mut RouteRule) -> bool {
+    let Some((prefix, value)) = simple_line_parts(line) else {
+        return false;
+    };
+    let Some(values) = simple_rule_values_mut(rule, prefix) else {
+        return false;
+    };
+    push_unique(values, value);
     true
 }
 
@@ -385,5 +562,103 @@ mod tests {
             .unwrap();
         let text = p.simple_rules_text(SimpleAction::Proxy);
         assert_eq!(text.matches("domain:cdn.example.com").count(), 1);
+    }
+
+    #[test]
+    fn remove_simple_rule_removes_imported_duplicates_and_preserves_unrelated_empty_rules() {
+        let mut p = RouteProfile::new(1, "t");
+        p.append_simple_rule("suffix: Example.COM ", SimpleAction::Proxy)
+            .unwrap();
+        p.rules.push(p.rules[0].clone());
+        p.rules
+            .push(RouteRule::blank_simple(2, SimpleAction::Bypass));
+        assert!(p.has_simple_rule("suffix:EXAMPLE.com", SimpleAction::Proxy));
+        assert!(p
+            .remove_simple_rule("suffix:EXAMPLE.com", SimpleAction::Proxy)
+            .unwrap());
+        assert!(!p.has_simple_rule("suffix:example.com", SimpleAction::Proxy));
+        assert_eq!(p.rules.len(), 1);
+        assert_eq!(p.rules[0].rule_type, 2);
+        assert!(!p
+            .remove_simple_rule("suffix:example.com", SimpleAction::Proxy)
+            .unwrap());
+    }
+
+    #[test]
+    fn covering_rules_respect_order_label_boundaries_and_identical_lines() {
+        let mut p = RouteProfile::new(1, "t");
+        p.append_simple_rule("suffix:github.com", SimpleAction::Bypass)
+            .unwrap();
+        assert_eq!(
+            p.covering_simple_rule("suffix:api.github.com", SimpleAction::Proxy),
+            Some(("suffix:github.com".into(), SimpleAction::Bypass))
+        );
+        assert_eq!(
+            p.covering_simple_rule("suffix:mygithub.com", SimpleAction::Proxy),
+            None
+        );
+        assert_eq!(
+            p.covering_simple_rule("suffix:github.com", SimpleAction::Proxy),
+            None
+        );
+        p.append_simple_rule("keyword:github", SimpleAction::Block)
+            .unwrap();
+        assert_eq!(
+            p.covering_simple_rule("suffix:githubusercontent.com", SimpleAction::Proxy),
+            Some(("keyword:github".into(), SimpleAction::Block))
+        );
+        assert_eq!(
+            p.covering_simple_rule("keyword:github", SimpleAction::Proxy),
+            None
+        );
+        p.append_simple_rule("suffix:api.github.com", SimpleAction::Proxy)
+            .unwrap();
+        p.rules.rotate_right(1);
+        assert_eq!(
+            p.covering_simple_rule("suffix:api.github.com", SimpleAction::Proxy),
+            None
+        );
+    }
+
+    #[test]
+    fn locked_or_raw_routes_cannot_be_toggled() {
+        let mut p = RouteProfile::new(1, "t");
+        p.append_simple_rule("ip:1.1.1.1", SimpleAction::Proxy)
+            .unwrap();
+        p.prevent_modifications = true;
+        assert!(p
+            .remove_simple_rule("ip:1.1.1.1", SimpleAction::Proxy)
+            .is_err());
+        p.prevent_modifications = false;
+        p.is_raw = true;
+        assert!(p
+            .remove_simple_rule("ip:1.1.1.1", SimpleAction::Proxy)
+            .is_err());
+        assert!(p.has_simple_rule("ip:1.1.1.1", SimpleAction::Proxy));
+    }
+
+    #[test]
+    fn connection_targets_offer_suffix_levels_keyword_and_separated_tld() {
+        let targets = connection_route_targets("1.1.1.1:443", "Tile.OpenStreetMap.Org.", "curl");
+        let rules: Vec<_> = targets.iter().map(|t| t.rule.as_str()).collect();
+        assert_eq!(
+            rules,
+            [
+                "suffix:tile.openstreetmap.org",
+                "suffix:openstreetmap.org",
+                "keyword:openstreetmap",
+                "suffix:org",
+                "processName:curl"
+            ]
+        );
+        assert!(targets[3].separator_before);
+        assert!(targets[4].separator_before);
+        assert!(connection_route_targets("bbc.co.uk:443", "", "")
+            .iter()
+            .all(|t| !t.rule.starts_with("keyword:")));
+        assert_eq!(
+            connection_route_targets("[2001:db8::1]:443", "", "")[0].rule,
+            "ip:2001:db8::1"
+        );
     }
 }

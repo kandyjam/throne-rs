@@ -7,6 +7,7 @@
 //! - Stats sibling: `throne_stats.db` ([`traffic_stats`])
 
 mod paths;
+mod scanner;
 mod schema;
 mod traffic_stats;
 
@@ -129,8 +130,9 @@ impl Database {
                     id, archive, skip_auto_update, auto_clear_unavailable, name, url, info,
                     sub_last_update, front_proxy_id, landing_proxy_id,
                     column_width_json, profiles_json, scroll_last_profile,
-                    test_sort_by, traffic_sort_by, test_items_to_show, type_sort_by
-                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)"#,
+                    test_sort_by, traffic_sort_by, test_items_to_show, type_sort_by,
+                    endpoint_json, sub_options_json, sub_metadata_json
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)"#,
                 params![
                     g.id,
                     g.archive as i32,
@@ -149,6 +151,9 @@ impl Database {
                     g.traffic_sort_by,
                     g.test_items_to_show,
                     g.type_sort_by,
+                    serde_json::to_string(&g.endpoint)?,
+                    serde_json::to_string(&g.sub_options)?,
+                    serde_json::to_string(&g.sub_metadata)?,
                 ],
             )?;
         }
@@ -185,8 +190,8 @@ impl Database {
             tx.execute(
                 r#"INSERT INTO profiles (
                     id, type, name, gid, latency, dl_speed, ul_speed,
-                    test_country, ip_out, outbound_json, traffic_dl, traffic_up
-                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)"#,
+                    test_country, ip_out, outbound_json, traffic_dl, traffic_up, endpoint_json, latency_at
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)"#,
                 params![
                     p.id,
                     p.profile_type.as_str(),
@@ -200,6 +205,8 @@ impl Database {
                     outbound_json,
                     p.traffic_downlink,
                     p.traffic_uplink,
+                    serde_json::to_string(&p.endpoint)?,
+                    p.latency_at,
                 ],
             )?;
         }
@@ -259,7 +266,8 @@ impl Database {
             r#"SELECT id, archive, skip_auto_update, auto_clear_unavailable, name, url, info,
                       sub_last_update, front_proxy_id, landing_proxy_id,
                       column_width_json, profiles_json, scroll_last_profile,
-                      test_sort_by, traffic_sort_by, test_items_to_show, type_sort_by
+                      test_sort_by, traffic_sort_by, test_items_to_show, type_sort_by,
+                      endpoint_json, sub_options_json, sub_metadata_json
                FROM groups"#,
         )?;
         let rows = stmt.query_map([], |row| {
@@ -286,6 +294,11 @@ impl Database {
                 traffic_sort_by: row.get::<_, Option<i32>>(14)?.unwrap_or(0),
                 test_items_to_show: row.get::<_, Option<i32>>(15)?.unwrap_or(0),
                 type_sort_by: row.get::<_, Option<i32>>(16)?.unwrap_or(0),
+                endpoint: serde_json::from_str(&row.get::<_, String>(17)?).unwrap_or_default(),
+                sub_options: serde_json::from_str(&row.get::<_, String>(18)?)
+                    .unwrap_or_else(|_| serde_json::json!({})),
+                sub_metadata: serde_json::from_str(&row.get::<_, String>(19)?)
+                    .unwrap_or_else(|_| serde_json::json!({})),
             })
         })?;
         collect_rows(rows)
@@ -294,7 +307,7 @@ impl Database {
     fn load_profiles(&self) -> Result<Vec<Profile>, StorageError> {
         let mut stmt = self.conn.prepare(
             r#"SELECT id, type, name, gid, latency, dl_speed, ul_speed,
-                      test_country, ip_out, outbound_json, traffic_dl, traffic_up
+                      test_country, ip_out, outbound_json, traffic_dl, traffic_up, endpoint_json, latency_at
                FROM profiles"#,
         )?;
         let rows = stmt.query_map([], |row| {
@@ -318,6 +331,8 @@ impl Database {
                 name,
                 profile_type,
                 latency_ms: row.get::<_, Option<i32>>(4)?.unwrap_or(0),
+                latency_at: row.get::<_, i64>(13)?,
+                endpoint: serde_json::from_str(&row.get::<_, String>(12)?).unwrap_or_default(),
                 download_speed: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
                 upload_speed: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
                 test_country: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
@@ -668,6 +683,8 @@ fn merge_settings_tx(tx: &rusqlite::Transaction<'_>, s: &AppSettings) -> Result<
         ("remote_dns", s.remote_dns.clone()),
         ("direct_dns", s.direct_dns.clone()),
         ("vpn_strict_route", bool_str(s.vpn_strict_route)),
+        ("kill_switch", bool_str(s.kill_switch)),
+        ("vpn_auto_redirect", bool_str(s.vpn_auto_redirect)),
         ("vpn_mtu", s.vpn_mtu.to_string()),
         ("vpn_tun_ipv4_cidr", s.vpn_tun_ipv4_cidr.clone()),
         ("vpn_ipv6", bool_str(s.vpn_ipv6)),
@@ -791,6 +808,8 @@ fn apply_setting(s: &mut AppSettings, key: &str, value: &str) {
         "remote_dns" => s.remote_dns = value.to_string(),
         "direct_dns" => s.direct_dns = value.to_string(),
         "vpn_strict_route" => s.vpn_strict_route = parse_bool(value),
+        "kill_switch" => s.kill_switch = parse_bool(value),
+        "vpn_auto_redirect" => s.vpn_auto_redirect = parse_bool(value),
         "vpn_mtu" => {
             if let Ok(n) = value.parse() {
                 s.vpn_mtu = n;

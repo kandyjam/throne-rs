@@ -3,16 +3,16 @@ package sysdns
 import (
 	"strings"
 
-	"ThroneCore/internal/boxdns"
+	"ThroneCore/internal/netmon"
 	tun "github.com/sagernet/sing-tun"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/shell"
 )
 
 // SetSystemDNS points the physical default-route NIC at addr (or clears it when
-// addr is "Empty"). Prefer the always-on boxdns monitor — it excludes TUN/loopback
+// addr is "Empty"). Prefer the always-on netmon monitor — it excludes TUN/loopback
 // — so we never call networksetup against utun after auto_route flips the default
-// route. Falling back to sing-box's monitor keeps prior behavior if boxdns is down.
+// route. Falling back to sing-box's monitor keeps prior behavior if netmon is down.
 func SetSystemDNS(addr string, interfaceMonitor tun.DefaultInterfaceMonitor) error {
 	interfaceName := physicalInterfaceName(interfaceMonitor)
 	if interfaceName == "" {
@@ -36,7 +36,7 @@ func SetSystemDNS(addr string, interfaceMonitor tun.DefaultInterfaceMonitor) err
 }
 
 func physicalInterfaceName(interfaceMonitor tun.DefaultInterfaceMonitor) string {
-	if ifc := boxdns.DefaultInterface(); ifc != nil && ifc.Name != "" {
+	if ifc := netmon.DefaultInterface(); ifc != nil && ifc.Name != "" {
 		return ifc.Name
 	}
 	if interfaceMonitor != nil {

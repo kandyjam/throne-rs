@@ -59,7 +59,7 @@ git show "${TARGET}:core/go.mod" 2>/dev/null | awk '/^replace /{print}' || \
 
 echo
 echo "==> preserved local patches (re-apply after a core checkout)"
-echo "  core/internal/sysdns/sysdns_darwin.go  physical NIC via boxdns.DefaultInterface"
+echo "  core/internal/sysdns/sysdns_darwin.go  physical NIC via netmon.DefaultInterface"
 echo
 echo "Next: triage the log into must-port / core / cosmetic / out-of-scope,"
 echo "then update VERSION, Cargo.toml, README, docs/UPSTREAM_TRACKING.md, and this skill's pin."

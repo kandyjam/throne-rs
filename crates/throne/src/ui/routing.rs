@@ -1,7 +1,7 @@
 //! Routing Settings dialog — parity with upstream `DialogManageRoutes` +
 //! `RouteItem` / `RawRouteItem`.
 //!
-//! Tabs: Common · Hijack · Warp · DNS · Route  
+//! Tabs: Common · Warp · DNS · Route
 //! Route actions: New (structured/raw/remote) · Clone · Export · Import · Edit ·
 //! Delete · Update. Draft is committed only on OK.
 
@@ -34,13 +34,7 @@ pub enum RoutingTab {
 }
 
 impl RoutingTab {
-    pub const ALL: [Self; 5] = [
-        Self::Common,
-        Self::Hijack,
-        Self::Warp,
-        Self::Dns,
-        Self::Route,
-    ];
+    pub const ALL: [Self; 4] = [Self::Common, Self::Warp, Self::Dns, Self::Route];
     pub fn label(self) -> &'static str {
         match self {
             Self::Common => "Common",

@@ -120,7 +120,10 @@ pub fn build_load_config_ex(
     // TUN inbound when toolbar Tun is on (needs privileges on macOS/Linux).
     // Mirrors upstream `buildInboundSection` (generate.cpp).
     let mut tun_ipv4_cidr = String::new();
-    let outbound = proxy_outbound;
+    let mut outbound = proxy_outbound;
+    if auto_selector.is_none() {
+        apply_skip_cert_to_outbound(profile, &mut outbound, settings.skip_cert);
+    }
     if settings.tun_mode_enabled {
         // 1.3.0: Darwin Tun no longer requires a Local override IP. `local` stays the OS resolver.
         tun_ipv4_cidr = normalize_tun_ipv4_cidr(&settings.vpn_tun_ipv4_cidr);
@@ -131,15 +134,13 @@ pub fn build_load_config_ex(
         if let Some(v6) = &tun_ipv6_cidr {
             tun_addrs.push(json!(v6));
         }
-        // Platform stack defaults match upstream SettingsRepo (macOS → gvisor).
-        let stack = default_tun_stack();
+        // 1.4 removes the selectable stack; let the bundled core choose its supported backend.
         let mut tun = json!({
             "type": "tun",
             "tag": "tun-in",
             "auto_route": true,
             "strict_route": settings.vpn_strict_route,
             "mtu": settings.vpn_mtu.clamp(1280, 65535),
-            "stack": stack,
             "address": tun_addrs
         });
         // Upstream genTunName(): macOS "" (omit); else "throne-tun".
@@ -150,7 +151,7 @@ pub fn build_load_config_ex(
         }
         // Upstream: Linux + vpn_auto_redirect (default true).
         #[cfg(target_os = "linux")]
-        {
+        if settings.vpn_auto_redirect {
             tun.as_object_mut()
                 .unwrap()
                 .insert("auto_redirect".into(), json!(true));
@@ -176,6 +177,10 @@ pub fn build_load_config_ex(
 
     let (mut route_rules, mut rule_sets, route_final) =
         compile_route_section(route_profile, settings.ruleset_mirror);
+    let l3_bridge = l3_bridge_enabled(settings, route_profile);
+    if l3_bridge {
+        route_rules = with_l3_bridge_twins(route_rules);
+    }
 
     // Upstream: optional adblock remote rule-set + reject rule.
     if settings.adblock_enable {
@@ -194,6 +199,22 @@ pub fn build_load_config_ex(
             "rule_set": ["throne-adblocksingbox"],
             "action": "reject"
         }));
+    }
+    // A Block default also compiles to direct, but must never acquire a bypass gate.
+    // This fallback follows every ordinary rule, including injected adblock rules.
+    if l3_bridge
+        && route_final == "direct"
+        && route_profile
+            .is_some_and(|rp| rp.is_raw || rp.default_outbound == DefaultOutbound::Direct)
+    {
+        route_rules.push(json!({
+            "preferred_by": ["l3-direct"],
+            "action": "route",
+            "outbound": "l3-direct"
+        }));
+    }
+    if route_profile.is_some_and(|rp| !rp.is_raw && rp.default_outbound == DefaultOutbound::Block) {
+        route_rules.push(json!({ "action": "reject" }));
     }
 
     let (dns, default_resolver_tag) =
@@ -225,8 +246,8 @@ pub fn build_load_config_ex(
     let mut outbounds = extra_outbounds;
     outbounds.push(outbound);
     outbounds.push(json!({ "type": "direct", "tag": "direct" }));
-    if settings.skip_cert {
-        apply_skip_cert_to_outbounds(&mut outbounds);
+    if l3_bridge {
+        outbounds.push(json!({ "type": "bridge", "tag": "l3-direct", "bridge_name": "throne-br" }));
     }
 
     let config = json!({
@@ -235,13 +256,10 @@ pub fn build_load_config_ex(
         "inbounds": inbounds,
         "outbounds": outbounds,
         "route": route,
-        // clash_api enables TrafficManager used by QueryStats / QueryConnections.
-        // Upstream cache_file also sets store_fakeip / store_rdrc when applicable.
+        // In 1.4, the API service's presence creates the RPC traffic tracker.
+        // Port zero keeps its HTTP listener disabled while retaining stats and connections.
+        "services": [{ "type": "api", "listen": "127.0.0.1", "listen_port": 0, "secret": "" }],
         "experimental": {
-            "clash_api": {
-                "external_controller": "127.0.0.1:0",
-                "default_mode": ""
-            },
             "cache_file": {
                 "enabled": true,
                 "store_fakeip": settings.dns_persist_cache,
@@ -687,13 +705,11 @@ pub fn build_url_test_config(
         if let Some(obj) = ob.as_object_mut() {
             obj.insert("tag".into(), json!(tag.clone()));
         }
+        apply_skip_cert_to_outbound(p, &mut ob, settings.skip_cert);
         outbounds.push(ob);
         tags.push(tag);
     }
     outbounds.push(json!({ "type": "direct", "tag": "direct" }));
-    if settings.skip_cert {
-        apply_skip_cert_to_outbounds(&mut outbounds);
-    }
 
     let config = json!({
         "log": { "level": log_level, "timestamp": true },
@@ -742,20 +758,31 @@ fn default_tun_interface_name() -> Option<&'static str> {
     }
 }
 
-/// Upstream `vpn_implementation` platform defaults.
-fn default_tun_stack() -> &'static str {
-    #[cfg(target_os = "macos")]
-    {
-        "gvisor"
+fn l3_bridge_enabled(settings: &AppSettings, route_profile: Option<&RouteProfile>) -> bool {
+    !cfg!(all(target_os = "windows", target_arch = "aarch64"))
+        && settings.tun_mode_enabled
+        && settings.vpn_l3_bridge
+        && !route_profile.is_some_and(|rp| rp.is_raw && rp.prevent_modifications)
+}
+
+/// Put each bridge pre-match immediately before its direct route, below sniff/DNS rules.
+fn with_l3_bridge_twins(rules: Vec<Value>) -> Vec<Value> {
+    let mut result = Vec::with_capacity(rules.len());
+    for rule in rules {
+        let action = rule.get("action").and_then(Value::as_str).unwrap_or("");
+        if matches!(action, "" | "route")
+            && rule.get("preferred_by").is_none()
+            && rule.get("outbound").and_then(Value::as_str) == Some("direct")
+        {
+            let mut twin = rule.clone();
+            twin["preferred_by"] = json!(["l3-direct"]);
+            twin["action"] = json!("route");
+            twin["outbound"] = json!("l3-direct");
+            result.push(twin);
+        }
+        result.push(rule);
     }
-    #[cfg(target_os = "windows")]
-    {
-        "system"
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        "system"
-    }
+    result
 }
 
 /// Validate / fall back Tun IPv4 CIDR (upstream default `172.19.0.1/24`).
@@ -1001,6 +1028,7 @@ fn build_auto_selector_outbounds(
         if let Some(obj) = ob.as_object_mut() {
             obj.insert("tag".into(), json!(tag.clone()));
         }
+        apply_skip_cert_to_outbound(member, &mut ob, settings.skip_cert);
         member_outbounds.push(ob);
         // Warm prior: known-good (or known-bad rtt=0) results seed the core.
         if member.latency_ms != 0 && validity_mins > 0 {
@@ -1566,12 +1594,30 @@ fn apply_transport(v: &mut Value, o: &ParsedOutbound) {
     }
 }
 
-/// Upstream `TLS.cpp`: `skip_cert` forces `insecure` on any outbound that already has TLS.
-fn apply_skip_cert_to_outbounds(outbounds: &mut [Value]) {
-    for ob in outbounds {
-        if let Some(tls) = ob.get_mut("tls").and_then(|t| t.as_object_mut()) {
-            tls.insert("insecure".into(), json!(true));
-        }
+/// Upstream `TLS.cpp`: `skip_cert` affects native profiles using the shared TLS builder.
+fn apply_skip_cert_to_outbound(profile: &Profile, outbound: &mut Value, skip_cert: bool) {
+    // Upstream TLS::Build owns this override. Custom JSON, Naive's limited TLS,
+    // VPN endpoint TLS and native Xray streams have separate security contracts.
+    if !skip_cert
+        || !matches!(
+            profile.profile_type,
+            ProfileType::Http
+                | ProfileType::Trojan
+                | ProfileType::Vless
+                | ProfileType::Vmess
+                | ProfileType::Hysteria
+                | ProfileType::Hysteria2
+                | ProfileType::Tuic
+                | ProfileType::AnyTls
+                | ProfileType::Juicity
+                | ProfileType::TrustTunnel
+                | ProfileType::ShadowTls
+        )
+    {
+        return;
+    }
+    if let Some(tls) = outbound.get_mut("tls").and_then(Value::as_object_mut) {
+        tls.insert("insecure".into(), json!(true));
     }
 }
 
@@ -1976,6 +2022,109 @@ mod tests {
     }
 
     #[test]
+    fn skip_cert_preserves_custom_and_naive_tls_but_applies_to_native_selector_members() {
+        let mut custom = Profile::new(1, 1, "custom", ProfileType::Custom);
+        custom.outbound_json = json!({"type":"vless","server":"example.com","server_port":443,"uuid":"u","tls":{"enabled":true,"insecure":false}}).to_string();
+        let mut naive = Profile::new(2, 1, "naive", ProfileType::Naive);
+        naive.outbound_json = json!({"type":"naive","server":"example.com","server_port":443,"username":"u","password":"p","tls":{"enabled":true,"insecure":false}}).to_string();
+        let mut naive_outbound: Value = serde_json::from_str(&naive.outbound_json).unwrap();
+        apply_skip_cert_to_outbound(&naive, &mut naive_outbound, true);
+        assert_eq!(naive_outbound["tls"]["insecure"], false);
+        let mut native = custom.clone();
+        native.id = 3;
+        native.profile_type = ProfileType::Vless;
+        let settings = AppSettings {
+            skip_cert: true,
+            ..AppSettings::default()
+        };
+        let (test_json, _) = build_url_test_config(&[&custom, &native], &settings).unwrap();
+        let test: Value = serde_json::from_str(&test_json).unwrap();
+        assert_eq!(test["outbounds"][0]["tls"]["insecure"], false);
+        assert_eq!(test["outbounds"][1]["tls"]["insecure"], true);
+        let selector = Profile::new(99, 1, "selector", ProfileType::AutoSelector);
+        let auto = AutoSelectorBuild {
+            config: AutoSelectorConfig::new_for_group(1, "selector"),
+            members: vec![custom, native],
+        };
+        let built = build_load_config_ex(&selector, &settings, None, Some(&auto)).unwrap();
+        let config: Value = serde_json::from_str(&built.core_config_json).unwrap();
+        assert_eq!(config["outbounds"][0]["tls"]["insecure"], false);
+        assert_eq!(config["outbounds"][1]["tls"]["insecure"], true);
+    }
+
+    #[test]
+    fn legacy_hijack_settings_cannot_recreate_removed_listeners_or_answers() {
+        let mut p = Profile::new(1, 1, "socks", ProfileType::Socks);
+        p.outbound_json =
+            json!({"type":"socks","server":"example.com","server_port":1080}).to_string();
+        let settings = AppSettings {
+            enable_dns_server: true,
+            dns_server_rules: vec!["domain:example.com".into()],
+            enable_redirect: true,
+            system_dns_set: true,
+            ..AppSettings::default()
+        };
+        let built = build_load_config(&p, &settings, None).unwrap();
+        let config: Value = serde_json::from_str(&built.core_config_json).unwrap();
+        assert_eq!(config["inbounds"].as_array().unwrap().len(), 1);
+        assert_eq!(config["inbounds"][0]["type"], "mixed");
+        assert!(config["dns"]["rules"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .all(|rule| rule["action"] != "predefined"));
+    }
+
+    #[test]
+    fn l3_bridge_twins_keep_match_order_and_never_copy_reject_or_existing_gates() {
+        let rules = vec![
+            json!({"action":"sniff"}),
+            json!({"domain_suffix":["example.com"],"action":"route","outbound":"direct"}),
+            json!({"action":"reject","outbound":"direct"}),
+            json!({"preferred_by":["vpn"],"action":"route","outbound":"direct"}),
+        ];
+        let result = with_l3_bridge_twins(rules.clone());
+        assert_eq!(result.len(), 5);
+        assert_eq!(result[0], rules[0]);
+        assert_eq!(result[1]["preferred_by"], json!(["l3-direct"]));
+        assert_eq!(result[1]["domain_suffix"], rules[1]["domain_suffix"]);
+        assert_eq!(result[2], rules[1]);
+        assert_eq!(result[3], rules[2]);
+        assert_eq!(result[4], rules[3]);
+    }
+
+    #[test]
+    fn enabled_l3_bridge_uses_guard_interface_prefix_and_block_final_still_rejects() {
+        let mut p = Profile::new(1, 1, "socks", ProfileType::Socks);
+        p.outbound_json =
+            json!({"type":"socks","server":"example.com","server_port":1080}).to_string();
+        let settings = AppSettings {
+            vpn_l3_bridge: true,
+            ..tun_settings()
+        };
+        let mut route = RouteProfile::new(1, "block default");
+        route.default_outbound = DefaultOutbound::Block;
+        let built = build_load_config(&p, &settings, Some(&route)).unwrap();
+        let config: Value = serde_json::from_str(&built.core_config_json).unwrap();
+        if !cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+            let bridge = config["outbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|out| out["type"] == "bridge")
+                .unwrap();
+            assert_eq!(bridge["bridge_name"], "throne-br");
+        }
+        let rules = config["route"]["rules"].as_array().unwrap();
+        assert_eq!(rules.last().unwrap(), &json!({"action":"reject"}));
+        assert!(!rules.iter().any(|rule| rule
+            == &json!({"preferred_by":["l3-direct"],"action":"route","outbound":"l3-direct"})));
+        route.is_raw = true;
+        route.prevent_modifications = true;
+        assert!(!l3_bridge_enabled(&settings, Some(&route)));
+    }
+
+    #[test]
     fn subtract_ipv4_punches_tun_subnet_out_of_private_range() {
         let ranges = vec!["172.16.0.0/12".into()];
         let out = subtract_ipv4_prefix(&ranges, "172.19.0.1/24");
@@ -2069,8 +2218,14 @@ mod tests {
                 "macOS tun name must be utun* or omitted, got {:?}",
                 tun.get("interface_name")
             );
-            assert_eq!(tun["stack"], "gvisor");
         }
+        assert!(
+            tun.get("stack").is_none(),
+            "the 1.4 core selects its TUN stack"
+        );
+        assert_eq!(v["services"][0]["type"], "api");
+        assert_eq!(v["services"][0]["listen_port"], 0);
+        assert!(v["experimental"].get("clash_api").is_none());
         #[cfg(not(target_os = "macos"))]
         {
             assert_eq!(tun["interface_name"], "throne-tun");

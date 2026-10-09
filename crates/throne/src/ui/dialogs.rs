@@ -1241,8 +1241,8 @@ pub fn tun_settings_body(
         .child(section_hint(
             "Tun Mode settings — applied on next Start when Tun is checked. \
              macOS/Linux require elevated ThroneCore (setuid). \
-             On macOS also set Routing → Local override to a plain DNS IP \
-             (same as upstream Throne; empty Local DNS + Tun will fail to start).",
+             The core detects local DNS automatically on macOS. \
+             The TUN stack is managed by ThroneCore.",
         ))
         .child(input_field_row("MTU", mtu_input, 140.))
         .child(input_field_row("Private ranges", ranges_input, 140.))

@@ -17,8 +17,8 @@ Keep **throne-rs** (`rewrite/rust-gpui`) behaviorally aligned with
 | Item | Value |
 |------|--------|
 | Upstream remote | `upstream` → `https://github.com/throneproj/Throne.git` |
-| **Pin** | tag **`1.3.2`** (`9dd4fe96`, 2026-09-29) |
-| `upstream/dev` at last audit | `1.3.2-20-ga7534e3d` — do not absorb until asked |
+| **Pin** | tag **`1.4.0-beta.1`** (`50a22014`, 2026-10-04) |
+| `upstream/dev` at last audit | `1.4.0-beta.1-13-g32138a44` on 2026-10-09 — do not absorb until asked |
 | Product version | root `VERSION` + workspace `Cargo.toml` `version` |
 | Matrix | [`docs/UPSTREAM_TRACKING.md`](../../docs/UPSTREAM_TRACKING.md) |
 | Audit command | `./script/upstream-audit [tag]` |
@@ -49,9 +49,9 @@ git archive <tag> core | tar -x
 # re-apply the local patch (do not drop it)
 ```
 
-**Local patch:** `core/internal/sysdns/sysdns_darwin.go` resolves the NIC through `boxdns.DefaultInterface()` (TUN/loopback excluded) before sing-box's monitor. Upstream still calls `interfaceMonitor.DefaultInterface().Name`, which follows `utun` after `auto_route`.
+**Local patch:** `core/internal/sysdns/sysdns_darwin.go` resolves the physical NIC through `netmon.DefaultInterface()` (TUN/loopback excluded) before sing-box's monitor. The 1.4.0-beta.1 removal of the `boxdns` monitor must not drop this hardening; sing-box's default interface can follow `utun` after `auto_route`.
 
-Proto lives at `core/gen/libcore.proto`. New RPCs since 1.3.0-beta.3: `WarpRegister`, `CaptureDiagnostics`, `StopDiagnostics`, `UpdateRuleSets`. Field 12 `vpn_status_timeout_ms` is reserved. Do not invent framing; the Rust client is length-prefixed method + protobuf.
+Proto lives at `core/gen/libcore.proto`. New contracts since 1.3.0-beta.3 include `WarpRegister`, `CaptureDiagnostics`, `StopDiagnostics`, `UpdateRuleSets`, scanner/egress RPCs and the target's guard support. Retired standalone DNS-hijack RPCs are removed. Field 12 `vpn_status_timeout_ms` is reserved. Do not invent framing; the Rust client is length-prefixed method + protobuf.
 
 ## Where code maps
 
@@ -65,6 +65,20 @@ Proto lives at `core/gen/libcore.proto`. New RPCs since 1.3.0-beta.3: `WarpRegis
 | SQLite | `throne-storage` (`throne.db` wire compatible) |
 | Main window / dialogs | `crates/throne/src/ui/` |
 | Import / deeplink | `throne-import` |
+
+## 1.4.0-beta.1 contracts and remaining gaps (current pin)
+
+The 23 commits from `1.3.2` to `1.4.0-beta.1` are individually triaged in `docs/UPSTREAM_TRACKING.md`. This is a core/schema baseline with partial product coverage, not a full-parity claim.
+
+- **Core/API/config:** target `core/` and proto synced; host core rebuilt. Emit the API service with its HTTP listener disabled so stats/connection trackers exist. L3 bridge uses `throne-br`, ordered direct-rule twins and fallback; Block final rejects rather than bypassing. Retired DNS-hijack controls/selectable TUN stack removed or hidden; the mandatory DNS route action remains.
+- **IP lists/scanner:** upstream-compatible models, atomic entry generations, migration, scan progress/seed storage and RPCs. Native UI supports manual lists and **TCP only**, capped at **4,096 targets**, **256 hosts per CIDR**, **16 concurrent probes**, **64 targets per batch**. Full probes, resumable GUI sessions, remote list updates and default list seeds remain open.
+- **Endpoint sources:** profile/group inheritance and JSON/DB compatibility; profile list assignment plus **Own/Inherit** restoration. Start and stored-profile tests use transient endpoint clones, preserve TLS/SNI/transport hosts and ports, and block serverless/realm overrides before list lookup. Group/fixed-address editor remains open.
+- **Security/cleanup:** derived classification covers raw/custom/Xray, private hosts, pins and custom MASQUE's mandatory TLS. Cleanup honors the security-display gate and never removes a profile solely because global skip-cert compromised it.
+- **Connection routing:** domain levels, process name/path, destination targets and existing/coverage marks; a target's own identical line in another list does not count as covering it.
+- **Kill Switch:** setting persisted and upstream guard code retained in core; **no GUI or lifecycle integration** and no privileged runtime verification. Do not claim user protection is active.
+- **Platform gaps:** KDE/global-hotkey rewrite and OS proxy refactor are not ported. APT/RPM/AUR release automation and historical matrix gaps remain separate work.
+
+Verification recorded during the audit: domain **89 tests passed**, six actual-core smoke checks (including positive/negative WebSocket config cases), earlier Go vet/race checks and host packaging build. Final workspace checks and native GUI exercise are **pending**; Windows and privileged TUN/L3/Kill Switch runtime are **untested**. Refresh this record only from executed results.
 
 ## 1.3.2 contracts already ported
 

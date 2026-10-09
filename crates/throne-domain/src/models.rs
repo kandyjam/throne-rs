@@ -737,6 +737,11 @@ pub struct Profile {
     pub profile_type: ProfileType,
     /// Latency in milliseconds; 0 = untested, negative = failed.
     pub latency_ms: i32,
+    /// Timestamp of the last latency test; retained for upstream compatibility.
+    #[serde(default)]
+    pub latency_at: i64,
+    #[serde(default)]
+    pub endpoint: crate::EndpointSource,
     pub download_speed: String,
     pub upload_speed: String,
     pub test_country: String,
@@ -761,6 +766,8 @@ impl Profile {
             name: name.into(),
             profile_type: ty,
             latency_ms: 0,
+            latency_at: 0,
+            endpoint: crate::EndpointSource::default(),
             download_speed: String::new(),
             upload_speed: String::new(),
             test_country: String::new(),
@@ -884,6 +891,13 @@ pub struct Group {
     pub traffic_sort_by: i32,
     pub test_items_to_show: i32,
     pub type_sort_by: i32,
+    #[serde(default)]
+    pub endpoint: crate::EndpointSource,
+    /// Preserve upstream subscription extension keys without narrowing them.
+    #[serde(default)]
+    pub sub_options: serde_json::Value,
+    #[serde(default)]
+    pub sub_metadata: serde_json::Value,
 }
 
 impl Group {
@@ -906,6 +920,9 @@ impl Group {
             traffic_sort_by: 0,
             test_items_to_show: 0,
             type_sort_by: 0,
+            endpoint: crate::EndpointSource::default(),
+            sub_options: serde_json::json!({}),
+            sub_metadata: serde_json::json!({}),
         }
     }
 
@@ -1116,6 +1133,9 @@ pub struct AppSettings {
     pub remote_dns: String,
     pub direct_dns: String,
     pub vpn_strict_route: bool,
+    /// Linux auto-redirect (upstream default true). Prevents this host acting as a gateway.
+    #[serde(default = "default_true")]
+    pub vpn_auto_redirect: bool,
     pub vpn_mtu: i32,
     /// Tun IPv4 address/prefix (upstream `vpn_tun_ipv4_cidr`, default `172.19.0.1/24`).
     /// Passed to sing-box `inbounds[].address` and Start RPC `tun_ipv4_cidr` (macOS system DNS).
@@ -1153,6 +1173,9 @@ pub struct AppSettings {
     /// Skip TLS certificate verification on outbound TLS (`SettingsRepo.skip_cert`, 1.3.0-beta.3).
     #[serde(default)]
     pub skip_cert: bool,
+    /// Upstream 1.4 opt-in network guard; only armed after the core reports support.
+    #[serde(default)]
+    pub kill_switch: bool,
     /// Delete existing group profiles before applying a subscription snapshot.
     #[serde(default)]
     pub sub_clear: bool,
@@ -1188,7 +1211,8 @@ pub struct AppSettings {
     pub start_with_system: bool,
     pub system_proxy_enabled: bool,
     pub tun_mode_enabled: bool,
-    /// Upstream `system_dns_set` checkbox on the main toolbar.
+    /// Legacy setting retained for database round-trips; removed upstream in 1.4.
+    #[serde(default)]
     pub system_dns_set: bool,
     pub theme: String,
     pub log_level: String,
@@ -1242,7 +1266,7 @@ pub struct AppSettings {
     pub core_box_underlying_dns: String,
     #[serde(default)]
     pub fake_dns: bool,
-    /// DNS hijack / embedded DNS server.
+    /// Legacy DNS hijack settings: retained for loading old databases, never generated since 1.4.
     #[serde(default)]
     pub enable_dns_server: bool,
     #[serde(default = "default_dns_listen_port")]
@@ -1255,7 +1279,7 @@ pub struct AppSettings {
     pub dns_server_rules: Vec<String>,
     #[serde(default)]
     pub dns_server_listen_lan: bool,
-    /// Transparent redirect inbound.
+    /// Legacy transparent redirect settings: retained for loading old databases only.
     #[serde(default)]
     pub enable_redirect: bool,
     #[serde(default = "default_redirect_addr")]
@@ -1315,6 +1339,7 @@ impl Default for AppSettings {
             remote_dns: "https://dns.google/dns-query".into(),
             direct_dns: "localhost".into(),
             vpn_strict_route: false,
+            vpn_auto_redirect: true,
             // upstream SettingsRepo default is 1500; keep 9000 only if user already persisted it
             vpn_mtu: 1500,
             vpn_tun_ipv4_cidr: default_vpn_tun_ipv4_cidr(),
@@ -1329,6 +1354,7 @@ impl Default for AppSettings {
             net_use_proxy: false,
             net_insecure: false,
             skip_cert: false,
+            kill_switch: false,
             sub_clear: false,
             sub_show_change_popup: true,
             // Upstream SettingsRepo default: false (keep running profile on sub update).

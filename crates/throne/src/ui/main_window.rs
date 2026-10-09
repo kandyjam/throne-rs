@@ -1,7 +1,7 @@
 //! Main window layout mirrored from upstream `mainwindow.ui`.
 //!
 //! ```text
-//! [Program][Settings][Groups][Routing][Tools] [▶Start] [Tun][DNS][Proxy] | data_view
+//! [Program][Settings][Groups][Routing][Tools] [▶Start] [Tun][Proxy] | data_view
 //! ─────────────────────────────────────────────────────────────────────
 //! Group tabs …
 //! ┌ Type │ Address │ Name │ Test Result │ Traffic ──────────────────┐
@@ -31,8 +31,8 @@ use throne_core_client::{
     CoreSession,
 };
 use throne_domain::{
-    connection_route_rule, AppSettings, AppState, CoreStatus, Group, GroupId, Profile, ProfileId,
-    ProfileSortColumn, ProfileType, SimpleAction, TrafficSnapshot,
+    connection_route_targets, AppSettings, AppState, CoreStatus, Group, GroupId, Profile,
+    ProfileId, ProfileSortColumn, ProfileType, SimpleAction, TrafficSnapshot,
 };
 use throne_import::{fetch_url_with_options, import_subscription_response, FetchOptions};
 
@@ -587,8 +587,8 @@ pub struct MainWindow {
     ctx_menu_at: Option<(f32, f32)>,
     /// Target group for [`OpenMenu::GroupTabCtx`] (`None` = empty tab-bar area).
     ctx_group_id: Option<GroupId>,
-    /// Simple-mode rule line for [`OpenMenu::ConnectionCtx`].
-    connection_rule: Option<String>,
+    /// Domain levels, keyword, IP and process targets for the Connections menu.
+    connection_targets: Vec<throne_domain::ConnectionRouteTarget>,
     dialog: Dialog,
     /// Real InputState entities for the open dialog (text source of truth while open).
     dialog_inputs: Option<DialogInputs>,
@@ -732,7 +732,7 @@ impl MainWindow {
             rendered_connection_ids: String::new(),
             ctx_menu_at: None,
             ctx_group_id: None,
-            connection_rule: None,
+            connection_targets: Vec::new(),
             dialog: Dialog::None,
             dialog_inputs: None,
             pending_nested_simple_sync: false,
@@ -1149,7 +1149,7 @@ impl MainWindow {
         self.open_menu = OpenMenu::None;
         self.ctx_menu_at = None;
         self.ctx_group_id = None;
-        self.connection_rule = None;
+        self.connection_targets.clear();
     }
 
     fn close_dialog(&mut self) {
@@ -2281,22 +2281,8 @@ impl MainWindow {
         let Dialog::RoutingSettings(draft) = &self.dialog else {
             return;
         };
-        // Validate DNS hijack rules (prefer Input text when present).
-        let rules_text = if let Some(DialogInputs::Routing(inputs)) = &self.dialog_inputs {
-            DialogInputs::read_string(&inputs.dns_rules, cx)
-        } else {
-            draft.dns_rules_text()
-        };
-        if !crate::ui::routing::RoutingDraft::validate_dns_rules(&rules_text) {
-            if let Dialog::RoutingSettings(d) = &mut self.dialog {
-                d.nested = RoutingNested::Notice {
-                    title: "Invalid settings".into(),
-                    body: "DNS Rules are not valid".into(),
-                };
-            }
-            cx.notify();
-            return;
-        }
+        // Legacy hijack fields remain persisted for compatibility but no longer
+        // participate in validation or generated configuration (upstream 1.4).
         if draft.routes.is_empty() {
             if let Dialog::RoutingSettings(d) = &mut self.dialog {
                 d.nested = RoutingNested::Notice {
@@ -2713,6 +2699,15 @@ impl MainWindow {
         let Some(profile) = self.state.profile(id).cloned() else {
             return;
         };
+        let profile = match self.profile_with_endpoint(&profile) {
+            Ok(profile) => profile,
+            Err(error) => {
+                self.state
+                    .set_status_message(format!("IP Test failed · {}: {error}", profile.name));
+                cx.notify();
+                return;
+            }
+        };
         let settings = self.state.settings().clone();
         let core = Arc::clone(&self.core);
         self.background_busy = true;
@@ -2786,6 +2781,17 @@ impl MainWindow {
             cx.notify();
             return;
         };
+        let profile = match self.profile_with_endpoint(&profile) {
+            Ok(profile) => profile,
+            Err(error) => {
+                self.state.set_status_message(format!(
+                    "Speedtest group failed · {}: {error}",
+                    profile.name
+                ));
+                cx.notify();
+                return;
+            }
+        };
         let id = profile.id;
         let settings = self.state.settings().clone();
         let test_current = matches!(
@@ -2856,7 +2862,20 @@ impl MainWindow {
             cx.notify();
             return;
         };
-        let profile = self.state.profile(id).cloned();
+        let Some(profile) = self.state.profile(id).cloned() else {
+            self.state.set_status_message("Profile not found");
+            cx.notify();
+            return;
+        };
+        let profile = match self.profile_with_endpoint(&profile) {
+            Ok(profile) => profile,
+            Err(error) => {
+                self.state
+                    .set_status_message(format!("Speedtest failed · {}: {error}", profile.name));
+                cx.notify();
+                return;
+            }
+        };
         let settings = self.state.settings().clone();
         let test_current = matches!(
             self.state.core_status(),
@@ -2872,7 +2891,7 @@ impl MainWindow {
                 .spawn(async move {
                     let mut guard = core.lock().map_err(|e| format!("lock: {e}"))?;
                     guard
-                        .speed_test_simple(profile.as_ref(), &settings, test_current)
+                        .speed_test_simple(Some(&profile), &settings, test_current)
                         .map_err(|e| e.to_string())
                 })
                 .await;
@@ -3159,6 +3178,15 @@ impl MainWindow {
             cx.notify();
             return;
         };
+        let profile = match self.profile_with_endpoint(&profile) {
+            Ok(profile) => profile,
+            Err(error) => {
+                self.state
+                    .set_status_message_only(format!("Endpoint: {error}"));
+                cx.notify();
+                return;
+            }
+        };
 
         self.core_op_busy = true;
         self.pending_stop = false;
@@ -3189,6 +3217,23 @@ impl MainWindow {
         let auto_build = if profile.profile_type == ProfileType::AutoSelector {
             match self.state.resolve_auto_selector_members(profile_id) {
                 Ok((mut cfg, plan, members)) => {
+                    let members = match members
+                        .iter()
+                        .map(|member| self.profile_with_endpoint(member))
+                        .collect::<Result<Vec<_>, _>>()
+                    {
+                        Ok(members) => members,
+                        Err(error) => {
+                            self.core_op_busy = false;
+                            self.running_profile_display = None;
+                            self.state.set_core_status(CoreStatus::Error(error.clone()));
+                            self.state.set_status_message_only(format!(
+                                "Auto Selector endpoint: {error}"
+                            ));
+                            cx.notify();
+                            return;
+                        }
+                    };
                     self.state.push_log(format!(
                         "[Auto selector] {} · starting with {} member(s)",
                         plan.summary(),
@@ -3531,6 +3576,28 @@ impl MainWindow {
         Ok(())
     }
 
+    fn profile_with_endpoint(&self, profile: &Profile) -> Result<Profile, String> {
+        if throne_domain::endpoint_override_blocker(profile).is_some() {
+            return Ok(profile.clone());
+        }
+        let group = self.state.group(profile.group_id);
+        let source = throne_domain::effective_endpoint_source(profile, group);
+        let list = if let throne_domain::EndpointSource::IpList { list } = source {
+            let path = if self.db_path_label.is_empty() {
+                throne_storage::default_db_path()
+            } else {
+                std::path::PathBuf::from(&self.db_path_label)
+            };
+            throne_storage::Database::open(&path)
+                .and_then(|db| db.load_ip_list(*list))
+                .map_err(|e| e.to_string())?
+        } else {
+            None
+        };
+        throne_domain::materialize_profile_endpoint(profile, group, list.as_ref())
+            .map_err(|e| e.to_string())
+    }
+
     fn save_db(&mut self, cx: &mut Context<Self>) {
         self.close_menus();
         match self.persist_db() {
@@ -3586,6 +3653,15 @@ impl MainWindow {
             self.state.set_status_message("Profile not found");
             cx.notify();
             return;
+        };
+        let profile = match self.profile_with_endpoint(&profile) {
+            Ok(profile) => profile,
+            Err(error) => {
+                self.state
+                    .set_status_message(format!("URL Test failed · {}: {error}", profile.name));
+                cx.notify();
+                return;
+            }
         };
         let settings = self.state.settings().clone();
         let running_id = self
@@ -3681,6 +3757,22 @@ impl MainWindow {
             cx.notify();
             return;
         }
+        let profiles = match profiles
+            .iter()
+            .map(|profile| {
+                self.profile_with_endpoint(profile)
+                    .map_err(|error| format!("{}: {error}", profile.name))
+            })
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(profiles) => profiles,
+            Err(error) => {
+                self.state
+                    .set_status_message(format!("URL Test group failed · {error}"));
+                cx.notify();
+                return;
+            }
+        };
         let settings = self.state.settings().clone();
         let n = profiles.len();
         let core = Arc::clone(&self.core);
@@ -4090,20 +4182,53 @@ impl MainWindow {
     }
 
     fn add_connection_route(&mut self, action: SimpleAction, cx: &mut Context<Self>) {
-        let Some(rule) = self.connection_rule.clone() else {
-            self.state.set_status_message("No host on this connection");
+        let Some(route) = self.state.active_route().cloned() else {
+            self.state
+                .set_status_message("Select a routing profile first");
             cx.notify();
             return;
         };
-        match self.state.append_simple_rule_to_current(&rule, action) {
-            Ok(()) => {
-                let _ = self.persist_db();
-                if self.state.core_status().is_running() {
-                    self.state
-                        .set_status_message(format!("Added {rule} — restart to apply"));
-                }
-            }
-            Err(e) => self.state.set_status_message(e),
+        if route.is_raw || route.prevent_modifications {
+            self.state
+                .set_status_message("This routing profile is raw or locked");
+            cx.notify();
+            return;
+        }
+        let id = route.id;
+        let owner = cx.entity().downgrade();
+        let apply = Box::new(move |changes: &[(String, bool)], cx: &mut App| {
+            owner
+                .update(cx, |this, cx| {
+                    let current = this
+                        .state
+                        .route_mut(id)
+                        .ok_or("Routing profile was deleted")?;
+                    let previous = current.clone();
+                    super::connection_routes::apply_changes(current, changes, action)?;
+                    if let Err(error) = this.persist_db() {
+                        if let Some(current) = this.state.route_mut(id) {
+                            *current = previous;
+                        }
+                        return Err(error);
+                    }
+                    this.state.set_status_message(format!(
+                        "{} routing target(s) saved — restart to apply",
+                        changes.len()
+                    ));
+                    cx.notify();
+                    Ok(())
+                })
+                .map_err(|e| e.to_string())?
+        });
+        if let Err(error) = super::connection_routes::open(
+            route,
+            self.connection_targets.clone(),
+            action,
+            apply,
+            cx,
+        ) {
+            self.state
+                .set_status_message(format!("Could not open route targets: {error}"));
         }
         cx.notify();
     }
@@ -4484,6 +4609,53 @@ impl MainWindow {
     fn set_sys_dns(&mut self, on: bool, cx: &mut Context<Self>) {
         self.state.set_system_dns(on);
         let _ = self.persist_db();
+        cx.notify();
+    }
+
+    fn open_scanner(&mut self, cx: &mut Context<Self>) {
+        self.close_menus();
+        let path = if self.db_path_label.is_empty() {
+            throne_storage::default_db_path()
+        } else {
+            std::path::PathBuf::from(&self.db_path_label)
+        };
+        let owner = cx.entity().downgrade();
+        let apply = Box::new(move |source, cx: &mut App| {
+            owner
+                .update(cx, |this, cx| {
+                    let id = this
+                        .state
+                        .selected_profile_id()
+                        .ok_or("Select a profile in the main window first")?;
+                    let profile = this.state.profile(id).ok_or("Profile no longer exists")?;
+                    if matches!(
+                        source,
+                        throne_domain::EndpointSource::IpList { .. }
+                            | throne_domain::EndpointSource::Address { .. }
+                    ) {
+                        if let Some(reason) = throne_domain::endpoint_override_blocker(profile) {
+                            return Err(reason.to_string());
+                        }
+                    }
+                    let previous = profile.endpoint.clone();
+                    this.state
+                        .set_profile_endpoint(id, source)
+                        .map_err(|e| e.to_string())?;
+                    if let Err(error) = this.persist_db() {
+                        let _ = this.state.set_profile_endpoint(id, previous);
+                        return Err(error);
+                    }
+                    this.state
+                        .set_status_message("Endpoint setting saved — restart profile to apply");
+                    cx.notify();
+                    Ok(())
+                })
+                .map_err(|e| e.to_string())?
+        });
+        if let Err(error) = super::scanner::open(path, apply, cx) {
+            self.state
+                .set_status_message(format!("Could not open IP Scanner: {error}"));
+        }
         cx.notify();
     }
 
@@ -5263,6 +5435,8 @@ impl MainWindow {
             }
             OpenMenu::Tools => {
                 panel = panel.child(menu_label("Tools"));
+                item!("t-ip-scanner", "IP Lists & Scanner…", |t, _w, cx| t
+                    .open_scanner(cx));
                 item!("t-url", "Url Test Selected", |t, _w, cx| t
                     .url_test_selected(cx));
                 item!("t-url-group", "Url Test Group (⌘⇧G)", |t, _w, cx| {
@@ -5375,18 +5549,17 @@ impl MainWindow {
                 }
             }
             OpenMenu::ConnectionCtx => {
-                let rule = self.connection_rule.clone().unwrap_or_default();
-                if rule.is_empty() {
+                if self.connection_targets.is_empty() {
                     panel = panel.child(menu_label("No host on this connection"));
                 } else {
-                    panel = panel.child(menu_label(rule));
-                    item!("cr-proxy", "Add to Proxy", |t, _w, cx| {
+                    panel = panel.child(menu_label("Modify routing targets"));
+                    item!("cr-proxy", "Proxy…", |t, _w, cx| {
                         t.add_connection_route(SimpleAction::Proxy, cx);
                     });
-                    item!("cr-direct", "Add to Direct", |t, _w, cx| {
+                    item!("cr-direct", "Direct…", |t, _w, cx| {
                         t.add_connection_route(SimpleAction::Bypass, cx);
                     });
-                    item!("cr-block", "Add to Block", |t, _w, cx| {
+                    item!("cr-block", "Block…", |t, _w, cx| {
                         t.add_connection_route(SimpleAction::Block, cx);
                     });
                 }
@@ -5776,7 +5949,12 @@ impl MainWindow {
                             let test = profile.display_test_result();
                             let traffic = profile.display_traffic();
                             let lat_color = latency_color(profile.latency_ms);
-                            let insecure = show_sec && profile.insecure;
+                            let insecure = show_sec
+                                && throne_domain::profile_security(
+                                    profile,
+                                    _this.state.settings().skip_cert,
+                                )
+                                .is_dangerous();
                             let e_select = entity.clone();
                             let e_ctx = entity.clone();
 
@@ -6024,10 +6202,10 @@ impl MainWindow {
                             },
                             {
                                 let entity = cx.entity().clone();
-                                move |dest, domain, x, y, _, cx| {
+                                move |dest, domain, process, x, y, _, cx| {
                                     entity.update(cx, |this, cx| {
-                                        this.connection_rule =
-                                            connection_route_rule(&dest, &domain);
+                                        this.connection_targets =
+                                            connection_route_targets(&dest, &domain, &process);
                                         this.show_menu(OpenMenu::ConnectionCtx, Some((x, y)), cx);
                                     });
                                 }

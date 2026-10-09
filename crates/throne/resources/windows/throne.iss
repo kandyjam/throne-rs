@@ -68,6 +68,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 ; GUI + core must share {app} (upstream parentcheck: basename Throne + ThroneCore beside it)
 Source: "{#SourceDir}\Throne.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\ThroneCore.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\libcronet.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\app-icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]

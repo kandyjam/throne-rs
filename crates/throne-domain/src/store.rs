@@ -295,6 +295,30 @@ impl AppState {
         self.profiles.get(&id)
     }
 
+    pub fn set_profile_endpoint(
+        &mut self,
+        id: ProfileId,
+        endpoint: crate::EndpointSource,
+    ) -> Result<(), StoreError> {
+        self.profiles
+            .get_mut(&id)
+            .ok_or(StoreError::ProfileNotFound(id))?
+            .endpoint = endpoint;
+        Ok(())
+    }
+
+    pub fn set_group_endpoint(
+        &mut self,
+        id: GroupId,
+        endpoint: crate::EndpointSource,
+    ) -> Result<(), StoreError> {
+        self.groups
+            .get_mut(&id)
+            .ok_or(StoreError::GroupNotFound(id))?
+            .endpoint = endpoint;
+        Ok(())
+    }
+
     pub fn set_active_group(&mut self, id: GroupId) -> Result<(), StoreError> {
         if !self.groups.contains_key(&id) {
             return Err(StoreError::GroupNotFound(id));
@@ -1442,6 +1466,11 @@ impl AppState {
     pub fn set_profile_latency(&mut self, id: ProfileId, latency_ms: i32) {
         if let Some(p) = self.profiles.get_mut(&id) {
             p.latency_ms = latency_ms;
+            p.latency_at = if latency_ms == 0 {
+                0
+            } else {
+                chrono::Utc::now().timestamp()
+            };
         }
     }
 
@@ -1458,6 +1487,7 @@ impl AppState {
             p.upload_speed = ul.to_string();
             if latency_ms > 0 {
                 p.latency_ms = latency_ms;
+                p.latency_at = chrono::Utc::now().timestamp();
             }
         }
     }
@@ -1489,6 +1519,11 @@ impl AppState {
             };
             if let Some(p) = self.profiles.get_mut(id) {
                 p.latency_ms = v;
+                p.latency_at = if v == 0 {
+                    0
+                } else {
+                    chrono::Utc::now().timestamp()
+                };
                 n += 1;
             }
         }
@@ -1582,6 +1617,9 @@ impl AppState {
 
     /// Delete profiles flagged insecure when security display is meaningful.
     pub fn remove_insecure_in_group(&mut self, group_id: GroupId) -> usize {
+        if !self.settings.show_config_security {
+            return 0;
+        }
         let Some(g) = self.groups.get(&group_id) else {
             return 0;
         };
@@ -1589,7 +1627,11 @@ impl AppState {
             .profile_ids
             .iter()
             .copied()
-            .filter(|id| self.profiles.get(id).map(|p| p.insecure).unwrap_or(false))
+            .filter(|id| {
+                self.profiles.get(id).is_some_and(|profile| {
+                    crate::profile_security(profile, self.settings.skip_cert).is_insecure()
+                })
+            })
             .collect();
         let n = drop.len();
         if n > 0 {
@@ -2326,6 +2368,104 @@ mod tests {
         assert!(state.profile(invalid_id).is_none());
         assert!(state.profile(valid_id).is_some());
         assert!(state.profile(custom_id).is_some());
+    }
+
+    #[test]
+    fn insecure_cleanup_uses_live_security_and_preserves_private_pinned_global_only_profiles() {
+        use serde_json::json;
+
+        let mut state = AppState::empty();
+        let group = state.add_group("security");
+        let other_group = state.add_group("other");
+        let cases = [
+            (
+                "raw",
+                ProfileType::Socks,
+                json!({"type":"socks","server":"example.com"}),
+                false,
+            ),
+            (
+                "private",
+                ProfileType::Socks,
+                json!({"type":"socks","server":"192.168.1.1"}),
+                true,
+            ),
+            (
+                "pinned",
+                ProfileType::Vless,
+                json!({"type":"vless","server":"example.com","tls":{"enabled":true,"insecure":true,"certificate_public_key_sha256":["pin"]}}),
+                true,
+            ),
+            (
+                "global-only",
+                ProfileType::Vless,
+                json!({"type":"vless","server":"example.com","tls":{"enabled":true}}),
+                true,
+            ),
+            (
+                "explicit-insecure",
+                ProfileType::Vless,
+                json!({"type":"vless","server":"example.com","tls":{"enabled":true,"insecure":true}}),
+                false,
+            ),
+        ];
+        let mut ids = Vec::new();
+        for (name, kind, raw, stale_flag) in cases {
+            let id = state.add_profile(group, name, kind);
+            let profile = state.profiles.get_mut(&id).unwrap();
+            profile.outbound_json = raw.to_string();
+            profile.insecure = stale_flag;
+            ids.push(id);
+        }
+        let other = state.add_profile(other_group, "other raw", ProfileType::Socks);
+        state.profiles.get_mut(&other).unwrap().outbound_json =
+            json!({"type":"socks","server":"example.com"}).to_string();
+        state.settings.skip_cert = true;
+        state.settings.show_config_security = false;
+        assert_eq!(state.remove_insecure_in_group(group), 0);
+        assert_eq!(state.group(group).unwrap().profile_ids, ids);
+        state.settings.show_config_security = true;
+        assert_eq!(state.remove_insecure_in_group(group), 2);
+        assert!(state.profile(ids[0]).is_none());
+        assert!(state.profile(ids[4]).is_none());
+        for id in &ids[1..4] {
+            assert!(state.profile(*id).is_some());
+        }
+        assert!(state.profile(other).is_some());
+    }
+
+    #[test]
+    fn insecure_cleanup_preserves_custom_masque_pins_and_mandatory_ca_tls() {
+        use serde_json::json;
+
+        for skip_cert in [false, true] {
+            let mut state = AppState::empty();
+            let group = state.add_group("MASQUE");
+            state.settings.skip_cert = skip_cert;
+            let records = [
+                json!({"type":"masque","server":"example.com","peer_public_key":"pin","tls":{"insecure":true}}),
+                json!({"type":"custom","subtype":"outbound","config":json!({"type":"masque","server":"example.com","peer_public_key":"pin","tls":{"insecure":true}}).to_string()}),
+                json!({"type":"masque","server":"example.com","tls":{"enabled":false}}),
+                json!({"type":"masque","server":"10.0.0.1","tls":{"insecure":true}}),
+                json!({"type":"masque","server":"example.com","peer_public_key":"","tls":{"insecure":true}}),
+            ];
+            let mut ids = Vec::new();
+            for (index, raw) in records.into_iter().enumerate() {
+                let id = state.add_profile(group, format!("MASQUE {index}"), ProfileType::Custom);
+                let profile = state.profiles.get_mut(&id).unwrap();
+                profile.outbound_json = raw.to_string();
+                profile.insecure = index != 4;
+                ids.push(id);
+            }
+            assert_eq!(state.remove_insecure_in_group(group), 1);
+            for id in &ids[..4] {
+                assert!(
+                    state.profile(*id).is_some(),
+                    "verified or private MASQUE must survive cleanup"
+                );
+            }
+            assert!(state.profile(ids[4]).is_none());
+        }
     }
 
     #[test]

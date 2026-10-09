@@ -3,7 +3,7 @@
 # Builds Throne.exe + ThroneCore.exe and produces an Inno Setup installer.
 #
 # Prerequisites:
-#   - Rust + Go
+#   - Rust + Go 1.26+ + protoc (protobuf)
 #   - Inno Setup 6 (ISCC.exe on PATH or default install dir)
 #
 # Usage (from repo root, PowerShell):
@@ -68,22 +68,83 @@ function Find-ExistingCore([string]$PreferDir) {
 }
 
 function Ensure-Core([string]$CoreOut) {
+    $CoreOut = [System.IO.Path]::GetFullPath($CoreOut)
     $dir = Split-Path -Parent $CoreOut
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     $go = Find-Go
     if ($go) {
         Write-Step "Building Go ThroneCore with $go"
-        Push-Location (Join-Path $Root "core\server")
-        & $go build -trimpath -ldflags="-s -w" -o $CoreOut .
-        $code = $LASTEXITCODE
-        Pop-Location
-        if ($code -ne 0) { throw "go build failed" }
+        if (-not (Get-Command protoc -ErrorAction SilentlyContinue)) {
+            throw "protoc not found; install Protocol Buffers before building ThroneCore"
+        }
+        $savedPath = $env:PATH
+        $savedGoOS = $env:GOOS
+        $savedGoArch = $env:GOARCH
+        $savedCgo = $env:CGO_ENABLED
+        Push-Location (Join-Path $Root "core")
+        try {
+            $pluginDir = ([string](& $go env GOBIN)).Trim()
+            if ($LASTEXITCODE -ne 0) { throw "go env GOBIN failed" }
+            if (-not $pluginDir) {
+                $goPath = (& $go env GOPATH).Trim()
+                if ($LASTEXITCODE -ne 0) { throw "go env GOPATH failed" }
+                $pluginDir = Join-Path ($goPath.Split(';')[0]) "bin"
+            }
+            $env:PATH = "$pluginDir;$savedPath"
+            # Install generator executables for the host before setting the core target.
+            $env:GOOS = $null
+            $env:GOARCH = $null
+            if (-not (Get-Command protoc-gen-go -ErrorAction SilentlyContinue)) {
+                & $go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+                if ($LASTEXITCODE -ne 0) { throw "install protoc-gen-go failed" }
+            }
+            if (-not (Get-Command protoc-gen-go-grpc -ErrorAction SilentlyContinue)) {
+                & $go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
+                if ($LASTEXITCODE -ne 0) { throw "install protoc-gen-go-grpc failed" }
+            }
+            & protoc -I gen --go_out=gen --go-grpc_out=gen `
+                --go_opt=paths=source_relative --go-grpc_opt=paths=source_relative gen/libcore.proto
+            if ($LASTEXITCODE -ne 0) { throw "generate core protobuf failed" }
+
+            # Match upstream 1.4.0-beta.1 modern Windows builds.
+            $env:GOOS = "windows"
+            $env:GOARCH = if ($Architecture -eq "aarch64") { "arm64" } else { "amd64" }
+            $env:CGO_ENABLED = "0"
+            $tags = if ($env:THRONE_CORE_TAGS) { $env:THRONE_CORE_TAGS } else {
+                "with_clash_api,with_quic,with_wireguard,with_utls,with_dhcp,with_tailscale,with_openvpn,with_openconnect,badlinkname,tfogo_checklinkname0,with_purego,with_naive_outbound"
+            }
+            if (($tags -split ',') -contains "with_naive_outbound") {
+                $cronetModule = "github.com/sagernet/cronet-go/lib/windows_$($env:GOARCH)"
+                & $go mod download $cronetModule
+                if ($LASTEXITCODE -ne 0) { throw "download Cronet library failed" }
+                $cronetDir = (& $go list -m -f '{{.Dir}}' $cronetModule).Trim()
+                if ($LASTEXITCODE -ne 0) { throw "locate Cronet library failed" }
+                Copy-Item -Force (Join-Path $cronetDir "libcronet.dll") (Join-Path $dir "libcronet.dll")
+            }
+            $singboxVersion = (& $go list -m -f '{{.Version}}' github.com/sagernet/sing-box).Trim()
+            if ($LASTEXITCODE -ne 0) { throw "read sing-box version failed" }
+            $ldflags = "-s -w -X 'github.com/sagernet/sing-box/constant.Version=$singboxVersion' -X 'internal/godebug.defaultGODEBUG=multipathtcp=0' -checklinkname=0"
+            & $go build -trimpath -tags $tags -ldflags $ldflags -o $CoreOut .
+            if ($LASTEXITCODE -ne 0) { throw "go build failed" }
+        } finally {
+            Pop-Location
+            $env:PATH = $savedPath
+            $env:GOOS = $savedGoOS
+            $env:GOARCH = $savedGoArch
+            $env:CGO_ENABLED = $savedCgo
+        }
         return
     }
     $existing = Find-ExistingCore (Split-Path -Parent $CoreOut)
     if ($existing) {
         Write-Step "go not on PATH — copying prebuilt ThroneCore from $existing"
-        Copy-Item -Force $existing $CoreOut
+        if ([System.IO.Path]::GetFullPath($existing) -ne $CoreOut) {
+            Copy-Item -Force $existing $CoreOut
+            $existingCronet = Join-Path (Split-Path -Parent $existing) "libcronet.dll"
+            if (Test-Path $existingCronet) {
+                Copy-Item -Force $existingCronet (Join-Path $dir "libcronet.dll")
+            }
+        }
         return
     }
     throw @"
@@ -157,7 +218,10 @@ $ZipName = "throne-windows-$Architecture.zip"
 $ZipPath = Join-Path $Dist $ZipName
 if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
 Write-Step "Portable zip → $ZipPath"
-Compress-Archive -Path $guiOut, $coreOut -DestinationPath $ZipPath -Force
+$portableFiles = @($guiOut, $coreOut)
+$cronetDll = Join-Path $ReleaseDir "libcronet.dll"
+if (Test-Path $cronetDll) { $portableFiles += $cronetDll }
+Compress-Archive -Path $portableFiles -DestinationPath $ZipPath -Force
 
 Write-Step "Windows bundle complete"
 Get-ChildItem $Dist -Filter "ThroneRs*" | Format-Table Name, Length

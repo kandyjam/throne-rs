@@ -11,6 +11,7 @@ mod config_build;
 mod privilege;
 mod proto_wire;
 mod rule_set_list;
+mod scan;
 mod sys_proxy;
 
 pub use config_build::{
@@ -27,6 +28,11 @@ pub use proto_wire::{
     SpeedTestResult, UrlTestResult,
 };
 pub use rule_set_list::{lookup_rule_set_url, RULE_SET_LIST};
+pub use scan::{
+    ParseRuleSetResponse, QueryScanResponse, ScanCheckNetworkResponse, ScanEntry, ScanEvent,
+    ScanHttpOptions, ScanIcmpOptions, ScanProbeRequest, ScanProbeResponse, ScanProbeResult,
+    ScanTargetSpec, ScanTcpOptions, ScanUrlTestRequest,
+};
 pub use sys_proxy::{
     force_clear_system_proxy, proxy_client_host, set_system_proxy, set_tun_system_dns,
     tun_dns_address,
@@ -430,6 +436,27 @@ impl CoreSession {
         self.start_profile_ex(profile, settings, route_profile, None, apply_system_proxy)
     }
 
+    /// Ask the bundled core to validate sing-box JSON without starting it.
+    /// This never applies a system proxy, creates a TUN, or changes system DNS.
+    pub fn check_config_json(&mut self, config: &str) -> Result<(), CoreError> {
+        self.ensure_connected()?;
+        let payload = proto_wire::encode_load_config_req_ex(
+            config,
+            false,
+            false,
+            "",
+            "",
+            &proto_wire::LoadConfigExtras::default(),
+        );
+        let response = self.call("CheckConfig", &payload, Duration::from_secs(30))?;
+        let error = proto_wire::decode_error_resp(&response)?;
+        if error.is_empty() {
+            Ok(())
+        } else {
+            Err(CoreError::Config(format_core_error(&error)))
+        }
+    }
+
     /// Start a profile, optionally expanding an Auto Selector into members.
     pub fn start_profile_ex(
         &mut self,
@@ -485,7 +512,9 @@ impl CoreSession {
             Err(e) => {
                 // Don't leave system proxy / Tun DNS pointing at a dead stack.
                 force_clear_system_proxy();
-                let _ = set_tun_system_dns(false, "");
+                if settings.tun_mode_enabled {
+                    let _ = set_tun_system_dns(false, "");
+                }
                 return Err(e);
             }
         };
@@ -511,12 +540,16 @@ impl CoreSession {
                 let err2 = proto_wire::decode_error_resp(&resp2)?;
                 if !err2.is_empty() {
                     force_clear_system_proxy();
-                    let _ = set_tun_system_dns(false, "");
+                    if settings.tun_mode_enabled {
+                        let _ = set_tun_system_dns(false, "");
+                    }
                     return Err(CoreError::Rpc(format_core_error(&err2)));
                 }
             } else {
                 force_clear_system_proxy();
-                let _ = set_tun_system_dns(false, "");
+                if settings.tun_mode_enabled {
+                    let _ = set_tun_system_dns(false, "");
+                }
                 return Err(CoreError::Rpc(format_core_error(&err)));
             }
         }
@@ -534,18 +567,8 @@ impl CoreSession {
             }
         }
 
-        // Client-side Tun DNS (macOS): point Wi-Fi/Ethernet at tunIP+1 so apps
-        // hit hijack-dns even when an older ThroneCore skipped SetSystemDNS.
-        if settings.tun_mode_enabled && !built.tun_ipv4_cidr.is_empty() {
-            if let Err(e) = set_tun_system_dns(true, &built.tun_ipv4_cidr) {
-                warn!(%e, "Tun system DNS enable failed — DNS may leak/pollute");
-            } else {
-                info!(
-                    dns = %tun_dns_address(&built.tun_ipv4_cidr).unwrap_or_default(),
-                    "Tun system DNS applied on primary NICs"
-                );
-            }
-        }
+        // The bundled core owns TUN DNS setup and teardown. Applying it here
+        // as well races the native lifecycle and can overwrite restored state.
 
         info!(
             profile = profile.id,
@@ -681,8 +704,7 @@ impl CoreSession {
     /// 3. **Keep ThroneCore alive** for the next Start (cold spawn is the main lag).
     ///    Only force-kill when Stop RPC fails (wedged core).
     pub fn stop_profile(&mut self, settings: &AppSettings) -> Result<(), CoreError> {
-        // 1) Always drop system proxy + Tun DNS first — browsers unblock even if
-        //    core Stop wedges. Keep networksetup on primary NICs only.
+        // 1) Drop system proxy first. The core Stop lifecycle owns TUN DNS.
         let host = if settings.inbound_address.trim().is_empty() {
             "127.0.0.1"
         } else {
@@ -692,12 +714,6 @@ impl CoreSession {
             warn!(%e, "system proxy clear on stop failed — force clear primary services");
             force_clear_system_proxy();
         }
-        // Always try to clear Tun DNS (idempotent Empty). Leaving 172.19.0.2
-        // after Stop = total DNS blackhole.
-        if let Err(e) = set_tun_system_dns(false, "") {
-            warn!(%e, "Tun system DNS clear on stop failed");
-        }
-
         // 2) Stop RPC — sing-box CloseWithTimeout is ~2s server-side.
         //    Prefer keep-alive: Qt Throne also reuses the core process.
         let mut kill = false;
@@ -727,6 +743,13 @@ impl CoreSession {
 
         if kill {
             self.force_kill_core();
+            // A wedged core cannot run its DNS teardown. Retain explicit
+            // recovery only on the failure path and only for a TUN session.
+            if settings.tun_mode_enabled {
+                if let Err(e) = set_tun_system_dns(false, "") {
+                    warn!(%e, "Tun DNS recovery after forced stop failed");
+                }
+            }
         }
         Ok(())
     }

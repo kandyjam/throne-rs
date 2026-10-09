@@ -262,7 +262,7 @@ pub fn connections_panel(
     speeds: &ConnectionSpeedTracker,
     show_source: bool,
     on_close: impl Fn(String, &mut Window, &mut App) + Clone + 'static,
-    on_context: impl Fn(String, String, f32, f32, &mut Window, &mut App) + Clone + 'static,
+    on_context: impl Fn(String, String, String, f32, f32, &mut Window, &mut App) + Clone + 'static,
 ) -> impl IntoElement {
     if !running {
         return div()
@@ -290,6 +290,7 @@ pub fn connections_panel(
         let close = on_close.clone();
         let dest = c.dest.clone();
         let domain = c.domain.clone();
+        let process = c.process.clone();
         let context = on_context.clone();
         list = list.child(connection_row(
             c,
@@ -301,7 +302,7 @@ pub fn connections_panel(
                 close(id.clone(), w, cx);
             },
             move |x, y, w, cx| {
-                context(dest.clone(), domain.clone(), x, y, w, cx);
+                context(dest.clone(), domain.clone(), process.clone(), x, y, w, cx);
             },
         ));
     }
