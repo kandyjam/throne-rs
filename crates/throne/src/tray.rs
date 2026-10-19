@@ -34,6 +34,7 @@ use crate::theme::ColorScheme;
 // ── Menu item ids (stable strings for MenuEvent routing) ─────────────────
 
 pub const SHOW_WINDOW_ID: &str = "throne.show";
+pub const TOGGLE_CONNECTION_ID: &str = "throne.toggle_connection";
 pub const START_WITH_SYSTEM_ID: &str = "throne.start_with_system";
 pub const REMEMBER_LAST_ID: &str = "throne.remember_last";
 pub const ALLOW_LAN_ID: &str = "throne.allow_lan";
@@ -55,6 +56,8 @@ const TRAY_ICON_SIZE: u32 = 64;
 
 struct TrayHandles {
     tray: TrayIcon,
+    connection: MenuItem,
+    connection_state: std::cell::Cell<ConnectionState>,
     start_with_system: CheckMenuItem,
     remember_last: CheckMenuItem,
     allow_lan: CheckMenuItem,
@@ -74,6 +77,7 @@ static APPLIED_SCHEME: AtomicU8 = AtomicU8::new(0);
 /// Snapshot used to paint checkmarks (upstream reads SettingsRepo on show).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TrayMenuState {
+    pub connection: ConnectionState,
     pub start_with_system: bool,
     pub remember_last: bool,
     pub allow_lan: bool,
@@ -81,9 +85,33 @@ pub struct TrayMenuState {
     pub tun: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ConnectionState {
+    #[default]
+    Stopped,
+    Starting,
+    Running,
+    Stopping,
+}
+
+impl ConnectionState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Stopped => "Connect",
+            Self::Starting => "Connecting…",
+            Self::Running => "Disconnect",
+            Self::Stopping => "Disconnecting…",
+        }
+    }
+    fn enabled(self) -> bool {
+        matches!(self, Self::Stopped | Self::Running)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayCommand {
     ShowWindow,
+    ToggleConnection,
     ToggleStartWithSystem,
     ToggleRememberLast,
     ToggleAllowLan,
@@ -100,6 +128,7 @@ pub enum TrayCommand {
 pub fn command_from_menu_id(id: &str) -> Option<TrayCommand> {
     match id {
         SHOW_WINDOW_ID => Some(TrayCommand::ShowWindow),
+        TOGGLE_CONNECTION_ID => Some(TrayCommand::ToggleConnection),
         START_WITH_SYSTEM_ID => Some(TrayCommand::ToggleStartWithSystem),
         REMEMBER_LAST_ID => Some(TrayCommand::ToggleRememberLast),
         ALLOW_LAN_ID => Some(TrayCommand::ToggleAllowLan),
@@ -118,6 +147,12 @@ pub fn command_from_menu_id(id: &str) -> Option<TrayCommand> {
 /// Build the upstream-aligned tray menu and install the status item.
 pub fn install(initial: TrayMenuState) -> Result<(), String> {
     let show_window = MenuItem::with_id(SHOW_WINDOW_ID, "Show Window", true, None);
+    let connection = MenuItem::with_id(
+        TOGGLE_CONNECTION_ID,
+        initial.connection.label(),
+        initial.connection.enabled(),
+        None,
+    );
 
     let start_with_system = CheckMenuItem::with_id(
         START_WITH_SYSTEM_ID,
@@ -176,6 +211,7 @@ pub fn install(initial: TrayMenuState) -> Result<(), String> {
     let menu = Menu::new();
     menu.append_items(&[
         &show_window,
+        &connection,
         &sep1,
         &start_with_system,
         &remember_last,
@@ -222,6 +258,8 @@ pub fn install(initial: TrayMenuState) -> Result<(), String> {
     TRAY.with(|cell| {
         *cell.borrow_mut() = Some(TrayHandles {
             tray,
+            connection,
+            connection_state: std::cell::Cell::new(initial.connection),
             start_with_system,
             remember_last,
             allow_lan,
@@ -242,6 +280,15 @@ pub fn sync_menu_state(state: TrayMenuState) {
             return;
         };
         h.start_with_system.set_checked(state.start_with_system);
+        if h.connection_state.replace(state.connection) != state.connection {
+            h.connection.set_text(state.connection.label());
+            h.connection.set_enabled(state.connection.enabled());
+            let _ = h
+                .tray
+                .set_tooltip(Some(format!("ThroneRs — {}", state.connection.label())));
+            // Invalidate the themed icon cache when connection state changes.
+            APPLIED_SCHEME.store(0, Ordering::Relaxed);
+        }
         h.remember_last.set_checked(state.remember_last);
         h.allow_lan.set_checked(state.allow_lan);
         h.sp_system_proxy.set_checked(state.system_proxy);
@@ -257,7 +304,26 @@ pub fn apply_scheme(scheme: ColorScheme) {
     if APPLIED_SCHEME.load(Ordering::Relaxed) == scheme_tag(scheme) {
         return;
     }
-    let (rgba, template) = icon_bytes_for_scheme(scheme);
+    let (mut rgba, template) = icon_bytes_for_scheme(scheme);
+    let state = TRAY.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|h| h.connection_state.get())
+            .unwrap_or_default()
+    });
+    if state == ConnectionState::Starting {
+        // A template-safe dotted ring remains distinguishable on light and dark menu bars.
+        for y in 0..TRAY_ICON_SIZE {
+            for x in 0..TRAY_ICON_SIZE {
+                let dx = x as i32 - 32;
+                let dy = y as i32 - 32;
+                let radius = dx * dx + dy * dy;
+                if (27 * 27..=30 * 30).contains(&radius) && (x / 7 + y / 7) % 2 == 0 {
+                    rgba[((y * TRAY_ICON_SIZE + x) * 4 + 3) as usize] = 255;
+                }
+            }
+        }
+    }
     let icon = match Icon::from_rgba(rgba, TRAY_ICON_SIZE, TRAY_ICON_SIZE) {
         Ok(icon) => icon,
         Err(error) => {
@@ -398,6 +464,23 @@ fn icon_bytes_for_scheme(scheme: ColorScheme) -> (Vec<u8>, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tray_connection_command_and_transitions_do_not_allow_duplicate_operations() {
+        assert_eq!(
+            command_from_menu_id(TOGGLE_CONNECTION_ID),
+            Some(TrayCommand::ToggleConnection)
+        );
+        for (state, label, enabled) in [
+            (ConnectionState::Stopped, "Connect", true),
+            (ConnectionState::Starting, "Connecting…", false),
+            (ConnectionState::Running, "Disconnect", true),
+            (ConnectionState::Stopping, "Disconnecting…", false),
+        ] {
+            assert_eq!(state.label(), label);
+            assert_eq!(state.enabled(), enabled);
+        }
+    }
 
     #[test]
     fn menu_ids_map_to_upstream_tray_actions() {

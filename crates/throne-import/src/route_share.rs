@@ -256,6 +256,32 @@ fn rules_from_array(arr: &[Value], warnings: &mut Vec<String>) -> Vec<RouteRule>
                 .to_string(),
             ..Default::default()
         };
+        rule.tls_fragment = obj
+            .get("tls_fragment")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        rule.tls_record_fragment = obj
+            .get("tls_record_fragment")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        rule.tls_fragment_fallback_delay = obj
+            .get("tls_fragment_fallback_delay")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .into();
+        rule.override_address = obj
+            .get("override_address")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .into();
+        rule.override_port = obj
+            .get("override_port")
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| v.to_string())
+            })
+            .unwrap_or_default();
         rule.domain = string_list(obj.get("domain"));
         rule.domain_suffix = string_list(obj.get("domain_suffix"));
         rule.domain_keyword = string_list(obj.get("domain_keyword"));
@@ -337,6 +363,11 @@ pub fn to_share_object(profile: &RouteProfile) -> Value {
                 "invert": r.invert,
                 "action": r.action,
                 "reject_method": r.reject_method,
+                "override_address": r.override_address,
+                "override_port": r.override_port,
+                "tls_fragment": r.tls_fragment,
+                "tls_fragment_fallback_delay": r.tls_fragment_fallback_delay,
+                "tls_record_fragment": r.tls_record_fragment,
             })
         })
         .collect();

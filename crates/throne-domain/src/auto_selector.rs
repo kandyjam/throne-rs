@@ -1,7 +1,7 @@
 //! Auto Selector profile support (upstream Throne 1.2.3+ / 1.2.4).
 //!
-//! An Auto Selector tracks a whole group instead of one server. Membership is
-//! resolved at build/start time from `gid` + filters; ranking prefers measured
+//! An Auto Selector tracks ordered groups instead of one server. Membership is
+//! resolved at build/start time from `gids` (legacy `gid`) + filters; ranking prefers measured
 //! latency. The core then switches among the built pool (or we sticky-pick the
 //! best member when the running ThroneCore lacks `auto-selector` outbound).
 //!
@@ -59,6 +59,8 @@ pub struct AutoSelectorPlan {
     /// Prefix of `pool` that enters the config (build_limit).
     pub build: Vec<ProfileId>,
     pub members_in_group: usize,
+    #[serde(default)]
+    pub missing_groups: usize,
     pub eligible: usize,
     pub ranked_by_test: usize,
     pub skipped: Vec<(AutoSelectorSkip, usize)>,
@@ -99,6 +101,9 @@ pub struct AutoSelectorConfig {
     pub name: String,
     #[serde(default = "default_gid")]
     pub gid: GroupId,
+    /// Ordered tracked groups; `gid` remains the first group for older readers.
+    #[serde(default)]
+    pub gids: Vec<GroupId>,
     #[serde(default)]
     pub name_filter: String,
     #[serde(default)]
@@ -209,6 +214,7 @@ impl Default for AutoSelectorConfig {
         Self {
             name: String::new(),
             gid: -1,
+            gids: Vec::new(),
             name_filter: String::new(),
             country_filter: String::new(),
             exclude_unavailable: true,
@@ -248,11 +254,18 @@ impl AutoSelectorConfig {
         Self {
             name: name.into(),
             gid,
+            gids: vec![gid],
             ..Self::default()
         }
     }
 
     pub fn normalize(&mut self) {
+        if self.gids.is_empty() && self.gid >= 0 {
+            self.gids.push(self.gid);
+        }
+        let mut seen = std::collections::HashSet::new();
+        self.gids.retain(|gid| *gid >= 0 && seen.insert(*gid));
+        self.gid = self.gids.first().copied().unwrap_or(-1);
         if self.pool_cap < 1 {
             self.pool_cap = 1;
         }
@@ -331,6 +344,7 @@ impl AutoSelectorConfig {
             "type": "autoselector",
             "name": cfg.name,
             "gid": cfg.gid,
+            "gids": cfg.gids,
             "name_filter": cfg.name_filter,
             "country_filter": cfg.country_filter,
             "exclude_unavailable": cfg.exclude_unavailable,
@@ -371,13 +385,18 @@ impl AutoSelectorConfig {
         let v: Value = serde_json::from_str(s).ok()?;
         let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
         if !matches!(ty, "autoselector" | "auto_selector" | "auto-selector" | "") {
-            if v.get("gid").is_none() {
+            if v.get("gid").is_none() && v.get("gids").is_none() {
                 return None;
             }
-        } else if ty.is_empty() && v.get("gid").is_none() {
+        } else if ty.is_empty() && v.get("gid").is_none() && v.get("gids").is_none() {
             return None;
         }
+        let has_gids = v.get("gids").is_some();
         let mut cfg: Self = serde_json::from_value(v).ok()?;
+        if has_gids {
+            // An explicit empty list overrides a stale legacy gid.
+            cfg.gid = cfg.gids.first().copied().unwrap_or(-1);
+        }
         cfg.normalize();
         Some(cfg)
     }
@@ -394,7 +413,7 @@ pub fn profile_auto_selector(profile: &Profile) -> Option<AutoSelectorConfig> {
     }
     AutoSelectorConfig::from_outbound_json(&profile.outbound_json).and_then(|cfg| {
         // Only accept non-typed JSON when it clearly looks like a selector.
-        if cfg.gid >= 0 {
+        if !cfg.gids.is_empty() {
             Some(cfg)
         } else {
             None
@@ -641,16 +660,43 @@ pub fn plan_auto_selector(
     group: Option<&Group>,
     lookup: impl Fn(ProfileId) -> Option<Profile>,
 ) -> AutoSelectorPlan {
+    let groups: Vec<_> = group.into_iter().collect();
+    plan_auto_selector_groups(selector_profile, selector, &groups, lookup)
+}
+
+/// Plan one pooled selector across groups, preserving order and deduplicating members.
+pub fn plan_auto_selector_groups(
+    selector_profile: &Profile,
+    selector: &AutoSelectorConfig,
+    groups: &[&Group],
+    lookup: impl Fn(ProfileId) -> Option<Profile>,
+) -> AutoSelectorPlan {
+    let mut normalized = selector.clone();
+    normalized.normalize();
+    let selector = &normalized;
+    let groups: Vec<_> = selector
+        .gids
+        .iter()
+        .filter_map(|id| groups.iter().copied().find(|g| g.id == *id))
+        .collect();
     let mut plan = AutoSelectorPlan {
+        missing_groups: selector.gids.len().saturating_sub(groups.len()),
         pool_cap_used: selector.pool_cap,
         build_limit_used: selector.build_limit,
         ..Default::default()
     };
 
-    let Some(group) = group else {
-        plan.error = Some("Auto selector points at a group that no longer exists".into());
+    if groups.is_empty() {
+        plan.error = Some(
+            if selector.gids.is_empty() {
+                "Auto selector tracks no group"
+            } else {
+                "Auto selector points at a group that no longer exists"
+            }
+            .into(),
+        );
         return plan;
-    };
+    }
 
     let mut skip_counts: Vec<(AutoSelectorSkip, usize)> = Vec::new();
     let mut bump = |skip: AutoSelectorSkip| {
@@ -663,25 +709,28 @@ pub fn plan_auto_selector(
 
     let mut members: Vec<ProfileId> = Vec::new();
     let mut unavailable: Vec<ProfileId> = Vec::new();
-    for &id in &group.profile_ids {
-        if id == selector_profile.id {
-            continue;
-        }
-        plan.members_in_group += 1;
-        let member = lookup(id);
-        if let Some(skip) = member_skip(member.as_ref(), selector, Some(group)) {
-            if skip == AutoSelectorSkip::Unavailable {
-                unavailable.push(id);
+    let mut seen = std::collections::HashSet::new();
+    for group in groups {
+        for &id in &group.profile_ids {
+            if id == selector_profile.id || !seen.insert(id) {
+                continue;
             }
-            bump(skip);
-            continue;
-        }
-        if let Some(m) = member.as_ref() {
-            if effective_latency(m, selector) > 0 {
-                plan.ranked_by_test += 1;
+            plan.members_in_group += 1;
+            let member = lookup(id);
+            if let Some(skip) = member_skip(member.as_ref(), selector, Some(group)) {
+                if skip == AutoSelectorSkip::Unavailable {
+                    unavailable.push(id);
+                }
+                bump(skip);
+                continue;
             }
+            if let Some(m) = member.as_ref() {
+                if effective_latency(m, selector) > 0 {
+                    plan.ranked_by_test += 1;
+                }
+            }
+            members.push(id);
         }
-        members.push(id);
     }
     // Network outage: every remaining member failed its last test. Keep them
     // rather than emitting an empty pool that can never recover.
@@ -760,13 +809,24 @@ pub fn rerank_auto_selector_pool(
     group: Option<&Group>,
     lookup: impl Fn(ProfileId) -> Option<Profile>,
 ) -> Vec<ProfileId> {
+    let groups: Vec<_> = group.into_iter().collect();
+    rerank_auto_selector_groups(selector, selector_profile_id, &groups, lookup)
+}
+
+/// Re-rank members from every tracked group together.
+pub fn rerank_auto_selector_groups(
+    selector: &mut AutoSelectorConfig,
+    selector_profile_id: ProfileId,
+    groups: &[&Group],
+    lookup: impl Fn(ProfileId) -> Option<Profile>,
+) -> Vec<ProfileId> {
     let dummy = Profile::new(
         selector_profile_id,
         selector.gid,
         selector.name.clone(),
         ProfileType::AutoSelector,
     );
-    let plan = plan_auto_selector(&dummy, selector, group, &lookup);
+    let plan = plan_auto_selector_groups(&dummy, selector, groups, &lookup);
     if plan.error.is_some() {
         return Vec::new();
     }

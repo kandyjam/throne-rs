@@ -337,7 +337,16 @@ pub fn materialize_profile_endpoint(
             }
         }
     }
-    value["server"] = address.into();
+    if profile.profile_type == crate::ProfileType::Wireguard && value["peers"].is_array() {
+        if let Some(peer) = value["peers"]
+            .as_array_mut()
+            .and_then(|peers| peers.first_mut())
+        {
+            peer["address"] = address.into();
+        }
+    } else {
+        value["server"] = address.into();
+    }
     clone.outbound.server = Some(address.to_owned());
     clone.outbound_json = value.to_string();
     clone.outbound.raw_json = Some(clone.outbound_json.clone());

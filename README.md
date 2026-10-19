@@ -2,10 +2,10 @@
 
 **Rust + [GPUI](https://github.com/zed-industries/zed) rewrite** of [Throne](https://github.com/throneproj/Throne) (formerly Nekoray) — a cross-platform desktop GUI proxy client powered by Sing-box / Xray.
 
-**Version:** `1.4.0-beta.1` (aligned with upstream release tag / `NKR_VERSION` — see root [`VERSION`](./VERSION))
+**Version:** `1.4.0-beta.3` (aligned with upstream release tag / `NKR_VERSION` — see root [`VERSION`](./VERSION))
 
-> Status: **Wave 1.4.0-beta.1** — core and scanner RPCs synced; native IP lists and bounded TCP scanning; endpoint persistence; connection routing and security advisories updated. Full scanner workflows, Kill Switch GUI, and global hotkey parity remain tracked gaps.
-> Upstream remote: `upstream` → [throneproj/Throne](https://github.com/throneproj/Throne) (`dev` is ahead; pin is tag `1.4.0-beta.1`).
+> Status: **Wave 1.4.0-beta.3** — multi-group Auto Selector, retained group sorting, route TLS fragmentation, TLS cipher imports, connection names and the rebuilt Go core are aligned. Headless/service support, country-provider settings, full validation/export, remote control API, scanner workflows, Kill Switch GUI and global hotkeys remain tracked gaps.
+> Upstream remote: `upstream` → [throneproj/Throne](https://github.com/throneproj/Throne) (`dev` is ahead; pin is tag `1.4.0-beta.3`).
 > Parity matrix: [docs/UPSTREAM_TRACKING.md](./docs/UPSTREAM_TRACKING.md) · Skill: [skills/throne-upstream-parity/SKILL.md](./skills/throne-upstream-parity/SKILL.md).
 
 ## Architecture
@@ -17,7 +17,7 @@
 | Import | `crates/throne-import` | Share links + `throne://` deeplinks (GroupUpdater-aligned) |
 | Storage | `crates/throne-storage` | SQLite schema compatible with upstream repos |
 | Core client | `crates/throne-core-client` | Async API toward the Go `ThroneCore` process |
-| Data plane | `core/` | Existing Go core (sing-box / xray, TUN, DNS, tests), synced to upstream 1.4.0-beta.1 |
+| Data plane | `core/` | Existing Go core (sing-box / xray, TUN, DNS, tests), synced to upstream 1.4.0-beta.3 |
 
 ```
 ┌──────────────────────────┐
@@ -50,7 +50,7 @@ Legacy Qt/C++ GUI was removed on branch `rewrite/rust-gpui`. History remains on 
 ## Build & run
 
 ```bash
-# 1) Build Go core (required for Start / Auto Selector / URL Test / Scanner — 1.4.0-beta.1 sources)
+# 1) Build Go core (required for Start / Auto Selector / URL Test / Scanner — 1.4.0-beta.3 sources)
 ./script/build-core                  # protoc + go build w/ with_quic,with_utls,… → target/debug/ThroneCore
 # Override tags: THRONE_CORE_TAGS='with_quic,…' ./script/build-core
 

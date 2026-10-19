@@ -21,8 +21,8 @@ use std::sync::{Arc, Mutex};
 
 use gpui::{
     actions, div, prelude::*, px, uniform_list, App, Bounds, ClipboardItem, Context, DragMoveEvent,
-    Empty, EntityInputHandler, FocusHandle, Focusable, KeyDownEvent, MouseButton, Pixels, Render,
-    ScrollHandle, ScrollStrategy, SharedString, Subscription, UTF16Selection,
+    Empty, Entity, EntityInputHandler, FocusHandle, Focusable, KeyDownEvent, MouseButton, Pixels,
+    Render, ScrollHandle, ScrollStrategy, SharedString, Subscription, UTF16Selection,
     UniformListScrollHandle, Window,
 };
 
@@ -61,6 +61,7 @@ use gpui_component::{
         Cancel as DialogCancel, Confirm as DialogConfirm, Dialog as GpuiDialog, DialogButtonProps,
         DialogFooter,
     },
+    input::{Input, InputEvent, InputState},
     ActiveTheme as _, WindowExt as _,
 };
 
@@ -236,12 +237,33 @@ fn running_mode_marker(tun_enabled: bool, system_proxy_enabled: bool) -> &'stati
     }
 }
 
+#[cfg(test)]
 fn should_scroll_logs_to_bottom(logs_tab_active: bool, previous: &str, current: &str) -> bool {
     logs_tab_active && !current.is_empty() && previous != current
 }
 
 fn should_update_rendered_log_text(logs_tab_active: bool) -> bool {
     logs_tab_active
+}
+
+fn pause_log_updates(
+    active: bool,
+    distance_from_bottom: f32,
+    filter_changed: bool,
+    has_snapshot: bool,
+) -> bool {
+    active && distance_from_bottom > 2. && !filter_changed && has_snapshot
+}
+
+fn filtered_logs(logs: &str, query: &str) -> String {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return logs.to_string();
+    }
+    logs.lines()
+        .filter(|line| line.to_lowercase().contains(&query))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Fingerprint of the active connection set (ids only — traffic churn must not force scroll).
@@ -577,11 +599,17 @@ pub struct MainWindow {
     open_menu: OpenMenu,
     /// Bottom panel tab: 0 Logs, 1 Connections, 2 Traffic Graph
     bottom_tab: usize,
-    /// Shared vertical scroll for Logs / Connections bottom panel body.
+    /// Separate scroll handles preserve log history position across tab switches.
     log_scroll_handle: ScrollHandle,
+    connection_scroll_handle: ScrollHandle,
     /// Profile table (`uniform_list`) scroll — used to reveal keyboard-selected rows.
     profile_list_scroll: UniformListScrollHandle,
     rendered_log_text: String,
+    log_filter: Option<Entity<InputState>>,
+    log_filter_visible: bool,
+    rendered_log_filter: String,
+    log_input_subscription: Option<Subscription>,
+    logs_paused: bool,
     /// Last rendered Connections id set (for auto-scroll-to-last).
     rendered_connection_ids: String,
     ctx_menu_at: Option<(f32, f32)>,
@@ -618,9 +646,6 @@ pub struct MainWindow {
     /// Top-right progress while group URL/IP test runs (upstream `data_view`).
     test_progress: Option<TestProgressPanel>,
     subscription_queue: Option<SubscriptionUpdateQueue>,
-    sort_column: SortColumn,
-    /// `true` = ascending (A→Z, low latency first).
-    sort_asc: bool,
     /// Live connections from core (Connections tab).
     connections: Vec<ConnectionRow>,
     /// Per-connection speed samples for the Connections Speed column.
@@ -727,8 +752,14 @@ impl MainWindow {
             open_menu: OpenMenu::None,
             bottom_tab: 0,
             log_scroll_handle: ScrollHandle::new(),
+            connection_scroll_handle: ScrollHandle::new(),
             profile_list_scroll: UniformListScrollHandle::new(),
             rendered_log_text: String::new(),
+            log_filter: None,
+            log_filter_visible: false,
+            rendered_log_filter: String::new(),
+            log_input_subscription: None,
+            logs_paused: false,
             rendered_connection_ids: String::new(),
             ctx_menu_at: None,
             ctx_group_id: None,
@@ -748,8 +779,6 @@ impl MainWindow {
             background_busy: false,
             test_progress: None,
             subscription_queue: None,
-            sort_column: SortColumn::None,
-            sort_asc: true,
             connections: Vec::new(),
             connection_speeds: ConnectionSpeedTracker::default(),
             auto_selector_snapshot: Vec::new(),
@@ -790,6 +819,17 @@ impl MainWindow {
     ///
     /// Call from `open_window` so theme tokens follow OS light/dark changes live.
     pub fn attach_window_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.log_filter.is_none() {
+            let input =
+                cx.new(|cx| InputState::new(window, cx).placeholder("Filter logs (literal text)…"));
+            self.log_input_subscription =
+                Some(cx.subscribe(&input, |_, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        cx.notify();
+                    }
+                }));
+            self.log_filter = Some(input);
+        }
         self.sync_theme_from_window(window, cx);
         self._appearance_sub = Some(cx.observe_window_appearance(window, |this, window, cx| {
             this.sync_theme_from_window(window, cx);
@@ -997,12 +1037,13 @@ impl MainWindow {
     }
 
     fn toggle_sort(&mut self, col: SortColumn, cx: &mut Context<Self>) {
-        (self.sort_column, self.sort_asc) = next_sort_state(self.sort_column, self.sort_asc, col);
-        let result = domain_sort_column(self.sort_column)
+        let (current, ascending) = self.group_sort_state();
+        let (column, ascending) = next_sort_state(current, ascending, col);
+        let result = domain_sort_column(column)
             .ok_or_else(|| "no sortable column selected".to_string())
             .and_then(|column| {
                 self.state
-                    .sort_active_group_profiles(column, self.sort_asc)
+                    .sort_active_group_profiles(column, ascending)
                     .map_err(|error| error.to_string())
             })
             .and_then(|()| self.persist_db());
@@ -1134,11 +1175,27 @@ impl MainWindow {
         cx.notify();
     }
 
+    fn group_sort_state(&self) -> (SortColumn, bool) {
+        let Some(group) = self.state.group(self.state.active_group_id()) else {
+            return (SortColumn::None, true);
+        };
+        let column = match group.sort_method {
+            1 | 7 => SortColumn::Type,
+            2 => SortColumn::Address,
+            3 => SortColumn::Name,
+            4 | 8 => SortColumn::TestResult,
+            6 => SortColumn::Traffic,
+            _ => SortColumn::None,
+        };
+        (column, !group.sort_descending)
+    }
+
     fn sort_label(&self, col: SortColumn, base: &str) -> String {
-        if self.sort_column != col {
+        let (column, ascending) = self.group_sort_state();
+        if column != col {
             return base.to_string();
         }
-        if self.sort_asc {
+        if ascending {
             format!("{base} ↑")
         } else {
             format!("{base} ↓")
@@ -1919,15 +1976,49 @@ impl MainWindow {
             Some(DialogInputs::EditProfile { name }) => DialogInputs::read_string(name, cx),
             _ => return,
         };
-        match self.state.rename_profile(id, name) {
+        let selector_json = if let Dialog::EditProfile {
+            selector_groups: Some(groups),
+            ..
+        } = &self.dialog
+        {
+            if groups.is_empty() || !groups.iter().any(|id| self.state.group(*id).is_some()) {
+                self.state
+                    .set_status_message("Select at least one existing tracked group");
+                cx.notify();
+                return;
+            }
+            let Some(mut config) = self
+                .state
+                .profile(id)
+                .and_then(throne_domain::profile_auto_selector)
+            else {
+                return;
+            };
+            config.gids = groups.clone();
+            config.gid = groups[0];
+            config.name = name.trim().to_string();
+            Some(config.to_outbound_json())
+        } else {
+            None
+        };
+        let result = self
+            .state
+            .rename_profile(id, name)
+            .map_err(|e| e.to_string())
+            .and_then(|()| {
+                if let Some(json) = selector_json {
+                    self.state
+                        .update_profile_outbound_json(id, json)
+                        .map_err(|e| e.to_string())?;
+                }
+                self.persist_db()
+            });
+        match result {
             Ok(()) => {
                 self.close_dialog();
-                let _ = self.persist_db();
-                self.state.set_status_message("Profile renamed");
+                self.state.set_status_message("Profile saved");
             }
-            Err(e) => {
-                self.state.set_status_message(format!("Rename failed: {e}"));
-            }
+            Err(e) => self.state.set_status_message(format!("Save failed: {e}")),
         }
         cx.notify();
     }
@@ -2041,6 +2132,8 @@ impl MainWindow {
                     if let Some(r) = ed.profile.rules.get_mut(i) {
                         r.name = DialogInputs::read_string(&re.rule_name, cx);
                         r.protocol = DialogInputs::read_string(&re.rule_protocol, cx);
+                        r.tls_fragment_fallback_delay =
+                            DialogInputs::read_string(&re.rule_fragment_delay, cx);
                         r.domain = lines_to_vec(&DialogInputs::read_string(&re.rule_domain, cx));
                         r.domain_suffix =
                             lines_to_vec(&DialogInputs::read_string(&re.rule_suffix, cx));
@@ -2102,6 +2195,7 @@ impl MainWindow {
                             r.domain.join("\n"),
                             r.domain_suffix.join("\n"),
                             r.ip_cidr.join("\n"),
+                            r.tls_fragment_fallback_delay.clone(),
                         )
                     }),
                 _ => None,
@@ -2114,8 +2208,9 @@ impl MainWindow {
         let Some(NestedInputs::RouteEditor(re)) = &inputs.nested else {
             return;
         };
-        let (name, protocol, domain, suffix, ip) = rule.unwrap_or_else(|| {
+        let (name, protocol, domain, suffix, ip, fragment_delay) = rule.unwrap_or_else(|| {
             (
+                String::new(),
                 String::new(),
                 String::new(),
                 String::new(),
@@ -2125,6 +2220,7 @@ impl MainWindow {
         });
         DialogInputs::set_string(&re.rule_name, name, window, cx);
         DialogInputs::set_string(&re.rule_protocol, protocol, window, cx);
+        DialogInputs::set_string(&re.rule_fragment_delay, fragment_delay, window, cx);
         DialogInputs::set_string(&re.rule_domain, domain, window, cx);
         DialogInputs::set_string(&re.rule_suffix, suffix, window, cx);
         DialogInputs::set_string(&re.rule_ip, ip, window, cx);
@@ -2937,6 +3033,12 @@ impl MainWindow {
     pub(crate) fn tray_menu_state(&self) -> crate::tray::TrayMenuState {
         let s = self.state.settings();
         crate::tray::TrayMenuState {
+            connection: match self.state.core_status() {
+                CoreStatus::Running { .. } => crate::tray::ConnectionState::Running,
+                CoreStatus::Starting => crate::tray::ConnectionState::Starting,
+                CoreStatus::Stopping => crate::tray::ConnectionState::Stopping,
+                _ => crate::tray::ConnectionState::Stopped,
+            },
             start_with_system: s.start_with_system,
             remember_last: s.remember_enable,
             allow_lan: crate::tray::allow_lan_from_address(&s.inbound_address),
@@ -4711,6 +4813,9 @@ impl MainWindow {
             remote_dns,
             direct_dns,
             log_level,
+            log_font_family,
+            log_font_size,
+            max_log_line,
             user_agent,
             sub_custom_hwid,
             sub_auto_minutes,
@@ -4725,6 +4830,18 @@ impl MainWindow {
         let remote_dns = DialogInputs::read_string(remote_dns, cx);
         let direct_dns = DialogInputs::read_string(direct_dns, cx);
         let log_level = DialogInputs::read_string(log_level, cx);
+        let log_font_family = DialogInputs::read_string(log_font_family, cx);
+        let log_font_size = DialogInputs::read_string(log_font_size, cx)
+            .parse::<i32>()
+            .unwrap_or(0);
+        let log_font_size = if log_font_size == 0 {
+            0
+        } else {
+            log_font_size.clamp(8, 32)
+        };
+        let max_log_line = DialogInputs::read_string(max_log_line, cx)
+            .parse::<usize>()
+            .unwrap_or(500);
         let user_agent = DialogInputs::read_string(user_agent, cx);
         let sub_custom_hwid_params = DialogInputs::read_string(sub_custom_hwid, cx);
         let mut sub_minutes = DialogInputs::read_string(sub_auto_minutes, cx)
@@ -4779,6 +4896,9 @@ impl MainWindow {
             subscription,
         );
         self.state.settings_mut().url_scheme_auto_register = url_scheme_auto_register;
+        self.state.settings_mut().log_font_family = log_font_family;
+        self.state.settings_mut().log_font_size = log_font_size;
+        self.state.set_log_limit(max_log_line);
         for n in notices {
             self.state.push_log(n);
         }
@@ -4965,9 +5085,6 @@ impl MainWindow {
                             crate::ui::routing::RtFocus::RemoteDns
                         }
                         crate::ui::routing::RoutingTab::Warp => crate::ui::routing::RtFocus::WarpEp,
-                        crate::ui::routing::RoutingTab::Hijack => {
-                            crate::ui::routing::RtFocus::DnsPort
-                        }
                         _ => crate::ui::routing::RtFocus::None,
                     };
                 }
@@ -4983,19 +5100,11 @@ impl MainWindow {
                         None
                     }
                     crate::ui::routing::RtFocus::DnsObject => Some((&mut s.dns_object, true)),
-                    crate::ui::routing::RtFocus::DnsV4 => Some((&mut s.dns_v4_resp, false)),
-                    crate::ui::routing::RtFocus::DnsV6 => Some((&mut s.dns_v6_resp, false)),
-                    crate::ui::routing::RtFocus::DnsPort => None,
-                    crate::ui::routing::RtFocus::RedirectAddr => {
-                        Some((&mut s.redirect_listen_address, false))
-                    }
-                    crate::ui::routing::RtFocus::RedirectPort => None,
                     crate::ui::routing::RtFocus::WarpEp => Some((&mut s.warp_ep, false)),
                     crate::ui::routing::RtFocus::WarpPriv => Some((&mut s.warp_private_key, false)),
                     crate::ui::routing::RtFocus::WarpPub => Some((&mut s.warp_public_key, false)),
                     crate::ui::routing::RtFocus::WarpAddrs
                     | crate::ui::routing::RtFocus::WarpReserved
-                    | crate::ui::routing::RtFocus::DnsRules
                     | crate::ui::routing::RtFocus::None => None,
                 };
                 field
@@ -5033,7 +5142,7 @@ impl MainWindow {
 
     /// Insert/delete text into the focused dialog field (end-cursor model).
     fn apply_dialog_text_edit(&mut self, text: &str, is_backspace: bool, cx: &mut Context<Self>) {
-        // Routing: main DNS/Warp/Hijack + nested editors use Input when NestedInputs present;
+        // Routing: main DNS/Warp + nested editors use Input when NestedInputs present;
         // fallback fake-caret only when NestedInputs is missing.
         if matches!(self.dialog, Dialog::RoutingSettings(_)) {
             let nested_active = matches!(
@@ -5761,7 +5870,7 @@ impl MainWindow {
         // Column widths must match row cells exactly. Click toggles sort;
         // drag the right edge of a column to resize (persisted per group).
         let entity = cx.entity().clone();
-        let active = self.sort_column;
+        let active = self.group_sort_state().0;
         let muted = Theme::text_muted();
         let accent = Theme::accent();
         let (widths, custom) = self.profile_col_layout();
@@ -5939,7 +6048,17 @@ impl MainWindow {
                             let ty = profile.display_type();
                             let addr = if profile.profile_type == ProfileType::AutoSelector {
                                 throne_domain::profile_auto_selector(profile)
-                                    .and_then(|c| group_names.get(&c.gid).cloned())
+                                    .map(|c| {
+                                        c.gids
+                                            .iter()
+                                            .map(|id| {
+                                                group_names.get(id).cloned().unwrap_or_else(|| {
+                                                    format!("Missing group #{id}")
+                                                })
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    })
                                     .map(|n| format!("group · {n}"))
                                     .unwrap_or_else(|| profile.display_address())
                             } else {
@@ -6061,16 +6180,35 @@ impl MainWindow {
     fn render_bottom_tabs(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity().clone();
         let tab = self.bottom_tab;
-        let logs = self.state.logs_text();
-        if should_scroll_logs_to_bottom(tab == 0, &self.rendered_log_text, &logs) {
+        let query = if self.log_filter_visible {
+            self.log_filter
+                .as_ref()
+                .map(|input| input.read(cx).value().to_string())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let logs = filtered_logs(&self.state.logs_text(), &query);
+        let filter_changed = query != self.rendered_log_filter;
+        let distance_from_bottom =
+            f32::from(self.log_scroll_handle.max_offset().y + self.log_scroll_handle.offset().y);
+        self.logs_paused = pause_log_updates(
+            tab == 0,
+            distance_from_bottom,
+            filter_changed,
+            !self.rendered_log_text.is_empty(),
+        );
+        if tab == 0 && !self.logs_paused {
+            // Apply after layout too: filtering/font changes can change the scroll range.
             self.log_scroll_handle.scroll_to_bottom();
         }
-        if should_update_rendered_log_text(tab == 0) {
+        if !self.logs_paused && should_update_rendered_log_text(tab == 0) {
             self.rendered_log_text = logs.clone();
+            self.rendered_log_filter = query;
         }
         let conn_fp = connections_ids_fingerprint(&self.connections);
         if should_scroll_connections_to_bottom(tab == 1, &self.rendered_connection_ids, &conn_fp) {
-            self.log_scroll_handle.scroll_to_bottom();
+            self.connection_scroll_handle.scroll_to_bottom();
         }
         if should_update_rendered_connection_ids(tab == 1) {
             self.rendered_connection_ids = conn_fp;
@@ -6078,14 +6216,26 @@ impl MainWindow {
             // Leaving Connections: reset so re-entry always lands on the last row.
             self.rendered_connection_ids.clear();
         }
-        let log_preview = if logs.is_empty() {
-            "(no log lines yet)".to_string()
+        let log_preview = if self.rendered_log_text.is_empty() {
+            "(no matching log lines)".to_string()
         } else {
-            // Show newest lines first in the cramped panel for scanability.
-            let lines: Vec<&str> = logs.lines().collect();
-            let n = lines.len();
-            let start = n.saturating_sub(12);
-            lines[start..].join("\n")
+            self.rendered_log_text.clone()
+        };
+        let log_font = if self.state.settings().log_font_family.trim().is_empty() {
+            if cfg!(target_os = "macos") {
+                "Menlo"
+            } else if cfg!(target_os = "windows") {
+                "Consolas"
+            } else {
+                "monospace"
+            }
+        } else {
+            self.state.settings().log_font_family.as_str()
+        }
+        .to_string();
+        let log_size = match self.state.settings().log_font_size {
+            0 => 12.,
+            size => size.clamp(8, 32) as f32,
         };
         div()
             .flex()
@@ -6111,9 +6261,12 @@ impl MainWindow {
                                 SharedString::from("Connections"),
                                 SharedString::from("Traffic Graph"),
                             ],
-                            move |ix, _, cx| {
+                            move |ix, window, cx| {
                                 e.update(cx, |t, cx| {
                                     t.bottom_tab = *ix;
+                                    if *ix != 0 {
+                                        t.focus_handle.focus(window, cx);
+                                    }
                                     cx.notify();
                                 });
                             },
@@ -6123,7 +6276,35 @@ impl MainWindow {
                     .when(tab == 0, |row| {
                         let e_copy = entity.clone();
                         let e_clear = entity.clone();
-                        row.child(icon_btn("log-copy", "icons/copy.svg", move |_, _, cx| {
+                        let e_filter = entity.clone();
+                        let e_resume = entity.clone();
+                        row.child(Button::new("log-filter-toggle").label("Filter").on_click(
+                            move |_, window, cx| {
+                                e_filter.update(cx, |t, cx| {
+                                    t.log_filter_visible = !t.log_filter_visible;
+                                    if t.log_filter_visible {
+                                        if let Some(input) = &t.log_filter {
+                                            input.read(cx).focus_handle(cx).focus(window, cx);
+                                        }
+                                    } else {
+                                        t.focus_handle.focus(window, cx);
+                                    }
+                                    cx.notify();
+                                });
+                            },
+                        ))
+                        .when(self.logs_paused, |row| {
+                            row.child(Button::new("log-resume").label("Resume").on_click(
+                                move |_, _, cx| {
+                                    e_resume.update(cx, |t, cx| {
+                                        t.rendered_log_text.clear();
+                                        t.log_scroll_handle.scroll_to_bottom();
+                                        cx.notify();
+                                    });
+                                },
+                            ))
+                        })
+                        .child(icon_btn("log-copy", "icons/copy.svg", move |_, _, cx| {
                             e_copy.update(cx, |t, cx| t.copy_logs(cx));
                         }))
                         .child(icon_btn(
@@ -6132,6 +6313,8 @@ impl MainWindow {
                             move |_, _, cx| {
                                 e_clear.update(cx, |t, cx| {
                                     t.state.clear_logs();
+                                    t.rendered_log_text.clear();
+                                    t.log_scroll_handle.scroll_to_bottom();
                                     cx.notify();
                                 });
                             },
@@ -6152,6 +6335,13 @@ impl MainWindow {
                         ))
                     }),
             )
+            .when(tab == 0 && self.log_filter_visible, |el| {
+                if let Some(input) = &self.log_filter {
+                    el.child(div().px_2().child(Input::new(input).cleanable(true)))
+                } else {
+                    el
+                }
+            })
             .child(
                 div()
                     .id("logs-panel")
@@ -6164,7 +6354,10 @@ impl MainWindow {
                     .text_xs()
                     .text_color(Theme::text_muted())
                     .overflow_y_scroll()
-                    .track_scroll(&self.log_scroll_handle)
+                    .when(tab == 0, |el| el.track_scroll(&self.log_scroll_handle))
+                    .when(tab == 1, |el| {
+                        el.track_scroll(&self.connection_scroll_handle)
+                    })
                     .when(tab == 0, {
                         let e = entity.clone();
                         move |el| {
@@ -6182,7 +6375,13 @@ impl MainWindow {
                                                 "Click panel or Copy · ⌘⇧C to copy all logs",
                                             ),
                                         )
-                                        .child(div().text_color(Theme::text()).child(log_preview)),
+                                        .child(
+                                            div()
+                                                .font_family(log_font)
+                                                .text_size(px(log_size))
+                                                .text_color(Theme::text())
+                                                .child(log_preview),
+                                        ),
                                 )
                         }
                     })
@@ -6557,6 +6756,7 @@ impl EntityInputHandler for MainWindow {
 
 impl Render for MainWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_tray_menu();
         // Keep paint tokens + gpui-component chrome aligned with settings / OS appearance.
         self.sync_theme_from_window(window, cx);
         // Dialog present / NestedInputs sync runs in AppShell::prepare_dialog_layer
@@ -6569,7 +6769,13 @@ impl Render for MainWindow {
         let focus = self.focus_handle.clone();
         // Don't steal focus from gpui-component Dialog / Input.
         let gpui_dialog_active = window.has_active_dialog(cx);
-        if !gpui_dialog_active && !focus.is_focused(window) {
+        let log_filter_focused = self.bottom_tab == 0
+            && self.log_filter_visible
+            && self
+                .log_filter
+                .as_ref()
+                .is_some_and(|input| input.read(cx).focus_handle(cx).is_focused(window));
+        if !gpui_dialog_active && !log_filter_focused && !focus.is_focused(window) {
             focus.focus(window, cx);
         }
 
@@ -6582,7 +6788,7 @@ impl Render for MainWindow {
         let toolbar_menu_open = Self::toolbar_menu_index(self.open_menu).is_some();
 
         // Key context: destructive Main shortcuts only when no modal is open.
-        let key_ctx = if dialog_open || gpui_dialog_active {
+        let key_ctx = if dialog_open || gpui_dialog_active || log_filter_focused {
             "Dialog"
         } else {
             "Main"
@@ -6619,6 +6825,15 @@ impl Render for MainWindow {
             .on_action(cx.listener(|this, _: &CopyLogs, _, cx| this.copy_logs(cx)))
             .on_action(cx.listener(|_this, _: &Quit, _, cx| cx.quit()))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if this.bottom_tab == 0
+                    && this.log_filter_visible
+                    && this
+                        .log_filter
+                        .as_ref()
+                        .is_some_and(|input| input.read(cx).focus_handle(cx).is_focused(window))
+                {
+                    return;
+                }
                 if this.handle_dialog_key(event, cx) {
                     // Mark handled so macOS doesn't drop the keystroke on the floor.
                     cx.stop_propagation();
@@ -6804,6 +7019,9 @@ fn build_gpui_dialog(
                 remote_dns,
                 direct_dns,
                 log_level,
+                log_font_family,
+                log_font_size,
+                max_log_line,
                 user_agent,
                 sub_custom_hwid,
                 sub_auto_minutes,
@@ -6858,6 +7076,9 @@ fn build_gpui_dialog(
                     remote_dns,
                     direct_dns,
                     log_level,
+                    log_font_family,
+                    log_font_size,
+                    max_log_line,
                     user_agent,
                     sub_custom_hwid,
                     sub_auto_minutes,
@@ -7364,11 +7585,33 @@ fn build_gpui_dialog(
                     },
                 ))
         }
-        Dialog::EditProfile { type_label, .. } => {
+        Dialog::EditProfile {
+            type_label,
+            selector_groups,
+            ..
+        } => {
             let Some(DialogInputs::EditProfile { name }) = this.dialog_inputs.as_ref() else {
                 return dialog.title("Edit Profile").child(div().child("…"));
             };
             let type_label = type_label.clone();
+            let is_selector = selector_groups.is_some();
+            let mut group_options = Vec::new();
+            if let Some(selected) = selector_groups {
+                for id in selected {
+                    let name = this
+                        .state
+                        .group(*id)
+                        .map(|g| g.name.clone())
+                        .unwrap_or_else(|| format!("Missing group #{id}"));
+                    group_options.push((*id, name, true));
+                }
+                for group in this.state.all_groups() {
+                    if !selected.contains(&group.id) {
+                        group_options.push((group.id, group.name.clone(), false));
+                    }
+                }
+            }
+            let e_groups = entity.clone();
             let e_save = entity.clone();
             let e_cancel = entity.clone();
             dialog
@@ -7388,9 +7631,32 @@ fn build_gpui_dialog(
                 .child(edit_profile_body(
                     name,
                     &type_label,
+                    &group_options,
+                    is_selector,
+                    move |gid, _, cx| {
+                        e_groups.update(cx, |t, cx| {
+                            if let Dialog::EditProfile {
+                                selector_groups: Some(groups),
+                                ..
+                            } = &mut t.dialog
+                            {
+                                if groups.contains(&gid) {
+                                    groups.retain(|id| *id != gid);
+                                } else {
+                                    groups.push(gid);
+                                }
+                            }
+                            cx.notify();
+                        });
+                    },
                     move |window, cx| {
-                        e_save.update(cx, |t, cx| t.save_edit_profile(cx));
-                        window.close_all_dialogs(cx);
+                        let saved = e_save.update(cx, |t, cx| {
+                            t.save_edit_profile(cx);
+                            matches!(t.dialog, Dialog::None)
+                        });
+                        if saved {
+                            window.close_all_dialogs(cx);
+                        }
                     },
                     move |window, cx| {
                         e_cancel.update(cx, |t, cx| {
@@ -7801,6 +8067,26 @@ fn build_nested_routing_dialog(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn log_filter_is_literal_case_insensitive_and_can_be_cleared() {
+        let text = "[INFO] Ready\n[WARN] peer [A+B]\n[info] resumed";
+        assert_eq!(
+            super::filtered_logs(text, " INFO "),
+            "[INFO] Ready\n[info] resumed"
+        );
+        assert_eq!(super::filtered_logs(text, "[a+b]"), "[WARN] peer [A+B]");
+        assert_eq!(super::filtered_logs(text, ""), text);
+    }
+
+    #[test]
+    fn log_history_freezes_only_above_bottom_and_resumes_on_filter_or_clear() {
+        use super::pause_log_updates;
+        assert!(pause_log_updates(true, 40., false, true));
+        assert!(!pause_log_updates(true, 0., false, true));
+        assert!(!pause_log_updates(true, 40., true, true));
+        assert!(!pause_log_updates(true, 40., false, false));
+        assert!(!pause_log_updates(false, 40., false, true));
+    }
     use super::{
         adjacent_profile_id, connections_ids_fingerprint, eligible_subscription_ids,
         eligible_subscription_ids_filtered, failed_start_profile_log,

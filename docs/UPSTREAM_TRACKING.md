@@ -2,11 +2,11 @@
 
 Remote: `upstream` → `https://github.com/throneproj/Throne.git`  
 Baseline branch: `upstream/dev`  
-**Target release (this audit):** tag **`1.4.0-beta.1`** (`50a22014`, 2026-10-04).
-**Last audited tip:** `upstream/dev` describe **`1.4.0-beta.1-13-g32138a44`** on 2026-10-09 (13 commits past the pin; not absorbed).
-**Product version:** `1.4.0-beta.1` (root [`VERSION`](../VERSION) + workspace Cargo version = this pin).
+**Target release (this audit):** tag **`1.4.0-beta.3`** (`01086027`, 2026-10-17).
+**Last audited tip:** `upstream/dev` describe **`1.4.0-beta.3-6-gcb26b89e`** on 2026-10-18 (six commits past the pin; not absorbed).
+**Product version:** `1.4.0-beta.3` (root [`VERSION`](../VERSION) + workspace Cargo version = this pin).
 
-This pin identifies the core and schema baseline; it does not claim complete product parity. The scanner, Kill Switch, global hotkeys, OS proxy refactor, and historical gaps below remain partial or unported.
+This pin identifies the audited release baseline; it does not claim complete product parity. The new remote control API, full scanner, Kill Switch, global hotkeys, OS proxy refactor, and historical gaps below remain partial or unported.
 
 Agent skill for ongoing parity work: [`skills/throne-upstream-parity/SKILL.md`](../skills/throne-upstream-parity/SKILL.md).
 
@@ -14,16 +14,56 @@ Agent skill for ongoing parity work: [`skills/throne-upstream-parity/SKILL.md`](
 
 ```bash
 ./script/upstream-audit            # current VERSION → newest 1.* tag
-./script/upstream-audit 1.4.0-beta.1 # explicit release tag
+./script/upstream-audit 1.4.0-beta.3 # explicit release tag
 ```
 
 Manual equivalent:
 
 ```bash
 git fetch upstream --prune --tags
-git log --oneline 1.3.2..1.4.0-beta.1
-git diff --dirstat=files,0 1.3.2 1.4.0-beta.1
+git log --oneline 1.4.0-beta.2..1.4.0-beta.3
+git diff --dirstat=files,0 1.4.0-beta.2 1.4.0-beta.3
 ```
+
+## 1.4.0-beta.3 audit (2026-10-18)
+
+**Pinned release:** `010860272538fd0955f40dd87e4b200d6fee2adc` (2026-10-17), **16 commits** after beta.2 (`9172ec37`). The fetched `upstream/dev` is `1.4.0-beta.3-6-gcb26b89e`; those six subsequent commits are excluded. This is an audited baseline, not a claim of complete upstream parity.
+
+| Commit | Upstream change | Disposition in this rewrite |
+|--------|-----------------|-----------------------------|
+| `2bfc5885` | x/net update | ✅ Target `go.mod`/`go.sum` synced |
+| `053888ea` | Linux FakeIP CI fixes | 🧩 Core synced; upstream Linux environment/CI execution not reproduced on this Darwin host |
+| `5cb7fe16` | Automatic Amnezia I1–I5 QUIC signatures | 🧩 Native generator, RPC and Rust client implemented; profile-editor generation control not ported |
+| `6906912f` | Retain group sorting | ✅ Upstream `sort_method`/`sort_descending` DB columns, per-group header state and stable re-sort after import, subscription, rename, traffic and test updates; raw order stays raw |
+| `11c80fd4` | Connection profile names | ✅ Running profile and Auto Selector member tags resolve to captured names in Connections; raw outbound tag retained as fallback |
+| `a6d042c2` | TLS fragmentation route options | ✅ Models, compatible DB migration, share import/export, route editor switches/delay and core JSON; `route-options` stays non-terminal without an outbound |
+| `39d6b620` | WireGuard startup memory fix | ✅ Target wireguard-go dependency synced |
+| `cb823588` | Clash VLESS engine preference | ⏳ Engine preference and general native Xray-VLESS editor remain unported; XHTTP share-link/full-config bridge is separate |
+| `a1b2d3e5` | TLS cipher suites and unsafe fingerprint | 🧩 Native share-link suites retained with unsupported suites filtered/reported; ordinary TLS disables unsafe uTLS, REALITY uses required random fallback; XHTTP and Xray JSON cipher suites retained through full-config bridge. Dedicated suite editor/export remains |
+| `c33ef779` | Remove forced Xray deprecations | ✅ Target Xray dependency synced |
+| `bf89f273` | Config export improvements | ⏳ Full native profile/core export workflow remains; route share round-trip now retains the new fragment and override fields |
+| `c3c2778b` | Live graph refactor | 🧩 Existing GPUI traffic graph retained; upstream graph controls, sampling and persistence parity not claimed |
+| `a8af8ca8` | Structured input validation | 🧩 Invalid Clash ports cannot wrap; partial Clash feeds produce errors so subscription replacement is refused; native cipher diagnostics added. Full upstream per-field validators and editor diagnostics remain |
+| `568ce9d3` | Xray ports / mobile signatures / diagnostics | 🧩 Xray reservation/retry/cooldown core changes and capability-aware privilege decoding synced; mobile/native diagnostics UI not ported |
+| `725db1e6` | Headless engine, service and packaging | ⏳ Rust headless orchestration, CLI/service/API surface and packaging not ported; shared core changes synced. This is a separate product surface, not Qt-only N/A |
+| `01086027` | Multiple Auto Selector groups / country provider | 🧩 Ordered deduplicated `gids` with legacy `gid` compatibility, missing-group handling, per-group chain eligibility, Start/rerank and native tracked-group editor implemented. Country lookup provider customization and related runtime-stat UI remain |
+
+### Core baseline and limits
+
+`core/` matches beta.3 sources except the retained Darwin physical-NIC hardening through `netmon.DefaultInterface()`. Dependency pins: sing-box `8b3b24f856bd`, Xray `0858933635b5`, wireguard-go `98b1170bc9f0`; protobuf adds `GenQuicSignature` and optional privilege capability fields without changing RPC framing. The pre-existing legacy `core/server/` is not the active build source.
+
+The host binary is rebuilt at `target/parity-beta3/ThroneCore`. Packaging still uses the build script and root `VERSION`. A previously staged setuid core is deliberately not overwritten by the existing privilege setup path: an installed/elevated runtime must be refreshed separately before assuming beta.3 RPC support. No privileged network state was changed for this audit.
+
+### Verification evidence
+
+- **Executed:** host Go core rebuild; targeted Go tests for `capcheck`, `diagnostics`, `guard`, `probe`, `xray`; Xray race test.
+- **Executed:** `cargo test --workspace` passed **310 tests across 14 suites** (20 more than the beta.2 audit), including multi-group Start/rerank, route JSON, SQLite reopen, persisted sorting, TLS suites/REALITY, partial subscription rejection and additive protobuf contracts.
+- **Executed:** `cargo check -p throne` passed with two existing warnings (`RoutingTab::Hijack`, `validate_dns_rules`); `cargo fmt --all` and `git diff --check` passed.
+- **Executed:** **10 rebuilt-core smoke groups** passed: API-service SOCKS config; WebSocket endpoint/SNI/Host with negative control; ECH/Amnezia/XHTTP/FakeIP configs; multi-group selector and route-options fragmentation with conflicting-mode rejection; REALITY unsafe fallback and filtered cipher suites; privilege/QUIC-signature RPCs and invalid-IP rejection; scanner count, loopback TCP/progress, stopped-session rejection; rule-set parsing. No profile was started and no system proxy/TUN mode was changed.
+- **Executed failure, inspected provenance:** `cargo clippy --workspace --all-targets -- -D warnings` remains blocked by **18 existing domain lint errors** (manual clamps/default reassignment, manual filter, argument counts and a stray doc comment). The corresponding patterns are present in the pre-task snapshot; this is not a clean strict-lint result.
+- **Executed regression proof:** both route Basic/Advanced save-loss tests failed before repair and passed afterward. Fragment options now survive simple-rule rebuilds; clearing a simple bucket still removes it, and unconditional route-options payloads are retained.
+- **Inspected:** independent core security and Rust reviews found no remaining high-confidence blockers after REALITY, unsupported-suite and route-save repairs. Source review is not desktop interaction or CI evidence.
+- **Not executed:** native desktop interactions, live remote handshakes, Linux/Windows runtime, elevated TUN/L3/Kill Switch paths, full headless product workflows. Existing remote control API, scanner/resume UI, global-hotkey and historical editor gaps remain.
 
 ## Feature parity matrix
 
@@ -31,6 +71,18 @@ Status legend: ✅ implemented for the stated contract · 🧩 partial · ⏳ pl
 
 | Area | Upstream signal (commits / modules) | Rust status | Target crate |
 |------|-------------------------------------|-------------|--------------|
+| **Multiple Auto Selector groups (1.4.0-beta.3)** | `01086027` | ✅ Ordered/deduplicated `gids`, legacy `gid`, missing-group tolerance, per-group chain eligibility, DB round-trip, Start/rerank and native group checklist; generated config checked by actual core | `throne-domain`, `throne`, `throne-core-client` |
+| **Retained group sorting (1.4.0-beta.3)** | `6906912f` | ✅ DB-compatible mode/direction, per-group header state, stable ties, raw-order preservation and re-sort on data updates/reload; tested | `throne-domain`, `throne-storage`, `throne` |
+| **Route TLS fragmentation (1.4.0-beta.3)** | `a6d042c2` | ✅ Fragment/record flags and delay in model, DB, shares and editor; Basic/Advanced round trips preserve options; generated route-options checked by actual core | `throne-domain`, `throne-import`, `throne-storage`, `throne-core-client`, `throne` |
+| **Core capability / QUIC signature RPCs** | `5cb7fe16`, `568ce9d3` | 🧩 Core/client implemented and live RPC smoke passed; native generation and capability controls remain | `core`, `throne-core-client` |
+| **Headless / country providers / full import validation** | `725db1e6`, `01086027`, `a8af8ca8` | ⏳ Headless service/API/CLI and country-provider UI unported; validation is partial as detailed in beta.3 triage | `throne`, `throne-domain`, `throne-import` |
+| **TLS/ECH/XHTTP import (1.4.0-beta.2)** | `8e484f36`, `37ef15ff`, `aa0f9de8` | 🧩 ECH shorthand/legacy options and whole-certificate pins preserved; XHTTP VLESS and Xray JSON ECH use the full-config bridge; strict JSON precedes Python/form fallback. Dedicated Xray editor/type, share export and full-config batch tests remain gaps | `throne-import`, `throne-core-client` |
+| **ECH DNS bootstrap** | `37ef15ff` | ✅ native TLS HTTPS queries use direct/custom resolvers before proxy rules; static configs skip bootstrap; GUI resolver metadata stripped; canonical query/rule names match. Xray configs retain their own ECH settings | `throne-core-client` |
+| **WireGuard / Amnezia names and options** | `a2fbf55b` | ✅ `awg://`, INI explicit/adjacent-peer names, wrapper fragment/description precedence, container disambiguation; options and display fields survive DB reload, endpoint override preserves keys/port, and legacy `worker_count` becomes core `workers`. INI retains one coherent last peer; full multi-peer INI import remains a gap | `throne-import`, `throne-domain`, `throne-storage`, `throne-core-client` |
+| **IPv6 FakeIP** | `03cba7a5` | ✅ `2001:db8::/32`, outside private ULA bypass; respects persisted `fakeip_disable_ipv6`; config validated with actual core, privileged traffic untested | `throne-core-client`, `throne-storage` |
+| **Log view** | `b5c47542`, `ad53134b`, `32138a44` | 🧩 monospace font/size/history settings, collapsible case-insensitive literal filter, frozen history while scrolled up and Resume; full history shown. Regex/highlighting and upstream include/exclude filter settings remain | `throne`, `throne-domain`, `throne-storage` |
+| **Tray connect/disconnect** | `0616d343` | ✅ connection action, disabled transition labels and template-safe connecting glyph; refreshes from native pump while window hidden; live cross-platform GUI untested | `throne` |
+| **Throne remote control API** | `79461307` | ⏳ custom encrypted wire protocol, command router, listener, key/LAN allowlist and Integration settings **not ported**; existing core API tracker service is unrelated. Unknown DB settings remain preserved | `throne` |
 | Protocol catalog (SS/VMess/VLESS/Trojan/HY2/TUIC/…) | README + `OutboundFactory` | 🧩 types exist; full beans partial | `throne-domain`, `throne-import` |
 | Share-link import | `GroupUpdater::RawUpdater` | ✅ common schemes | `throne-import` |
 | Multi-line / base64 subscription body | `RawUpdater::update` | ✅ line + b64 split | `throne-import` |
@@ -68,7 +120,7 @@ Status legend: ✅ implemented for the stated contract · 🧩 partial · ⏳ pl
 | Profile editor tab order (1.2.4) | `33777e27` | ⏳ GPUI focus order later | `throne` |
 | Linux CLI installer | `89f3ec1d` | ⏳ | `script/` / xtask |
 | Windows unwritable config dir (1.2.4) | `d8e663cc` | ⏳ NSI; macOS package already uses AppConfig | `script/`, `throne` |
-| Core: sing-box / xray / TUN / DNS | Go `core/` (moved out of `core/server` in 1.3.0-beta.4) | ❌ Rust data-plane rewrite remains out of scope; shipping `ThroneCore` **synced to 1.4.0-beta.1** (sing-box `ebe0747b4182`, xray `e662c22ab109`, wireguard-go `3517ea9271e4`) with local Darwin physical-NIC patch retained via `netmon` | `core/` |
+| Core: sing-box / xray / TUN / DNS | Go `core/` (moved out of `core/server` in 1.3.0-beta.4) | ❌ Rust data-plane rewrite remains out of scope; shipping `ThroneCore` **synced to 1.4.0-beta.3** (sing-box `8b3b24f856bd`, Xray `0858933635b5`, wireguard-go `98b1170bc9f0`; additive capability/QUIC RPCs) with local Darwin physical-NIC patch retained via `netmon` | `core/` |
 | Core IPC Start/Stop | `dispatch.go` + Qt framing | 🧩 Start/Stop/Test/QueryStats/QueryConnections/**CloseConnections**, AutoSelector, scanner/egress RPCs; API service keeps trackers available; Xray strategy reserved field 12 and connection source field 14 retained | `throne-core-client`, `core/` |
 | **IP lists and scanner (1.4.0-beta.1)** | `86f196d4` | 🧩 native manual lists and bounded TCP scanning only: 4,096 targets, 256 hosts per CIDR, concurrency 16, batches 64; scan models/storage/RPCs exist, but full probes, resume UI, remote updates and default list seeds are not ported | `throne-domain`, `throne-storage`, `throne-core-client`, `throne` |
 | **Profile/group endpoint sources** | `1809cb0e` | 🧩 group/profile inheritance and DB round-trip; profile list assignment and Own/Inherit restoration; Start and stored-profile tests clone server overrides while retaining identity; group/fixed-address editor remains | `throne-domain`, `throne-storage`, `throne` |
@@ -115,10 +167,41 @@ Status legend: ✅ implemented for the stated contract · 🧩 partial · ⏳ pl
 10. **Wave 1.3.0-beta.3** — skip_cert · Auto Selector empty-pool recovery · connections add-to-route · inner-hop ids · core sing-box/Xray bump ✅  
 11. **Wave 1.3.2** — core tree `core/` · DNS cache persist off · Darwin Tun allows local DNS · IPv6 private bypass · empty sub rejected · simple-rule domains lowercased · `reject_method` import ✅  
 12. **Wave 1.4.0-beta.1** — tag/core/schema pin · API service and L3/Block config contracts · bounded manual TCP scanner · profile endpoint sources · connection route targets · derived security/cleanup 🧩 (explicit product gaps below).
+13. **Wave 1.4.0-beta.2** — ECH/TLS/XHTTP import · WireGuard/Amnezia import and persistence · DNS bootstrap/IPv6 FakeIP · log settings/filter/hold · tray connection states 🧩 (remote control API and documented runtime/product gaps remain).
+
+## Commit triage notes (1.4.0-beta.1 → 1.4.0-beta.2)
+
+All **14 commits** in `git log --reverse 1.4.0-beta.1..1.4.0-beta.2` are accounted for. Tag `9172ec37` is the exact target; the four later development commits are excluded.
+
+| SHA | Upstream change | Classification and action |
+|-----|-----------------|---------------------------|
+| `ad73538e` | Avoid disconnected Unix RPC calls | **Inspected/N/A:** Rust uses `ensure_connected` before calls; no matching eager Qt call. Remote IP-list updater remains unported |
+| `8e484f36` | TLS/XHTTP import consistency | **Must port:** certificate SHA256 pins and literal `+` preserved; XHTTP uses strict JSON before legacy fallback and full Xray bridge; certificate pins feed security classification |
+| `a2fbf55b` | WireGuard/Amnezia naming | **Must port:** explicit/adjacent-peer names, `vpn://` fragment and description priority, multi-container suffixes, `awg://`; obfuscation and peer options persist, modern/legacy WireGuard generates endpoints |
+| `37ef15ff` | Xray ECH and bootstrap DNS loop | **Must port:** Xray ECH retained in full configs; native ECH HTTPS direct rules/custom resolver and canonical query names; no GUI resolver field emitted into core TLS |
+| `b5c47542` | Monospace font, live filter, hold log view | **Must port/partial:** font/history settings, native literal filter, hold/resume and full retained history; highlighting/regex remain |
+| `03cba7a5` | IPv6 FakeIP documentation range | **Must port:** generated `2001:db8::/32` plus disable-IPv6 preference and core validation |
+| `aa0f9de8` | ECH share-link shorthand | **Must port:** flags, base64 PEM wrapping, query-name/resolver targets and legacy override precedence |
+| `0616d343` | Tray connect/disconnect and connecting icon | **Must port:** action/transition state/glyph plus independent hidden-window state pump |
+| `79461307` | Throne remote API and Integration dialog | **Must port/gap:** ⏳ new service, encrypted protocol/router and Integration dialog not implemented; no listener or remote-control claim |
+| `41a0137a` | Kill Switch Qt lifetime and UAC cancellation | **Qt-specific fix/N/A; product gap:** no equivalent Qt lifetime in Rust; Kill Switch GUI/lifecycle and Windows elevation parity remain unported/unverified |
+| `a343636e` | MetaCubeX Go for legacy OS builds | **Packaging/gap:** ⏳ legacy Windows/macOS toolchain builds not ported; modern host build retains existing tags |
+| `ad53134b` | Collapsible filter and font labels | **Must port:** Filter toggle and Basic Settings log font controls |
+| `32138a44` | Refine log filter behavior | **Partial:** case-insensitive literal matching and hide-to-disable; Qt highlighting/filter restoration details not fully ported |
+| `9172ec37` | Android test log isolation | **Core sync:** exact `core/mobile/log.go` and `test.go` delta; desktop rebuilt. Android runtime outside desktop validation |
+
+### Verification status (2026-10-14)
+
+- **Executed:** `cargo test --workspace --locked` — **290 passed across 10 suites**. Initial six import contracts and six later regression cases were observed failing before their respective repairs; the final suite passes.
+- **Executed:** `cargo check -p throne --locked` — zero errors, two existing dead-code warnings (`RoutingTab::Hijack`, `RoutingDraft::validate_dns_rules`). Formatting and `git diff --check` also pass.
+- **Executed:** host `./script/build-core target/parity-beta2`; exact target core differs only by the existing Darwin `netmon` physical-interface patch.
+- **Executed:** Rust smoke harness against rebuilt core — **all seven groups pass**: SOCKS/API tracker config; positive/negative WebSocket; imported ECH, Amnezia endpoint with `workers=2`, XHTTP/Xray and IPv6 FakeIP config checks; loopback scanner count/probe/progress/stop; rule-set parsing. Validation does not establish remote-server handshakes or privileged traffic behavior.
+- **Inspected and corrected:** security case normalization, canonical ECH bootstrap name, quoted/form-encoded XHTTP values, coherent WireGuard peer options and DB hydration, core workers key, immediate log trimming, hidden-window tray refresh, separate scroll handles and filter focus. Security and Rust re-reviews found no remaining blocking issue in these repairs; full multi-peer and legacy-hydration fixture coverage remain advisory improvements.
+- **Untested:** live native GUI interactions, Windows/Linux desktop and packaging, remote ECH/Amnezia/XHTTP handshake, Android runtime and privileged TUN/L3/Kill Switch.
 
 ## Commit triage notes (1.3.2 → 1.4.0-beta.1)
 
-All **23 commits** are accounted for below. Source: local `git log --reverse --format='%h %s' 1.3.2..1.4.0-beta.1`; no changes after the requested tag are included. The audited development tip is 13 commits newer and is not the product pin.
+All **23 commits** were accounted for in the previous audit. Source: local `git log --reverse --format='%h %s' 1.3.2..1.4.0-beta.1`. The following section is historical; the beta.2 delta is recorded above.
 
 | SHA | Upstream change | Classification and action |
 |-----|-----------------|---------------------------|
@@ -199,7 +282,7 @@ Remaining historical gaps in the matrix and earlier audits remain open unless a 
 | `ed8a7059` | updater exempt from insecure TLS | ⏳ no self-updater |
 | i18n / Qt a11y / Android / connections tree / diagnostics / TrustTunnel editor | | ⏳ / N/A |
 
-Local patch at that audit used `boxdns.DefaultInterface()`. On the current 1.4.0-beta.1 pin, `core/internal/sysdns/sysdns_darwin.go` retains the physical-NIC selection through `netmon.DefaultInterface()` so system DNS is not pointed at `utun`.
+Local patch at that audit used `boxdns.DefaultInterface()`. On the current 1.4.0-beta.2 pin, `core/internal/sysdns/sysdns_darwin.go` retains the physical-NIC selection through `netmon.DefaultInterface()` so system DNS is not pointed at `utun`.
 
 ## Commit triage notes (1.3.0-beta.2 → 1.3.0-beta.3)
 

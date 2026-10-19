@@ -3,25 +3,27 @@
 use serde_json::json;
 use throne_domain::{ParsedOutbound, ProfileType};
 
-use crate::ImportedProfile;
+use crate::{ImportReport, ImportedProfile};
 
-pub fn try_import_clash(text: &str) -> Option<Vec<ImportedProfile>> {
+pub fn try_import_clash(text: &str) -> Option<ImportReport> {
     if !text.contains("proxies:") {
         return None;
     }
     let doc: serde_yaml::Value = serde_yaml::from_str(text).ok()?;
     let proxies = doc.get("proxies")?.as_sequence()?;
-    let mut out = Vec::new();
-    for p in proxies {
+    let mut report = ImportReport {
+        notes: vec!["clash proxies".into()],
+        ..Default::default()
+    };
+    for (index, p) in proxies.iter().enumerate() {
         if let Some(prof) = proxy_from_yaml(p) {
-            out.push(prof);
+            report.profiles.push(prof);
+        } else {
+            report.skipped += 1;
+            report.errors.push(format!("Clash proxy {} has invalid or missing fields (server and port 1–65535 are required)", index + 1));
         }
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    Some(report)
 }
 
 fn proxy_from_yaml(v: &serde_yaml::Value) -> Option<ImportedProfile> {
@@ -38,12 +40,8 @@ fn proxy_from_yaml(v: &serde_yaml::Value) -> Option<ImportedProfile> {
         .unwrap_or("")
         .to_string();
     let port = get("port")
-        .and_then(|v| {
-            v.as_u64()
-                .or_else(|| v.as_i64().map(|n| n as u64))
-                .or_else(|| v.as_str()?.parse().ok())
-        })
-        .unwrap_or(0) as u16;
+        .and_then(|v| v.as_u64().or_else(|| v.as_str()?.trim().parse().ok()))
+        .and_then(|n| u16::try_from(n).ok())?;
     if server.is_empty() || port == 0 {
         return None;
     }
@@ -182,7 +180,7 @@ proxies:
     network: ws
     servername: a.example
 "#;
-        let list = try_import_clash(yaml).unwrap();
+        let list = try_import_clash(yaml).unwrap().profiles;
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].profile_type, ProfileType::Shadowsocks);
         assert_eq!(list[1].profile_type, ProfileType::Vless);

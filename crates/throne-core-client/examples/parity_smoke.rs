@@ -117,6 +117,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     core.check_config_json(&built.core_config_json)?;
     println!("PASS: generated SOCKS config with native API service validates");
     check_websocket_endpoints(&mut core, &settings)?;
+    check_beta2_imports(&mut core)?;
+    check_beta3_contracts(&mut core)?;
 
     let session = format!("parity-smoke-{}", std::process::id());
     let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -169,5 +171,116 @@ fn main() -> Result<(), Box<dyn Error>> {
     assert_eq!(parsed.cidrs, ["192.0.2.0/24", "2001:db8::/32"]);
     println!("PASS: native rule-set parser returns IPv4 and IPv6 CIDRs");
     core.shutdown()?;
+    Ok(())
+}
+
+fn check_beta2_imports(core: &mut CoreSession) -> Result<(), Box<dyn Error>> {
+    let key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+    let links = [
+        "trojan://password@edge.example:443?ech=public.example+https://1.1.1.1/dns-query".to_string(),
+        format!("awg://{key}@192.0.2.1:51820?public_key={key}&address=10.0.0.2/32&workers=2&jc=4&jmin=50&jmax=100&h1=1234"),
+        "vless://11111111-1111-1111-1111-111111111111@edge.example:443?security=TLS&type=xhttp&sni=identity.example&ech=public.example%2Bhttps%3A%2F%2F1.1.1.1%2Fdns-query&extra=%7B%22noGRPCHeader%22%3Atrue%7D".into(),
+    ];
+    for link in links {
+        let report = throne_import::import_text(&link);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let imported = report
+            .profiles
+            .into_iter()
+            .next()
+            .ok_or("no imported profile")?;
+        let mut profile = Profile::new(3, 1, "beta2 smoke", imported.profile_type);
+        profile.outbound_json = imported.outbound.to_db_json(imported.profile_type);
+        profile.outbound = imported.outbound;
+        let settings = AppSettings {
+            tun_mode_enabled: true,
+            fake_dns: true,
+            ..Default::default()
+        };
+        let built = build_load_config(&profile, &settings, None)?;
+        core.check_config_json(&built.core_config_json)?;
+        for xray in &built.xray_full_configs {
+            core.check_xray_config_json(xray)?;
+        }
+    }
+    println!("PASS: imported ECH, Amnezia endpoint, XHTTP/Xray, and IPv6 FakeIP configs validate in the rebuilt core");
+    Ok(())
+}
+
+fn check_beta3_contracts(core: &mut CoreSession) -> Result<(), Box<dyn Error>> {
+    use serde_json::json;
+    use throne_core_client::{build_load_config_ex, AutoSelectorBuild};
+    use throne_domain::{AppState, RouteProfile, RouteRule};
+    let mut state = AppState::empty();
+    let a = state.add_group("first");
+    let b = state.add_group("second");
+    for gid in [a, b] {
+        let id = state.add_profile(gid, "member", ProfileType::Socks);
+        state.update_profile_outbound_json(
+            id,
+            json!({"type":"socks","server":"127.0.0.1","server_port":1080}).to_string(),
+        )?;
+    }
+    let selector = state.add_auto_selector(a, a, "two groups")?;
+    state.update_profile_outbound_json(
+        selector,
+        json!({"type":"autoselector","gids":[a,b]}).to_string(),
+    )?;
+    let (config, _, members) = state.resolve_auto_selector_members(selector)?;
+    assert_eq!(members.len(), 2);
+    let auto = AutoSelectorBuild { config, members };
+    let mut route = RouteProfile::new(1, "fragment");
+    route.rules.push(RouteRule {
+        action: "route-options".into(),
+        domain: vec!["example.com".into()],
+        tls_fragment: true,
+        tls_fragment_fallback_delay: "500ms".into(),
+        ..Default::default()
+    });
+    let built = build_load_config_ex(
+        state.profile(selector).unwrap(),
+        &AppSettings::default(),
+        Some(&route),
+        Some(&auto),
+    )?;
+    core.check_config_json(&built.core_config_json)?;
+    let mut invalid: serde_json::Value = serde_json::from_str(&built.core_config_json)?;
+    let rule = invalid["route"]["rules"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|r| r["action"] == "route-options")
+        .unwrap();
+    rule["tls_record_fragment"] = json!(true);
+    assert!(
+        matches!(
+            core.check_config_json(&invalid.to_string()),
+            Err(CoreError::Config(_))
+        ),
+        "route-options cannot enable both fragment modes"
+    );
+    println!("PASS: multi-group selector and route-options TLS fragmentation validate; conflicting modes rejected");
+    for link in [
+        "vless://11111111-1111-1111-1111-111111111111@edge.example:443?security=reality&fp=unsafe&pbk=AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE&sni=identity.example",
+        "vless://11111111-1111-1111-1111-111111111111@edge.example:443?security=tls&fp=unsafe&cs=BOGUS,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    ] {
+        let report = throne_import::import_text(link);
+        assert!(report.errors.is_empty());
+        let imported = report.profiles.into_iter().next().ok_or("missing beta3 import")?;
+        let mut p = Profile::new(10, 1, "beta3 TLS", imported.profile_type);
+        p.outbound_json = imported.outbound.to_db_json(imported.profile_type);
+        p.outbound = imported.outbound;
+        let built = build_load_config(&p, &AppSettings::default(), None)?;
+        core.check_config_json(&built.core_config_json)?;
+    }
+    println!("PASS: native REALITY unsafe fallback and filtered TLS cipher suites validate");
+    let _capabilities = core.core_privileges()?;
+    let packets = core.generate_quic_signature("example.com")?;
+    assert!((1..=5).contains(&packets.len()));
+    assert!(packets.iter().all(|p| !p.is_empty()));
+    assert!(core.generate_quic_signature("127.0.0.1").is_err());
+    println!(
+        "PASS: privilege capabilities and offline QUIC signature RPCs respond; IP input rejected"
+    );
     Ok(())
 }

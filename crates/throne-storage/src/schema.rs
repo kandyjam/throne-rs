@@ -152,6 +152,13 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), StorageError> {
     )?;
     add_column_if_missing(conn, "profiles", "latency_at", "INTEGER NOT NULL DEFAULT 0")?;
     add_column_if_missing(conn, "groups", "type_sort_by", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "groups", "sort_method", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(
+        conn,
+        "groups",
+        "sort_descending",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     add_column_if_missing(
         conn,
         "groups",
@@ -211,6 +218,19 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), StorageError> {
         "route_profiles",
         "inner_hop_endpoint_ids",
         "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    add_column_if_missing(
+        conn,
+        "route_rules",
+        "tls_fragment",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(conn, "route_rules", "tls_fragment_fallback_delay", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "route_rules",
+        "tls_record_fragment",
+        "INTEGER NOT NULL DEFAULT 0",
     )?;
     add_column_if_missing(conn, "route_rules", "wifi_ssid_json", "TEXT")?;
     add_column_if_missing(conn, "route_rules", "wifi_bssid_json", "TEXT")?;

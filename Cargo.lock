@@ -7251,7 +7251,7 @@ dependencies = [
 
 [[package]]
 name = "throne"
-version = "1.4.0-beta.1"
+version = "1.4.0-beta.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7276,20 +7276,22 @@ dependencies = [
 
 [[package]]
 name = "throne-core-client"
-version = "1.4.0-beta.1"
+version = "1.4.0-beta.3"
 dependencies = [
  "anyhow",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "throne-domain",
+ "throne-import",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
 name = "throne-domain"
-version = "1.4.0-beta.1"
+version = "1.4.0-beta.3"
 dependencies = [
  "chrono",
  "serde",
@@ -7301,7 +7303,7 @@ dependencies = [
 
 [[package]]
 name = "throne-import"
-version = "1.4.0-beta.1"
+version = "1.4.0-beta.3"
 dependencies = [
  "base64 0.23.1",
  "flate2",
@@ -7317,7 +7319,7 @@ dependencies = [
 
 [[package]]
 name = "throne-storage"
-version = "1.4.0-beta.1"
+version = "1.4.0-beta.3"
 dependencies = [
  "dirs 7.0.0",
  "rusqlite",

@@ -229,7 +229,15 @@ pub fn connection_row(
             display_protocol(&c.network, &c.protocol),
             fg,
         ))
-        .child(col_fixed(COL_OUT, c.outbound.clone(), fg))
+        .child(col_fixed(
+            COL_OUT,
+            if c.outbound_name.is_empty() {
+                c.outbound.clone()
+            } else {
+                c.outbound_name.clone()
+            },
+            fg,
+        ))
         .child(col_fixed(
             COL_TRAFFIC,
             display_traffic(c.upload, c.download),

@@ -164,6 +164,7 @@ pub enum Dialog {
         name: String,
         /// Read-only type label shown in the dialog.
         type_label: String,
+        selector_groups: Option<Vec<GroupId>>,
     },
     ConfirmDeleteUnavailable {
         group_id: GroupId,
@@ -297,14 +298,18 @@ impl Dialog {
             id,
             name: p.name.clone(),
             type_label: p.profile_type.as_str().to_string(),
+            selector_groups: throne_domain::profile_auto_selector(p).map(|cfg| cfg.gids),
         })
     }
 }
 
-/// Edit-profile body: rename only (outbound JSON editing stays future work).
+/// Edit profile name and ordered Auto Selector group membership.
 pub fn edit_profile_body(
     name_input: &Entity<InputState>,
     type_label: &str,
+    groups: &[(GroupId, String, bool)],
+    is_selector: bool,
+    on_group_toggle: impl Fn(GroupId, &mut Window, &mut App) + Clone + 'static,
     on_save: impl Fn(&mut Window, &mut App) + 'static,
     on_cancel: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
@@ -315,6 +320,28 @@ pub fn edit_profile_body(
             "Type: {type_label} · edit name below"
         )))
         .child(div().mb_3().child(input_field_row("Name", name_input, 80.)))
+        .when(is_selector, |body| {
+            let mut list = div()
+                .id("selector-groups")
+                .max_h(px(240.))
+                .overflow_y_scroll()
+                .flex()
+                .flex_col();
+            for (id, label, selected) in groups {
+                let id = *id;
+                let callback = on_group_toggle.clone();
+                list = list.child(settings_switch_row(
+                    format!("selector-group-{id}"),
+                    label.clone(),
+                    *selected,
+                    move |_, w, cx| callback(id, w, cx),
+                ));
+            }
+            body.child(section_hint(
+                "Tracked groups · selection order is preserved",
+            ))
+            .child(list)
+        })
         .child(dialog_actions(
             "ep-cancel",
             "Cancel",
@@ -353,6 +380,9 @@ pub fn basic_settings_body(
     remote_dns: &Entity<InputState>,
     direct_dns: &Entity<InputState>,
     log_level: &Entity<InputState>,
+    log_font_family: &Entity<InputState>,
+    log_font_size: &Entity<InputState>,
+    max_log_line: &Entity<InputState>,
     user_agent: &Entity<InputState>,
     sub_custom_hwid: &Entity<InputState>,
     sub_auto_minutes: &Entity<InputState>,
@@ -420,6 +450,9 @@ pub fn basic_settings_body(
                 .child(form_input_row("Remote DNS", remote_dns))
                 .child(form_input_row("Direct DNS", direct_dns))
                 .child(form_input_row("Log level", log_level))
+                .child(form_input_row("Log font family", log_font_family))
+                .child(form_input_row("Log font size (0 = default)", log_font_size))
+                .child(form_input_row("Maximum log lines", max_log_line))
                 .child(form_row(
                     "Rule-set mirror",
                     secondary_btn("bs-mirror", ruleset_mirror.label(), move |_, w, cx| {

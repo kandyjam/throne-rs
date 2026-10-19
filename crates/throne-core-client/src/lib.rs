@@ -24,7 +24,7 @@ pub use privilege::{
     PrivilegeOutcome,
 };
 pub use proto_wire::{
-    AutoSelectorGroupStatus, AutoSelectorMemberStatus, ConnectionRow, IpTestResult,
+    AutoSelectorGroupStatus, AutoSelectorMemberStatus, ConnectionRow, CorePrivileges, IpTestResult,
     SpeedTestResult, UrlTestResult,
 };
 pub use rule_set_list::{lookup_rule_set_url, RULE_SET_LIST};
@@ -228,6 +228,7 @@ pub struct CoreSession {
     next_id: AtomicU32,
     connected: bool,
     running_profile: Option<ProfileId>,
+    outbound_names: std::collections::HashMap<String, String>,
     /// Lines from ThroneCore stdout/stderr (inbound/outbound connection logs, etc.).
     /// Reader threads push; UI drains via [`Self::take_core_logs`].
     core_log_buf: Arc<Mutex<VecDeque<String>>>,
@@ -246,6 +247,7 @@ impl CoreSession {
             next_id: AtomicU32::new(1),
             connected: false,
             running_profile: None,
+            outbound_names: Default::default(),
             core_log_buf: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
@@ -439,12 +441,21 @@ impl CoreSession {
     /// Ask the bundled core to validate sing-box JSON without starting it.
     /// This never applies a system proxy, creates a TUN, or changes system DNS.
     pub fn check_config_json(&mut self, config: &str) -> Result<(), CoreError> {
+        self.check_config_kind(config, false)
+    }
+
+    /// Validate an Xray config without starting a sidecar or changing network settings.
+    pub fn check_xray_config_json(&mut self, config: &str) -> Result<(), CoreError> {
+        self.check_config_kind(config, true)
+    }
+
+    fn check_config_kind(&mut self, config: &str, xray: bool) -> Result<(), CoreError> {
         self.ensure_connected()?;
         let payload = proto_wire::encode_load_config_req_ex(
-            config,
+            if xray { "" } else { config },
             false,
-            false,
-            "",
+            xray,
+            if xray { config } else { "" },
             "",
             &proto_wire::LoadConfigExtras::default(),
         );
@@ -555,6 +566,7 @@ impl CoreSession {
         }
 
         self.running_profile = Some(profile.id);
+        self.outbound_names = connection_outbound_names(profile, auto_selector);
 
         if apply_system_proxy || settings.system_proxy_enabled {
             let host = if settings.inbound_address.trim().is_empty() {
@@ -593,6 +605,35 @@ impl CoreSession {
             return self.config.binary_path.clone();
         }
         resolve_core_binary()
+    }
+
+    /// Report target-core TUN and Kill Switch capabilities without conflating them.
+    pub fn core_privileges(&mut self) -> Result<CorePrivileges, CoreError> {
+        self.ensure_connected()?;
+        let response = self.call(
+            "IsPrivileged",
+            &proto_wire::encode_empty_req(),
+            Duration::from_secs(2),
+        )?;
+        proto_wire::decode_core_privileges(&response)
+    }
+
+    /// Generate AmneziaWG I1-I5 packets offline using the core's Chrome QUIC first flight.
+    pub fn generate_quic_signature(&mut self, domain: &str) -> Result<Vec<String>, CoreError> {
+        self.ensure_connected()?;
+        let response = self.call(
+            "GenQuicSignature",
+            &proto_wire::encode_quic_signature_req(domain),
+            Duration::from_secs(8),
+        )?;
+        let (error, packets) = proto_wire::decode_quic_signature_resp(&response)?;
+        if !error.is_empty() {
+            return Err(CoreError::Config(error));
+        }
+        if packets.is_empty() || packets.len() > 5 {
+            return Err(CoreError::Rpc("invalid QUIC signature packet count".into()));
+        }
+        Ok(packets)
     }
 
     /// Upstream `Configs::IsAdmin` — live core `IsPrivileged` (euid == 0).
@@ -849,7 +890,15 @@ impl CoreSession {
             &proto_wire::encode_empty_req(),
             Duration::from_secs(5),
         )?;
-        let (active, _closed) = proto_wire::decode_query_connections_resp(&resp)?;
+        let (mut active, _closed) = proto_wire::decode_query_connections_resp(&resp)?;
+        for row in &mut active {
+            row.outbound_name = self
+                .outbound_names
+                .get(&row.outbound)
+                .cloned()
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| row.outbound.clone());
+        }
         Ok(active)
     }
 
@@ -1859,4 +1908,20 @@ mod tests {
         assert!(source.contains("url_test_profiles_with_progress"));
         assert!(source.contains("on_progress"));
     }
+}
+
+/// Snapshot only tags actually emitted by this start, so later edits cannot relabel live traffic.
+fn connection_outbound_names(
+    profile: &Profile,
+    auto: Option<&AutoSelectorBuild>,
+) -> std::collections::HashMap<String, String> {
+    let mut names = std::collections::HashMap::from([("proxy".into(), profile.name.clone())]);
+    if let Some(auto) = auto {
+        names.extend(
+            auto.members
+                .iter()
+                .map(|p| (format!("p{}", p.id), p.name.clone())),
+        );
+    }
+    names
 }

@@ -10,6 +10,8 @@ mod fetch;
 mod json_sub;
 mod links;
 mod route_share;
+mod tls;
+mod wireguard;
 
 use throne_domain::{ParsedOutbound, ProfileType, RouteProfile};
 
@@ -142,7 +144,15 @@ pub fn import_text(input: &str) -> ImportReport {
     import_text_inner(trimmed)
 }
 
-fn import_text_inner(trimmed: &str) -> ImportReport {
+fn import_text_inner(text: &str) -> ImportReport {
+    let mut report = import_text_inner_unchecked(text);
+    for profile in &report.profiles {
+        report.notes.extend(tls::import_notes(profile));
+    }
+    report
+}
+
+fn import_text_inner_unchecked(trimmed: &str) -> ImportReport {
     // JSON (sing-box / xray / SIP008 / custom)
     if let Some(list) = json_sub::try_import_json(trimmed) {
         return ImportReport {
@@ -153,12 +163,8 @@ fn import_text_inner(trimmed: &str) -> ImportReport {
     }
 
     // Clash YAML
-    if let Some(list) = clash::try_import_clash(trimmed) {
-        return ImportReport {
-            profiles: list,
-            notes: vec!["clash proxies".into()],
-            ..Default::default()
-        };
+    if let Some(report) = clash::try_import_clash(trimmed) {
+        return report;
     }
 
     // Amnezia vpn:// container (1.3.0-beta.2)
@@ -279,14 +285,36 @@ pub(crate) fn parse_wireguard_file(text: &str) -> Option<ImportedProfile> {
     let mut public_key = None;
     let mut endpoint = None;
     let mut preshared = None;
+    let mut options = Vec::new();
+    let mut peer_options = Vec::new();
+    let mut in_peer = false;
     for line in text.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
+        if line.eq_ignore_ascii_case("[Peer]") {
+            // Preserve the existing single-peer fallback, taking a coherent last
+            // peer instead of inheriting keys or optional fields from earlier peers.
+            in_peer = true;
+            public_key = None;
+            endpoint = None;
+            preshared = None;
+            peer_options.clear();
+            continue;
+        }
+        if line.eq_ignore_ascii_case("[Interface]") {
+            in_peer = false;
+        }
+        if line.is_empty() || line.starts_with(['#', ';', '[']) {
             continue;
         }
         let Some((k, v)) = line.split_once('=') else {
             continue;
         };
+        let option = (k.trim().to_string(), v.trim().to_string());
+        if in_peer {
+            peer_options.push(option);
+        } else {
+            options.push(option);
+        }
         let k = k.trim().to_ascii_lowercase().replace('_', "");
         let v = v.trim().to_string();
         match k.as_str() {
@@ -308,7 +336,7 @@ pub(crate) fn parse_wireguard_file(text: &str) -> Option<ImportedProfile> {
     };
     let private_key = private_key.filter(|s| !s.is_empty())?;
     let public_key = public_key.filter(|s| !s.is_empty())?;
-    let name = "WireGuard".to_string();
+    let name = wireguard_name(text).unwrap_or_else(|| "WireGuard".to_string());
     let outbound = ParsedOutbound {
         tag: Some(name.clone()),
         server: Some(host),
@@ -320,16 +348,104 @@ pub(crate) fn parse_wireguard_file(text: &str) -> Option<ImportedProfile> {
         raw_json: Some(text.to_string()),
         ..Default::default()
     };
-    Some(ImportedProfile {
+    let mut profile = ImportedProfile {
         name,
         profile_type: ProfileType::Wireguard,
         outbound,
         source: "wg-conf".into(),
-    })
+    };
+    options.extend(peer_options);
+    wireguard::apply_options(&mut profile, &options);
+    Some(profile)
+}
+
+fn wireguard_name(text: &str) -> Option<String> {
+    let mut explicit = None;
+    let mut peer = None;
+    let mut previous = None;
+    for line in text.lines().map(str::trim) {
+        if !line.starts_with(['#', ';']) {
+            if line.eq_ignore_ascii_case("[Peer]") {
+                peer = previous.take();
+            }
+            previous = None;
+            continue;
+        }
+        let comment = line
+            .trim_start_matches(|c: char| c == '#' || c == ';' || c.is_whitespace())
+            .trim();
+        if let Some((key, value)) = comment.split_once([':', '=']) {
+            if explicit.is_none()
+                && matches!(
+                    key.trim().to_ascii_lowercase().as_str(),
+                    "name" | "remark" | "remarks"
+                )
+                && !value.trim().is_empty()
+            {
+                explicit = Some(value.trim().to_string());
+            }
+        }
+        let directive = comment.split_once('=').is_some_and(|(key, _)| {
+            let key = key.trim();
+            !key.is_empty() && key.chars().all(|c| c.is_alphanumeric() || c == '_')
+        });
+        let meaningful = comment.chars().any(char::is_alphanumeric)
+            && comment
+                .split(|c: char| c.is_whitespace() || matches!(c, '_' | '-' | '.' | ':'))
+                .map(|s| s.trim_end_matches(|c: char| c.is_numeric()).to_lowercase())
+                .any(|s| {
+                    !s.is_empty()
+                        && !matches!(
+                            s.as_str(),
+                            "peer"
+                                | "server"
+                                | "wireguard"
+                                | "configuration"
+                                | "config"
+                                | "interface"
+                                | "client"
+                                | "wg"
+                        )
+                });
+        previous = (!directive && meaningful).then(|| comment.to_string());
+    }
+    explicit.or(peer)
+}
+
+fn apply_wireguard_override(report: &mut ImportReport, name: &str) {
+    if name.trim().is_empty() {
+        return;
+    }
+    for profile in &mut report.profiles {
+        // An inner link's explicit fragment takes precedence over its wrapper.
+        let inner_name = profile
+            .source
+            .split_once('#')
+            .map(|(_, fragment)| percent_decode_bytes(fragment));
+        if profile.profile_type != ProfileType::Wireguard
+            || inner_name.is_some_and(|s| !s.trim().is_empty())
+        {
+            continue;
+        }
+        profile.name = name.trim().to_string();
+        profile.outbound.tag = Some(profile.name.clone());
+        if let Some(raw) = &profile.outbound.raw_json {
+            if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw) {
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("tag".into(), serde_json::json!(profile.name));
+                    profile.outbound.raw_json = Some(value.to_string());
+                }
+            }
+        }
+    }
 }
 
 /// Amnezia `vpn://` payload: percent-decode + base64, then JSON containers or a conf body.
 fn import_vpn_scheme(link: &str) -> ImportReport {
+    let fragment_name = link
+        .split_once('#')
+        .map(|(_, s)| percent_decode_bytes(s))
+        .unwrap_or_default();
     let after = link
         .trim()
         .get(6..)
@@ -350,7 +466,7 @@ fn import_vpn_scheme(link: &str) -> ImportReport {
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
         let mut report = ImportReport::default();
         report.notes.push("vpn://".into());
-        collect_vpn_containers(&v, &mut report);
+        collect_vpn_containers(&v, &fragment_name, &mut report);
         if report.profiles.is_empty() && report.errors.is_empty() {
             report.errors.push("vpn:// JSON had no configs".into());
         }
@@ -358,6 +474,7 @@ fn import_vpn_scheme(link: &str) -> ImportReport {
     }
     let text = String::from_utf8_lossy(&bytes).into_owned();
     let mut report = import_text_inner(text.trim());
+    apply_wireguard_override(&mut report, &fragment_name);
     report.notes.insert(0, "vpn://".into());
     report
 }
@@ -386,10 +503,21 @@ fn percent_decode_bytes(s: &str) -> String {
         .unwrap_or_else(|_| s.to_string())
 }
 
-fn collect_vpn_containers(v: &serde_json::Value, report: &mut ImportReport) {
+fn collect_vpn_containers(v: &serde_json::Value, fragment_name: &str, report: &mut ImportReport) {
     let Some(containers) = v.get("containers").and_then(|c| c.as_array()) else {
         return;
     };
+    let target_name = [
+        Some(fragment_name),
+        v.get("description").and_then(|v| v.as_str()),
+        v.get("name").and_then(|v| v.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|s| !s.is_empty())
+    .unwrap_or("");
+    let mut entries = Vec::new();
     for c in containers {
         let Some(obj) = c.as_object() else { continue };
         for proto in obj.values() {
@@ -401,11 +529,27 @@ fn collect_vpn_containers(v: &serde_json::Value, report: &mut ImportReport) {
             if conf.is_empty() {
                 continue;
             }
-            let inner = import_text_inner(conf);
-            report.profiles.extend(inner.profiles);
-            report.errors.extend(inner.errors);
-            report.skipped += inner.skipped;
+            let is_wg = conf.contains("[Interface]") && conf.contains("[Peer]");
+            let container = c
+                .get("container")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            entries.push((conf.to_string(), container, is_wg));
         }
+    }
+    let wg_count = entries.iter().filter(|(_, _, is_wg)| *is_wg).count();
+    for (conf, container, is_wg) in entries {
+        let name = if is_wg && wg_count > 1 && !target_name.is_empty() && !container.is_empty() {
+            format!("{target_name} ({container})")
+        } else {
+            target_name.to_string()
+        };
+        let mut inner = import_text_inner(&conf);
+        apply_wireguard_override(&mut inner, &name);
+        report.profiles.extend(inner.profiles);
+        report.errors.extend(inner.errors);
+        report.skipped += inner.skipped;
     }
 }
 
@@ -513,8 +657,8 @@ not-a-link
             serde_json::from_str(&r.profiles[0].outbound.to_db_json(ProfileType::Wireguard))
                 .unwrap();
         assert_eq!(json["private_key"], "pk");
-        assert_eq!(json["peer_public_key"], "pubk");
-        assert_eq!(json["local_address"][0], "10.0.0.2/32");
+        assert_eq!(json["peers"][0]["public_key"], "pubk");
+        assert_eq!(json["address"][0], "10.0.0.2/32");
 
         let ini = "[Interface]\nPrivateKey = aaa\nAddress = 10.0.0.2/32\n[Peer]\nPublicKey = bbb\nPresharedKey = psk\nEndpoint = example.com:51820\n";
         let r = import_text(ini);
@@ -525,8 +669,8 @@ not-a-link
             serde_json::from_str(&r.profiles[0].outbound.to_db_json(ProfileType::Wireguard))
                 .unwrap();
         assert_eq!(json["private_key"], "aaa");
-        assert_eq!(json["peer_public_key"], "bbb");
-        assert_eq!(json["pre_shared_key"], "psk");
+        assert_eq!(json["peers"][0]["public_key"], "bbb");
+        assert_eq!(json["peers"][0]["pre_shared_key"], "psk");
     }
 
     #[test]

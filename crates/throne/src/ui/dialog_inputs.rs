@@ -9,7 +9,7 @@ use gpui_component::input::{CompletionProvider, EditorState, InputState, Textare
 
 use std::rc::Rc;
 
-use crate::ui::route_completion::{dns_rule_completion_provider, simple_rule_completion_provider};
+use crate::ui::route_completion::simple_rule_completion_provider;
 use throne_domain::{AppSettings, AppState};
 
 /// Active dialog text fields backed by gpui-component Input.
@@ -22,6 +22,9 @@ pub enum DialogInputs {
         remote_dns: Entity<InputState>,
         direct_dns: Entity<InputState>,
         log_level: Entity<InputState>,
+        log_font_family: Entity<InputState>,
+        log_font_size: Entity<InputState>,
+        max_log_line: Entity<InputState>,
         user_agent: Entity<InputState>,
         sub_custom_hwid: Entity<InputState>,
         sub_auto_minutes: Entity<InputState>,
@@ -42,7 +45,7 @@ pub enum DialogInputs {
         name: Entity<InputState>,
         url: Entity<InputState>,
     },
-    /// Main Routing tabs (DNS / Warp / Hijack) + optional nested editor Inputs.
+    /// Main Routing tabs (DNS / Warp) + optional nested editor Inputs.
     Routing(RoutingInputs),
 }
 
@@ -76,6 +79,7 @@ pub struct RouteEditorInputs {
     /// Advanced tab — bound to the currently selected rule (empty when none).
     pub rule_name: Entity<InputState>,
     pub rule_protocol: Entity<InputState>,
+    pub rule_fragment_delay: Entity<InputState>,
     pub rule_domain: Entity<TextareaState>,
     pub rule_suffix: Entity<TextareaState>,
     pub rule_ip: Entity<TextareaState>,
@@ -121,6 +125,7 @@ impl NestedInputs {
             ),
             rule_name: single_line(window, cx, String::new(), "Rule name"),
             rule_protocol: single_line(window, cx, String::new(), "tcp / udp / …"),
+            rule_fragment_delay: single_line(window, cx, String::new(), "500ms"),
             rule_domain: multi_line(window, cx, String::new(), "one domain per line", 3),
             rule_suffix: multi_line(window, cx, String::new(), "one suffix per line", 3),
             rule_ip: multi_line(window, cx, String::new(), "one CIDR per line", 3),
@@ -181,12 +186,6 @@ pub struct RoutingInputs {
     pub local_override: Entity<InputState>,
     pub cache_cap: Entity<InputState>,
     pub dns_object: Entity<TextareaState>,
-    pub dns_v4: Entity<InputState>,
-    pub dns_v6: Entity<InputState>,
-    pub dns_port: Entity<InputState>,
-    pub redirect_addr: Entity<InputState>,
-    pub redirect_port: Entity<InputState>,
-    pub dns_rules: Entity<EditorState>,
     pub warp_ep: Entity<InputState>,
     pub warp_priv: Entity<InputState>,
     pub warp_pub: Entity<InputState>,
@@ -202,7 +201,6 @@ impl RoutingInputs {
         cx: &mut Context<V>,
         s: &AppSettings,
     ) -> Self {
-        let dns_rules = s.dns_server_rules.join("\n");
         Self {
             remote_dns: single_line(window, cx, s.remote_dns.clone(), "tls://8.8.8.8"),
             direct_dns: single_line(window, cx, s.direct_dns.clone(), "localhost"),
@@ -214,22 +212,6 @@ impl RoutingInputs {
             ),
             cache_cap: single_line(window, cx, s.dns_cache_capacity.to_string(), "65536"),
             dns_object: multi_line(window, cx, s.dns_object.clone(), "sing-box dns JSON…", 6),
-            dns_v4: single_line(window, cx, s.dns_v4_resp.clone(), "IPv4 response"),
-            dns_v6: single_line(window, cx, s.dns_v6_resp.clone(), "IPv6 response"),
-            dns_port: single_line(window, cx, s.dns_server_listen_port.to_string(), "Port"),
-            redirect_addr: single_line(
-                window,
-                cx,
-                s.redirect_listen_address.clone(),
-                "Listen address",
-            ),
-            redirect_port: single_line(window, cx, s.redirect_listen_port.to_string(), "Port"),
-            dns_rules: editor_dns_rules(
-                window,
-                cx,
-                dns_rules,
-                "domain: / suffix: / regex: / ruleset:",
-            ),
             warp_ep: single_line(window, cx, s.warp_ep.clone(), "Endpoint"),
             warp_priv: single_line(window, cx, s.warp_private_key.clone(), "Private key"),
             warp_pub: single_line(window, cx, s.warp_public_key.clone(), "Public key"),
@@ -256,21 +238,6 @@ impl RoutingInputs {
             .parse()
             .unwrap_or(s.dns_cache_capacity);
         s.dns_object = DialogInputs::read_string(&self.dns_object, cx);
-        s.dns_v4_resp = DialogInputs::read_string(&self.dns_v4, cx);
-        s.dns_v6_resp = DialogInputs::read_string(&self.dns_v6, cx);
-        s.dns_server_listen_port = DialogInputs::read_string(&self.dns_port, cx)
-            .parse()
-            .unwrap_or(s.dns_server_listen_port);
-        s.redirect_listen_address = DialogInputs::read_string(&self.redirect_addr, cx);
-        s.redirect_listen_port = DialogInputs::read_string(&self.redirect_port, cx)
-            .parse()
-            .unwrap_or(s.redirect_listen_port);
-        let rules = DialogInputs::read_string(&self.dns_rules, cx);
-        s.dns_server_rules = rules
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect();
         s.warp_ep = DialogInputs::read_string(&self.warp_ep, cx);
         s.warp_private_key = DialogInputs::read_string(&self.warp_priv, cx);
         s.warp_public_key = DialogInputs::read_string(&self.warp_pub, cx);
@@ -351,22 +318,6 @@ fn editor_simple_rules<V: 'static>(
     )
 }
 
-/// Multi-line editor with DNS-rules autocomplete (domain/suffix/regex/ruleset).
-fn editor_dns_rules<V: 'static>(
-    window: &mut Window,
-    cx: &mut Context<V>,
-    value: impl Into<String>,
-    placeholder: &'static str,
-) -> Entity<EditorState> {
-    editor_with_completion(
-        window,
-        cx,
-        value,
-        placeholder,
-        dns_rule_completion_provider(),
-    )
-}
-
 impl DialogInputs {
     pub fn basic<V: 'static>(window: &mut Window, cx: &mut Context<V>, state: &AppState) -> Self {
         let s = state.settings();
@@ -377,6 +328,19 @@ impl DialogInputs {
             remote_dns: single_line(window, cx, s.remote_dns.clone(), "Remote DNS"),
             direct_dns: single_line(window, cx, s.direct_dns.clone(), "Direct DNS"),
             log_level: single_line(window, cx, s.log_level.clone(), "Log level"),
+            log_font_family: single_line(
+                window,
+                cx,
+                s.log_font_family.clone(),
+                "Default monospace",
+            ),
+            log_font_size: single_line(
+                window,
+                cx,
+                s.log_font_size.to_string(),
+                "0 = default; 8–32",
+            ),
+            max_log_line: single_line(window, cx, s.max_log_line.to_string(), "500"),
             user_agent: single_line(
                 window,
                 cx,

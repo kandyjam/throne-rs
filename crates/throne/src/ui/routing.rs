@@ -16,9 +16,9 @@ use throne_domain::{
 use crate::theme::Theme;
 use crate::ui::dialog_inputs::{NestedInputs, RoutingInputs};
 use crate::ui::widgets::{
-    editor_area, editor_area_tall, focus_field, focus_text_area, group_panel, input_area,
-    input_area_tall, input_field_row, input_inline, mode_switch, notice_banner, primary_btn,
-    secondary_btn, section_hint, tab_bar,
+    editor_area_tall, focus_field, focus_text_area, group_panel, input_area, input_area_tall,
+    input_field_row, input_inline, mode_switch, notice_banner, primary_btn, secondary_btn,
+    section_hint, settings_switch_row, tab_bar,
 };
 
 // ── Public draft types ──────────────────────────────────────────────────────
@@ -26,7 +26,6 @@ use crate::ui::widgets::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum RoutingTab {
     Common,
-    Hijack,
     Warp,
     Dns,
     #[default]
@@ -38,7 +37,6 @@ impl RoutingTab {
     pub fn label(self) -> &'static str {
         match self {
             Self::Common => "Common",
-            Self::Hijack => "Hijack",
             Self::Warp => "Warp",
             Self::Dns => "DNS",
             Self::Route => "Route",
@@ -55,12 +53,6 @@ pub enum RtFocus {
     LocalOverride,
     CacheCap,
     DnsObject,
-    DnsRules,
-    DnsV4,
-    DnsV6,
-    DnsPort,
-    RedirectAddr,
-    RedirectPort,
     WarpEp,
     WarpPriv,
     WarpPub,
@@ -232,35 +224,6 @@ impl RoutingDraft {
         self.routes.get(self.selected_idx)
     }
 
-    pub fn validate_dns_rules(raw: &str) -> bool {
-        for rule in raw.lines() {
-            let t = rule.trim();
-            if t.is_empty() {
-                continue;
-            }
-            if !(t.starts_with("ruleset:")
-                || t.starts_with("domain:")
-                || t.starts_with("suffix:")
-                || t.starts_with("regex:"))
-            {
-                return false;
-            }
-        }
-        true
-    }
-
-    pub fn dns_rules_text(&self) -> String {
-        self.settings.dns_server_rules.join("\n")
-    }
-
-    pub fn set_dns_rules_from_text(&mut self, text: &str) {
-        self.settings.dns_server_rules = text
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect();
-    }
-
     /// Apply keystroke into the focused field. `text` is the typed string
     /// (from GPUI `key_char` or a single-key fallback). Returns true if handled.
     pub fn handle_key(&mut self, text: Option<&str>, is_back: bool) -> bool {
@@ -320,7 +283,6 @@ impl RoutingDraft {
             self.focus = match self.tab {
                 RoutingTab::Dns => RtFocus::RemoteDns,
                 RoutingTab::Warp => RtFocus::WarpEp,
-                RoutingTab::Hijack => RtFocus::DnsPort,
                 RoutingTab::Common | RoutingTab::Route => RtFocus::None,
             };
             if self.focus == RtFocus::None {
@@ -337,15 +299,6 @@ impl RoutingDraft {
                 return edit_i32_field(&mut s.dns_cache_capacity, text, is_back);
             }
             RtFocus::DnsObject => Some((&mut s.dns_object, true)),
-            RtFocus::DnsV4 => Some((&mut s.dns_v4_resp, false)),
-            RtFocus::DnsV6 => Some((&mut s.dns_v6_resp, false)),
-            RtFocus::DnsPort => {
-                return edit_i32_field(&mut s.dns_server_listen_port, text, is_back);
-            }
-            RtFocus::RedirectAddr => Some((&mut s.redirect_listen_address, false)),
-            RtFocus::RedirectPort => {
-                return edit_i32_field(&mut s.redirect_listen_port, text, is_back);
-            }
             RtFocus::WarpEp => Some((&mut s.warp_ep, false)),
             RtFocus::WarpPriv => Some((&mut s.warp_private_key, false)),
             RtFocus::WarpPub => Some((&mut s.warp_public_key, false)),
@@ -359,12 +312,6 @@ impl RoutingDraft {
                 let mut joined = s.warp_reserved.join(",");
                 edit_str(&mut joined, text, is_back, false);
                 s.warp_reserved = split_csv(&joined);
-                return true;
-            }
-            RtFocus::DnsRules => {
-                let mut t = self.dns_rules_text();
-                edit_str(&mut t, text, is_back, true);
-                self.set_dns_rules_from_text(&t);
                 return true;
             }
             RtFocus::None => None,
@@ -653,6 +600,7 @@ pub enum RoutingEvent {
     ReSelectRule(usize),
     ReCycleDefOut,
     ReCycleRuleOut,
+    ReToggleFragment(bool),
     ReToggle(&'static str),
 }
 
@@ -683,7 +631,6 @@ fn build_main(
 
     let content = match draft.tab {
         RoutingTab::Common => tab_common(draft, &on_event).into_any_element(),
-        RoutingTab::Hijack => tab_hijack(draft, inputs, &on_event).into_any_element(),
         RoutingTab::Warp => tab_warp(draft, inputs, &on_event).into_any_element(),
         RoutingTab::Dns => tab_dns(draft, inputs, &on_event).into_any_element(),
         RoutingTab::Route => tab_route(draft, &on_event).into_any_element(),
@@ -845,121 +792,6 @@ fn tab_common(
         ))
         // silence unused
         .when(f == RtFocus::None, |d| d)
-}
-
-fn tab_hijack(
-    draft: &RoutingDraft,
-    inputs: Option<&RoutingInputs>,
-    on_event: &Rc<dyn Fn(RoutingEvent, &mut Window, &mut App)>,
-) -> impl IntoElement {
-    let s = &draft.settings;
-    let f = draft.focus;
-    let enabled = s.enable_dns_server;
-    div()
-        .flex()
-        .flex_col()
-        .child(
-            div()
-                .text_xs()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .mb_2()
-                .child("DNS Server"),
-        )
-        .child(
-            div()
-                .mb_2()
-                .child(mode_switch("rt-dns-en", "Enable", s.enable_dns_server, {
-                    let on = emit(on_event, RoutingEvent::Toggle("dns_server"));
-                    move |_, w, cx| on(w, cx)
-                })),
-        )
-        .child(div().mb_2().child(mode_switch(
-            "rt-dns-lan",
-            "Allow Lan to Connect",
-            s.dns_server_listen_lan,
-            {
-                let on = emit(on_event, RoutingEvent::Toggle("dns_lan"));
-                move |_, w, cx| on(w, cx)
-            },
-        )))
-        .when(enabled, |d| {
-            if let Some(inp) = inputs {
-                d.child(input_field_row("Listen Port", &inp.dns_port, 120.))
-                    .child(input_field_row("IPv4 Response", &inp.dns_v4, 120.))
-                    .child(input_field_row("IPv6 Response", &inp.dns_v6, 120.))
-                    .child(section_hint(
-                        "Rules (domain: / suffix: / regex: / ruleset:)",
-                    ))
-                    .child(div().mb_2().child(editor_area(&inp.dns_rules)))
-            } else {
-                d.child(field_row(
-                    "rt-dns-port",
-                    "Listen Port",
-                    s.dns_server_listen_port.to_string(),
-                    f == RtFocus::DnsPort,
-                    emit(on_event, RoutingEvent::SetFocus(RtFocus::DnsPort)),
-                ))
-                .child(field_row(
-                    "rt-dns-v4",
-                    "IPv4 Response",
-                    s.dns_v4_resp.clone(),
-                    f == RtFocus::DnsV4,
-                    emit(on_event, RoutingEvent::SetFocus(RtFocus::DnsV4)),
-                ))
-                .child(field_row(
-                    "rt-dns-v6",
-                    "IPv6 Response",
-                    s.dns_v6_resp.clone(),
-                    f == RtFocus::DnsV6,
-                    emit(on_event, RoutingEvent::SetFocus(RtFocus::DnsV6)),
-                ))
-                .child(multi_field(
-                    "rt-dns-rules",
-                    "Rules (domain: / suffix: / regex: / ruleset:)",
-                    &draft.dns_rules_text(),
-                    f == RtFocus::DnsRules,
-                    80.,
-                    emit(on_event, RoutingEvent::SetFocus(RtFocus::DnsRules)),
-                ))
-            }
-        })
-        .child(
-            div()
-                .text_xs()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .mt_3()
-                .mb_2()
-                .child("Redirect Settings"),
-        )
-        .child(
-            div()
-                .mb_2()
-                .child(mode_switch("rt-redir-en", "Enable", s.enable_redirect, {
-                    let on = emit(on_event, RoutingEvent::Toggle("redirect"));
-                    move |_, w, cx| on(w, cx)
-                })),
-        )
-        .when(s.enable_redirect, |d| {
-            if let Some(inp) = inputs {
-                d.child(input_field_row("Listen Address", &inp.redirect_addr, 120.))
-                    .child(input_field_row("Listen Port", &inp.redirect_port, 120.))
-            } else {
-                d.child(field_row(
-                    "rt-redir-addr",
-                    "Listen Address",
-                    s.redirect_listen_address.clone(),
-                    f == RtFocus::RedirectAddr,
-                    emit(on_event, RoutingEvent::SetFocus(RtFocus::RedirectAddr)),
-                ))
-                .child(field_row(
-                    "rt-redir-port",
-                    "Listen Port",
-                    s.redirect_listen_port.to_string(),
-                    f == RtFocus::RedirectPort,
-                    emit(on_event, RoutingEvent::SetFocus(RtFocus::RedirectPort)),
-                ))
-            }
-        })
 }
 
 fn tab_warp(
@@ -1926,6 +1758,40 @@ fn route_editor_view(
                                         emit(&on_event, RoutingEvent::ReCycleRuleOut),
                                     )),
                             )
+                            .when(
+                                matches!(r.action.as_str(), "" | "route" | "route-options"),
+                                |body| {
+                                    body.child(settings_switch_row(
+                                        "route-tls-fragment",
+                                        "TLS fragment",
+                                        r.tls_fragment,
+                                        {
+                                            let on = emit(
+                                                &on_event,
+                                                RoutingEvent::ReToggleFragment(false),
+                                            );
+                                            move |_, w, cx| on(w, cx)
+                                        },
+                                    ))
+                                    .child(settings_switch_row(
+                                        "route-tls-record-fragment",
+                                        "TLS record fragment",
+                                        r.tls_record_fragment,
+                                        {
+                                            let on = emit(
+                                                &on_event,
+                                                RoutingEvent::ReToggleFragment(true),
+                                            );
+                                            move |_, w, cx| on(w, cx)
+                                        },
+                                    ))
+                                    .child(input_field_row(
+                                        "Fallback",
+                                        &re.rule_fragment_delay,
+                                        70.,
+                                    ))
+                                },
+                            )
                             .child(input_field_row("Protocol", &re.rule_protocol, 70.))
                             .child(section_hint("domain (one per line)"))
                             .child(div().mb_2().child(input_area_tall(&re.rule_domain, 56.)))
@@ -2077,7 +1943,6 @@ impl RoutingDraft {
                 self.focus = match t {
                     RoutingTab::Dns => RtFocus::RemoteDns,
                     RoutingTab::Warp => RtFocus::WarpEp,
-                    RoutingTab::Hijack => RtFocus::DnsPort,
                     RoutingTab::Common | RoutingTab::Route => RtFocus::None,
                 };
                 RoutingSideEffect::None
@@ -2157,6 +2022,28 @@ impl RoutingDraft {
                 }
                 RoutingSideEffect::None
             }
+            RoutingEvent::ReToggleFragment(record) => {
+                if let RoutingNested::RouteEditor(ed) = &mut self.nested {
+                    if let Some(rule) = ed.selected_rule.and_then(|i| ed.profile.rules.get_mut(i)) {
+                        if record {
+                            rule.tls_record_fragment = !rule.tls_record_fragment;
+                        } else {
+                            rule.tls_fragment = !rule.tls_fragment;
+                        }
+                        if rule.action == "route-options"
+                            && rule.tls_fragment
+                            && rule.tls_record_fragment
+                        {
+                            if record {
+                                rule.tls_fragment = false;
+                            } else {
+                                rule.tls_record_fragment = false;
+                            }
+                        }
+                    }
+                }
+                RoutingSideEffect::None
+            }
             RoutingEvent::ReCycleRuleOut => {
                 if let RoutingNested::RouteEditor(ed) = &mut self.nested {
                     if let Some(i) = ed.selected_rule {
@@ -2198,9 +2085,6 @@ impl RoutingDraft {
     fn toggle(&mut self, name: &str) {
         let s = &mut self.settings;
         match name {
-            "dns_server" => s.enable_dns_server = !s.enable_dns_server,
-            "dns_lan" => s.dns_server_listen_lan = !s.dns_server_listen_lan,
-            "redirect" => s.enable_redirect = !s.enable_redirect,
             "warp" => s.enable_warp = !s.enable_warp,
             "fake_dns" => s.fake_dns = !s.fake_dns,
             "dns_routing" => s.enable_dns_routing = !s.enable_dns_routing,
@@ -2607,6 +2491,25 @@ mod tests {
     fn draft_with_settings() -> RoutingDraft {
         let state = AppState::default();
         RoutingDraft::from_state(&state)
+    }
+
+    #[test]
+    fn retired_hijack_toggles_preserve_legacy_settings() {
+        for enabled in [false, true] {
+            let mut d = draft_with_settings();
+            d.settings.enable_dns_server = enabled;
+            d.settings.dns_server_listen_lan = enabled;
+            d.settings.enable_redirect = enabled;
+            for name in ["dns_server", "dns_lan", "redirect"] {
+                assert!(matches!(
+                    d.apply_event(RoutingEvent::Toggle(name)),
+                    RoutingSideEffect::None
+                ));
+            }
+            assert_eq!(d.settings.enable_dns_server, enabled);
+            assert_eq!(d.settings.dns_server_listen_lan, enabled);
+            assert_eq!(d.settings.enable_redirect, enabled);
+        }
     }
 
     #[test]

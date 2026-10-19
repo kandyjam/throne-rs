@@ -45,7 +45,7 @@ echo "==> generating gen/ from libcore.proto"
     libcore.proto
 )
 
-# Match upstream throneproj/Throne `script/build_go.sh` (tag 1.4.0-beta.1, module root `core/`).
+# Match upstream throneproj/Throne `script/build_go.sh` (tag 1.4.0-beta.3, module root `core/`).
 # Base tags + platform extras. Override with THRONE_CORE_TAGS=...
 if [[ -n "${THRONE_CORE_TAGS:-}" ]]; then
   TAGS="$THRONE_CORE_TAGS"

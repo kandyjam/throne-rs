@@ -30,20 +30,12 @@ const SIMPLE_RULE_PREFIXES: &[&str] = &[
     "ruleset:",
 ];
 
-/// Prefixes for the main Routes → DNS rules editor (upstream is a smaller set).
-const DNS_RULE_PREFIXES: &[&str] = &["domain:", "suffix:", "regex:", "ruleset:"];
-
 const MAX_ITEMS: usize = 60;
 
 /// Completion catalog: type prefixes + every `ruleset:<tag>` from the well-known list.
 fn simple_rule_candidates() -> &'static [String] {
     static C: OnceLock<Vec<String>> = OnceLock::new();
     C.get_or_init(|| build_candidates(SIMPLE_RULE_PREFIXES))
-}
-
-fn dns_rule_candidates() -> &'static [String] {
-    static C: OnceLock<Vec<String>> = OnceLock::new();
-    C.get_or_init(|| build_candidates(DNS_RULE_PREFIXES))
 }
 
 fn build_candidates(prefixes: &[&str]) -> Vec<String> {
@@ -170,13 +162,6 @@ impl CompletionProvider for RuleLineProvider {
 pub fn simple_rule_completion_provider() -> Rc<dyn CompletionProvider> {
     Rc::new(RuleLineProvider {
         candidates: simple_rule_candidates(),
-    })
-}
-
-/// Provider for Routes → DNS rules text area.
-pub fn dns_rule_completion_provider() -> Rc<dyn CompletionProvider> {
-    Rc::new(RuleLineProvider {
-        candidates: dns_rule_candidates(),
     })
 }
 

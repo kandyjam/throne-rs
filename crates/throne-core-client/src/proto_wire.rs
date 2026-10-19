@@ -66,25 +66,76 @@ pub fn encode_load_config_req_ex(
     buf
 }
 
-/// Decode `IsPrivilegedResponse.has_privilege` (field 1, bool).
-pub fn decode_is_privileged_resp(data: &[u8]) -> Result<bool, CoreError> {
+/// Capability-aware privilege response. Optional fields distinguish old cores and platforms.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CorePrivileges {
+    pub has_privilege: bool,
+    pub tun_device: Option<bool>,
+    pub net_admin: Option<bool>,
+    pub kill_switch_privilege: Option<bool>,
+    pub detail: String,
+}
+
+pub fn decode_core_privileges(data: &[u8]) -> Result<CorePrivileges, CoreError> {
+    let mut result = CorePrivileges::default();
     let mut i = 0;
-    let mut has = false;
     while i < data.len() {
-        let (key, ni) = read_varint(data, i)?;
-        i = ni;
-        let field = (key >> 3) as u32;
-        let wire = (key & 0x7) as u8;
-        match (field, wire) {
-            (1, 0) => {
-                let (v, ni) = read_varint(data, i)?;
-                has = v != 0;
-                i = ni;
+        let (key, next) = read_varint(data, i)?;
+        i = next;
+        match ((key >> 3) as u32, (key & 7) as u8) {
+            (field @ 1..=4, 0) => {
+                let (value, next) = read_varint(data, i)?;
+                i = next;
+                match field {
+                    1 => result.has_privilege = value != 0,
+                    2 => result.tun_device = Some(value != 0),
+                    3 => result.net_admin = Some(value != 0),
+                    4 => result.kill_switch_privilege = Some(value != 0),
+                    _ => unreachable!(),
+                }
             }
-            _ => i = skip_field(data, i, wire)?,
+            (5, 2) => {
+                let (value, next) = read_string(data, i)?;
+                result.detail = value;
+                i = next;
+            }
+            (_, wire) => i = skip_field(data, i, wire)?,
         }
     }
-    Ok(has)
+    Ok(result)
+}
+
+pub fn decode_is_privileged_resp(data: &[u8]) -> Result<bool, CoreError> {
+    Ok(decode_core_privileges(data)?.has_privilege)
+}
+
+pub fn encode_quic_signature_req(domain: &str) -> Vec<u8> {
+    let mut buf = Vec::new();
+    write_string(&mut buf, 1, domain);
+    buf
+}
+
+pub fn decode_quic_signature_resp(data: &[u8]) -> Result<(String, Vec<String>), CoreError> {
+    let mut error = String::new();
+    let mut packets = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        let (key, next) = read_varint(data, i)?;
+        i = next;
+        match ((key >> 3) as u32, (key & 7) as u8) {
+            (field @ 1..=2, 2) => {
+                let (value, next) = read_string(data, i)?;
+                i = next;
+                if field == 1 {
+                    error = value;
+                } else {
+                    packets.push(value);
+                }
+            }
+            (_, wire) => i = skip_field(data, i, wire)?,
+        }
+    }
+    Ok((error, packets))
 }
 
 pub fn encode_empty_req() -> Vec<u8> {
@@ -251,6 +302,8 @@ pub struct ConnectionRow {
     pub upload: i64,
     pub download: i64,
     pub outbound: String,
+    /// Resolved from the config active at Start; raw outbound stays available for routing.
+    pub outbound_name: String,
     pub network: String,
     pub dest: String,
     pub protocol: String,
@@ -1063,5 +1116,35 @@ mod tests {
         assert_eq!(active[0].id, "cid");
         assert_eq!(active[0].dest, "1.2.3.4:443");
         assert_eq!(active[0].source, "10.0.0.8:52341");
+    }
+}
+
+#[cfg(test)]
+mod beta3_contracts {
+    use super::*;
+    #[test]
+    fn privilege_extensions_distinguish_absent_from_false() {
+        let old = decode_core_privileges(&[8, 1]).unwrap();
+        assert!(old.has_privilege);
+        assert_eq!(old.tun_device, None);
+        let new =
+            decode_core_privileges(&[8, 0, 16, 0, 24, 1, 32, 0, 42, 2, b'o', b'k', 48, 1]).unwrap();
+        assert_eq!(new.tun_device, Some(false));
+        assert_eq!(new.net_admin, Some(true));
+        assert_eq!(new.kill_switch_privilege, Some(false));
+        assert_eq!(new.detail, "ok");
+        assert!(decode_core_privileges(&[42, 4, b'x']).is_err());
+    }
+    #[test]
+    fn quic_signatures_preserve_repeated_packets_and_error_fields() {
+        let mut response = Vec::new();
+        write_string(&mut response, 2, "<b 01>");
+        write_string(&mut response, 2, "<b 02>");
+        assert_eq!(
+            decode_quic_signature_resp(&response).unwrap(),
+            (String::new(), vec!["<b 01>".into(), "<b 02>".into()])
+        );
+        assert_eq!(encode_quic_signature_req("a"), vec![10, 1, b'a']);
+        assert!(decode_quic_signature_resp(&[18, 3, b'x']).is_err());
     }
 }

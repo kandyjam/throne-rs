@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use thiserror::Error;
 
 use crate::auto_selector::{
-    plan_auto_selector, profile_auto_selector, rerank_auto_selector_pool, AutoSelectorConfig,
-    AutoSelectorPlan,
+    plan_auto_selector_groups, profile_auto_selector, rerank_auto_selector_groups,
+    AutoSelectorConfig, AutoSelectorPlan,
 };
 use crate::models::{
     AppSettings, CoreStatus, Group, GroupId, ParsedOutbound, Profile, ProfileId, ProfileType,
@@ -100,7 +100,6 @@ pub struct AppState {
 }
 
 /// Ring buffer for Logs panel. Sized for core traffic (inbound/outbound) lines.
-const LOG_HISTORY_CAP: usize = 1_000;
 
 impl Default for AppState {
     fn default() -> Self {
@@ -243,9 +242,14 @@ impl AppState {
             .unwrap_or(false);
         if !dup {
             self.log_lines.push_back(format_log_line(msg));
-            while self.log_lines.len() > LOG_HISTORY_CAP {
-                self.log_lines.pop_front();
-            }
+        }
+        self.set_log_limit(self.settings.max_log_line);
+    }
+
+    pub fn set_log_limit(&mut self, limit: usize) {
+        self.settings.max_log_line = if limit == 0 { 500 } else { limit.min(100_000) };
+        while self.log_lines.len() > self.settings.max_log_line {
+            self.log_lines.pop_front();
         }
     }
 
@@ -375,30 +379,58 @@ impl AppState {
         ascending: bool,
     ) -> Result<(), StoreError> {
         let group_id = self.active_group_id;
-        let mut ids = self
+        let group = self
             .groups
-            .get(&group_id)
-            .ok_or(StoreError::GroupNotFound(group_id))?
-            .profile_ids
-            .clone();
-        ids.sort_by(|left_id, right_id| {
-            let ordering = match (self.profiles.get(left_id), self.profiles.get(right_id)) {
-                (Some(left), Some(right)) => compare_profiles(left, right, column),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => left_id.cmp(right_id),
-            };
-            if ascending {
-                ordering
-            } else {
-                ordering.reverse()
-            }
-        });
-        self.groups
             .get_mut(&group_id)
-            .expect("active group checked above")
-            .profile_ids = ids;
+            .ok_or(StoreError::GroupNotFound(group_id))?;
+        group.sort_method = match column {
+            ProfileSortColumn::Type => 1,
+            ProfileSortColumn::Address => 2,
+            ProfileSortColumn::Name => 3,
+            ProfileSortColumn::TestResult => 4,
+            ProfileSortColumn::Traffic => 6,
+        };
+        group.sort_descending = !ascending;
+        self.resort_group(group_id);
         Ok(())
+    }
+
+    fn resort_group(&mut self, group_id: GroupId) {
+        let Some(group) = self.groups.get_mut(&group_id) else {
+            return;
+        };
+        if !(1..=8).contains(&group.sort_method) {
+            return;
+        }
+        let mut ids = std::mem::take(&mut group.profile_ids);
+        // Cache keys once per update; stable ties retain the subscription/manual order.
+        let keys: HashMap<_, _> = ids
+            .iter()
+            .filter_map(|id| {
+                self.profiles
+                    .get(id)
+                    .map(|p| (*id, group_sort_key(p, group, &self.settings)))
+            })
+            .collect();
+        ids.sort_by(|left, right| match (keys.get(left), keys.get(right)) {
+            (Some(a), Some(b)) => {
+                if group.sort_descending {
+                    b.cmp(a)
+                } else {
+                    a.cmp(b)
+                }
+            }
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
+        group.profile_ids = ids;
+    }
+
+    fn resort_profile_group(&mut self, id: ProfileId) {
+        if let Some(p) = self.profiles.get(&id) {
+            self.resort_group(p.group_id);
+        }
     }
 
     pub fn add_group(&mut self, name: impl Into<String>) -> GroupId {
@@ -440,6 +472,7 @@ impl AppState {
                 .ok_or(StoreError::ProfileNotFound(id))?;
             p.name = new_name.clone();
         }
+        self.resort_profile_group(id);
         self.push_log(format!("Renamed profile → {new_name}"));
         Ok(())
     }
@@ -614,6 +647,7 @@ impl AppState {
         if let Some(g) = self.groups.get_mut(&group_id) {
             g.profile_ids.push(id);
         }
+        self.resort_group(group_id);
         id
     }
 
@@ -670,8 +704,12 @@ impl AppState {
             .ok_or(StoreError::ProfileNotFound(profile_id))?;
         let cfg = profile_auto_selector(profile)
             .ok_or_else(|| StoreError::Msg("Profile is not an Auto Selector".into()))?;
-        let group = self.groups.get(&cfg.gid);
-        Ok(plan_auto_selector(profile, &cfg, group, |id| {
+        let groups: Vec<_> = cfg
+            .gids
+            .iter()
+            .filter_map(|id| self.groups.get(id))
+            .collect();
+        Ok(plan_auto_selector_groups(profile, &cfg, &groups, |id| {
             self.profiles.get(&id).cloned()
         }))
     }
@@ -688,8 +726,12 @@ impl AppState {
             .clone();
         let mut cfg = profile_auto_selector(&profile)
             .ok_or_else(|| StoreError::Msg("Profile is not an Auto Selector".into()))?;
-        let group = self.groups.get(&cfg.gid).cloned();
-        let ranked = rerank_auto_selector_pool(&mut cfg, profile_id, group.as_ref(), |id| {
+        let groups: Vec<_> = cfg
+            .gids
+            .iter()
+            .filter_map(|id| self.groups.get(id))
+            .collect();
+        let ranked = rerank_auto_selector_groups(&mut cfg, profile_id, &groups, |id| {
             self.profiles.get(&id).cloned()
         });
         if let Some(p) = self.profiles.get_mut(&profile_id) {
@@ -711,6 +753,7 @@ impl AppState {
             .ok_or(StoreError::ProfileNotFound(profile_id))?;
         p.outbound_json = outbound_json.clone();
         p.outbound.raw_json = Some(outbound_json);
+        self.resort_profile_group(profile_id);
         Ok(())
     }
 
@@ -725,8 +768,13 @@ impl AppState {
             .ok_or(StoreError::ProfileNotFound(profile_id))?;
         let cfg = profile_auto_selector(profile)
             .ok_or_else(|| StoreError::Msg("Profile is not an Auto Selector".into()))?;
-        let group = self.groups.get(&cfg.gid);
-        let plan = plan_auto_selector(profile, &cfg, group, |id| self.profiles.get(&id).cloned());
+        let groups: Vec<_> = cfg
+            .gids
+            .iter()
+            .filter_map(|id| self.groups.get(id))
+            .collect();
+        let plan =
+            plan_auto_selector_groups(profile, &cfg, &groups, |id| self.profiles.get(&id).cloned());
         if let Some(err) = &plan.error {
             return Err(StoreError::Msg(err.clone()));
         }
@@ -940,6 +988,10 @@ impl AppState {
         if let Some(profile) = self.profiles.get_mut(&id) {
             profile.traffic_downlink = profile.traffic_downlink.saturating_add(downlink.max(0));
             profile.traffic_uplink = profile.traffic_uplink.saturating_add(uplink.max(0));
+            let gid = profile.group_id;
+            if self.groups.get(&gid).is_some_and(|g| g.sort_method == 6) {
+                self.resort_group(gid);
+            }
         }
     }
 
@@ -989,6 +1041,9 @@ impl AppState {
             .retain(|_, p| self.groups.contains_key(&p.group_id));
         for g in self.groups.values_mut() {
             g.profile_ids.retain(|id| self.profiles.contains_key(id));
+        }
+        for gid in self.group_order.clone() {
+            self.resort_group(gid);
         }
         self.active_group_id = self.group_order.first().copied().unwrap_or(0);
         self.selected_profile_id = self
@@ -1442,6 +1497,7 @@ impl AppState {
             }
             n += 1;
         }
+        self.resort_group(gid);
         if n > 0 {
             self.active_group_id = gid;
             self.push_log(format!("Imported {n} profile(s)"));
@@ -1472,6 +1528,7 @@ impl AppState {
                 chrono::Utc::now().timestamp()
             };
         }
+        self.resort_profile_group(id);
     }
 
     pub fn set_profile_ip_country(&mut self, id: ProfileId, ip: &str, country: &str) {
@@ -1479,6 +1536,7 @@ impl AppState {
             p.ip_out = ip.to_string();
             p.test_country = country.to_string();
         }
+        self.resort_profile_group(id);
     }
 
     pub fn set_profile_speeds(&mut self, id: ProfileId, dl: &str, ul: &str, latency_ms: i32) {
@@ -1490,6 +1548,7 @@ impl AppState {
                 p.latency_at = chrono::Utc::now().timestamp();
             }
         }
+        self.resort_profile_group(id);
     }
 
     /// Apply a batch of URL-test results. `latency_ms < 0` or non-empty error → fail.
@@ -1526,6 +1585,13 @@ impl AppState {
                 };
                 n += 1;
             }
+        }
+        let groups: HashSet<_> = results
+            .iter()
+            .filter_map(|(id, _, _)| self.profiles.get(id).map(|p| p.group_id))
+            .collect();
+        for gid in groups {
+            self.resort_group(gid);
         }
         if log && n > 0 {
             self.push_log(format!("URL Test updated {n} profile(s)"));
@@ -1688,6 +1754,7 @@ impl AppState {
             }
             n += 1;
         }
+        self.resort_group(group_id);
         self.active_group_id = group_id;
         self.selected_profile_id = self
             .groups
@@ -1909,6 +1976,8 @@ impl AppState {
                 *profile_name = profile.name.clone();
             }
         }
+        self.resort_group(group_id);
+        report.result_order = self.groups[&group_id].profile_ids.clone();
         Ok(report)
     }
 
@@ -1925,6 +1994,7 @@ impl AppState {
                 p.test_country.clear();
             }
         }
+        self.resort_group(group_id);
         self.push_log("Test results cleared");
     }
 }
@@ -1970,28 +2040,66 @@ fn subscription_change(profile: &Profile) -> SubscriptionChange {
     }
 }
 
-fn compare_profiles(
-    left: &Profile,
-    right: &Profile,
-    column: ProfileSortColumn,
-) -> std::cmp::Ordering {
-    match column {
-        ProfileSortColumn::Type => left
-            .profile_type
-            .display_name()
-            .cmp(right.profile_type.display_name()),
-        ProfileSortColumn::Address => left
-            .display_address()
-            .to_lowercase()
-            .cmp(&right.display_address().to_lowercase()),
-        ProfileSortColumn::Name => left.name.to_lowercase().cmp(&right.name.to_lowercase()),
-        ProfileSortColumn::TestResult => upstream_latency_sort_key(left.latency_ms)
-            .cmp(&upstream_latency_sort_key(right.latency_ms)),
-        ProfileSortColumn::Traffic => left
-            .traffic_downlink
-            .saturating_add(left.traffic_uplink)
-            .cmp(&right.traffic_downlink.saturating_add(right.traffic_uplink)),
+fn group_sort_key(p: &Profile, g: &Group, settings: &AppSettings) -> (u8, i64, String) {
+    let mut method = g.sort_method;
+    if matches!(method, 1 | 7) {
+        method = if settings.show_config_security && g.type_sort_by == 1 {
+            7
+        } else {
+            1
+        };
     }
+    match method {
+        1 => (0, 0, p.display_type()),
+        2 => (0, 0, p.display_address()),
+        3 => (0, 0, p.name.clone()),
+        4 if g.test_sort_by == 1 => (0, speed_sort_key(&p.download_speed), String::new()),
+        4 if g.test_sort_by == 2 => (0, speed_sort_key(&p.upload_speed), String::new()),
+        4 if g.test_sort_by != 0 => (0, 0, p.ip_out.clone()),
+        4 | 8 => (
+            0,
+            i64::from(upstream_latency_sort_key(p.latency_ms)),
+            String::new(),
+        ),
+        5 => (0, p.id, String::new()),
+        6 => (
+            0,
+            match g.traffic_sort_by {
+                1 => p.traffic_downlink,
+                2 => p.traffic_uplink,
+                _ => p.traffic_downlink.saturating_add(p.traffic_uplink),
+            },
+            String::new(),
+        ),
+        7 => {
+            let security = crate::profile_security(p, settings.skip_cert);
+            (
+                security.level as u8,
+                0,
+                format!("{}{}", security.transport, security.label),
+            )
+        }
+        _ => (0, 0, String::new()),
+    }
+}
+
+fn speed_sort_key(speed: &str) -> i64 {
+    if speed == "N/A" {
+        return -1;
+    }
+    let split = speed
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(speed.len());
+    let value = speed[..split].parse::<f64>().unwrap_or(0.0);
+    let unit = speed[split..].trim().to_ascii_uppercase();
+    let scale = match unit.chars().next() {
+        Some('K') => 1_000.0,
+        Some('M') => 1_000_000.0,
+        Some('G') => 1_000_000_000.0,
+        Some('T') => 1_000_000_000_000.0,
+        _ => 1.0,
+    };
+    (value * scale) as i64
 }
 
 fn upstream_latency_sort_key(ms: i32) -> i32 {
@@ -2097,6 +2205,34 @@ mod tests {
         assert!(logs.contains("inbound/mixed"));
         assert!(logs.contains("outbound/direct"));
         assert!(logs.contains("apple.com"));
+    }
+
+    #[test]
+    fn configured_log_history_retains_only_the_newest_messages() {
+        let mut state = AppState::with_demo_data();
+        state.clear_logs();
+        state.settings_mut().max_log_line = 2;
+        for text in ["old message", "middle message", "new message"] {
+            state.push_log_only(text);
+        }
+        let text = state.logs_text();
+        assert!(!text.contains("old message"));
+        assert!(text.contains("middle message"));
+        assert!(text.contains("new message"));
+    }
+
+    #[test]
+    fn reducing_log_limit_trims_immediately_without_a_new_message() {
+        let mut state = AppState::empty();
+        for text in ["old", "middle", "new"] {
+            state.push_log_only(text);
+        }
+        state.set_log_limit(2);
+        assert_eq!(state.log_lines.len(), 2);
+        assert!(!state.logs_text().contains("] old"));
+        assert!(state.logs_text().contains("] new"));
+        state.set_log_limit(0);
+        assert_eq!(state.settings().max_log_line, 500);
     }
 
     #[test]

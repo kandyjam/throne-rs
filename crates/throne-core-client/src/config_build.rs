@@ -217,7 +217,7 @@ pub fn build_load_config_ex(
         route_rules.push(json!({ "action": "reject" }));
     }
 
-    let (dns, default_resolver_tag) =
+    let (mut dns, default_resolver_tag) =
         build_dns_section(settings, settings.tun_mode_enabled, &proxy_direct_domains)?;
 
     // Upstream buildRouteSection: default_domain_resolver = dns-direct (+ strategy);
@@ -246,11 +246,12 @@ pub fn build_load_config_ex(
     let mut outbounds = extra_outbounds;
     outbounds.push(outbound);
     outbounds.push(json!({ "type": "direct", "tag": "direct" }));
+    apply_ech_dns(&mut dns, &mut outbounds);
     if l3_bridge {
         outbounds.push(json!({ "type": "bridge", "tag": "l3-direct", "bridge_name": "throne-br" }));
     }
 
-    let config = json!({
+    let mut config = json!({
         "log": { "level": log_level, "timestamp": true },
         "dns": dns,
         "inbounds": inbounds,
@@ -268,6 +269,7 @@ pub fn build_load_config_ex(
         }
     });
 
+    extract_wireguard_endpoints(&mut config);
     let core_config_json =
         serde_json::to_string(&config).map_err(|e| CoreError::Config(e.to_string()))?;
 
@@ -499,8 +501,39 @@ fn route_rule_to_json(rule: &RouteRule) -> Option<Value> {
         obj.insert("ip_version".into(), json!(rule.ip_version));
     }
 
+    // Route options apply only to routing, never to reject/sniff actions.
+    if matches!(action, "route" | "route-options")
+        && (action == "route-options" || !matches!(rule.outbound(), DefaultOutbound::Block))
+    {
+        if !rule.override_address.trim().is_empty() {
+            obj.insert(
+                "override_address".into(),
+                json!(rule.override_address.trim()),
+            );
+        }
+        if let Ok(port) = rule.override_port.trim().parse::<u16>() {
+            if port > 0 {
+                obj.insert("override_port".into(), json!(port));
+            }
+        }
+        if rule.tls_fragment {
+            obj.insert("tls_fragment".into(), json!(true));
+            if !rule.tls_fragment_fallback_delay.trim().is_empty() {
+                obj.insert(
+                    "tls_fragment_fallback_delay".into(),
+                    json!(rule.tls_fragment_fallback_delay.trim()),
+                );
+            }
+        }
+        if rule.tls_record_fragment {
+            obj.insert("tls_record_fragment".into(), json!(true));
+        }
+    }
     // Action
     match action {
+        "route-options" => {
+            obj.insert("action".into(), json!("route-options"));
+        }
         "hijack-dns" => {
             if !obj.contains_key("protocol") {
                 obj.insert("protocol".into(), json!("dns"));
@@ -711,7 +744,7 @@ pub fn build_url_test_config(
     }
     outbounds.push(json!({ "type": "direct", "tag": "direct" }));
 
-    let config = json!({
+    let mut config = json!({
         "log": { "level": log_level, "timestamp": true },
         "dns": {
             "servers": [
@@ -738,6 +771,10 @@ pub fn build_url_test_config(
             }
         }
     });
+    let mut dns = config["dns"].take();
+    apply_ech_dns(&mut dns, config["outbounds"].as_array_mut().unwrap());
+    config["dns"] = dns;
+    extract_wireguard_endpoints(&mut config);
     let s = serde_json::to_string(&config).map_err(|e| CoreError::Config(e.to_string()))?;
     Ok((s, tags))
 }
@@ -1275,6 +1312,60 @@ fn take_singbox_outbound(mut v: Value) -> Option<Value> {
     Some(v)
 }
 
+/// WireGuard is an endpoint in the pinned core, not a legacy outbound.
+fn extract_wireguard_endpoints(config: &mut Value) {
+    let mut endpoints = Vec::new();
+    let Some(outbounds) = config["outbounds"].as_array_mut() else {
+        return;
+    };
+    let mut retained = Vec::with_capacity(outbounds.len());
+    for mut value in outbounds.drain(..) {
+        if value["type"] != "wireguard" {
+            retained.push(value);
+            continue;
+        }
+        let obj = value.as_object_mut().unwrap();
+        if !obj.contains_key("peers") {
+            let mut peer = json!({
+                "address":obj.remove("server").unwrap_or(Value::Null),
+                "port":obj.remove("server_port").unwrap_or(json!(51820)),
+                "public_key":obj.remove("peer_public_key").unwrap_or(Value::Null)
+            });
+            for key in [
+                "pre_shared_key",
+                "reserved",
+                "persistent_keepalive_interval",
+            ] {
+                if let Some(value) = obj.remove(key) {
+                    peer[key] = value;
+                }
+            }
+            obj.insert("peers".into(), json!([peer]));
+        }
+        obj.remove("server");
+        obj.remove("server_port");
+        if let Some(workers) = obj.remove("worker_count") {
+            obj.entry("workers").or_insert(workers);
+        }
+        if let Some(address) = obj.remove("local_address") {
+            obj.entry("address").or_insert(address);
+        }
+        if let Some(peers) = obj.get_mut("peers").and_then(Value::as_array_mut) {
+            for peer in peers {
+                if let Some(peer) = peer.as_object_mut() {
+                    peer.entry("allowed_ips")
+                        .or_insert_with(|| json!(["0.0.0.0/0", "::/0"]));
+                }
+            }
+        }
+        endpoints.push(value);
+    }
+    *outbounds = retained;
+    if !endpoints.is_empty() {
+        config["endpoints"] = json!(endpoints);
+    }
+}
+
 /// Drop or normalize `transport` so the core never sees invalid types like `tcp`.
 fn sanitize_outbound_transport(obj: &mut serde_json::Map<String, Value>) {
     let Some(tr) = obj.get("transport").and_then(|t| t.as_object()) else {
@@ -1655,7 +1746,7 @@ fn apply_tls(v: &mut Value, o: &ParsedOutbound, default_on: bool) {
         }
     }
     if let Some(fp) = &o.fp {
-        if !fp.is_empty() {
+        if !fp.is_empty() && fp != "unsafe" {
             t.insert("utls".into(), json!({ "enabled": true, "fingerprint": fp }));
         }
     }
@@ -1669,6 +1760,8 @@ fn apply_tls(v: &mut Value, o: &ParsedOutbound, default_on: bool) {
                     .unwrap()
                     .insert("short_id".into(), json!(sid));
             }
+            t.entry("utls")
+                .or_insert_with(|| json!({"enabled":true,"fingerprint":"random"}));
             t.insert("reality".into(), reality);
         }
     }
@@ -1689,7 +1782,7 @@ fn build_dns_section(
     tun_enabled: bool,
     proxy_domains: &[String],
 ) -> Result<(Value, &'static str), CoreError> {
-    if !tun_enabled {
+    if !tun_enabled && !settings.fake_dns {
         // Mixed/system-proxy path: OS resolver is proven-stable here.
         return Ok((
             json!({
@@ -1775,6 +1868,16 @@ fn build_dns_section(
         rules.push(rule);
     }
 
+    let mut servers = vec![remote, direct, local];
+    if settings.fake_dns {
+        let mut fake = json!({"type":"fakeip","tag":"dns-fake","inet4_range":"198.18.0.0/15"});
+        // Keep fake IPv6 outside the private fc00::/7 TUN bypass.
+        if !settings.fakeip_disable_ipv6 {
+            fake["inet6_range"] = json!("2001:db8::/32");
+        }
+        servers.push(fake);
+        rules.push(json!({"query_type":["A","AAAA"],"action":"route","server":"dns-fake"}));
+    }
     let mut final_rule = json!({
         "action": "route",
         "server": final_tag
@@ -1789,11 +1892,14 @@ fn build_dns_section(
 
     // Upstream dns object: servers + rules + cache_* — no top-level final.
     let mut dns = json!({
-        "servers": [remote, direct, local],
+        "servers": servers,
         "rules": rules,
         "cache_capacity": settings.dns_cache_capacity.max(0)
     });
     if let Some(obj) = dns.as_object_mut() {
+        if settings.fake_dns {
+            obj.insert("independent_cache".into(), json!(true));
+        }
         if settings.dns_disable_cache {
             obj.insert("disable_cache".into(), json!(true));
         }
@@ -1807,6 +1913,113 @@ fn build_dns_section(
 
     // Upstream buildRouteSection always uses dns-direct as default_domain_resolver.
     Ok((dns, "dns-direct"))
+}
+
+/// ECH bootstrap HTTPS queries cannot travel through the proxy they unlock.
+/// Consume the GUI-only resolver field after collecting it; never send it to sing-box.
+fn apply_ech_dns(dns: &mut Value, outbounds: &mut [Value]) {
+    let mut names = std::collections::BTreeMap::<String, Option<String>>::new();
+    for outbound in outbounds {
+        let server_name = outbound["tls"]["server_name"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| outbound["server"].as_str())
+            .unwrap_or("")
+            .to_string();
+        if outbound["tls"]["enabled"] != true {
+            continue;
+        }
+        let Some(ech) = outbound
+            .pointer_mut("/tls/ech")
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        let resolver = ech
+            .remove("resolver")
+            .and_then(|v| v.as_str().map(str::to_owned));
+        if ech.get("enabled") != Some(&json!(true)) {
+            continue;
+        }
+        let has_static = ech.get("config").is_some_and(|v| match v {
+            Value::Array(lines) => lines
+                .iter()
+                .any(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())),
+            Value::String(s) => !s.trim().is_empty(),
+            _ => false,
+        }) || ech
+            .get("config_path")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        if has_static {
+            continue;
+        }
+        let name = ech
+            .get("query_server_name")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(&server_name)
+            .trim();
+        let Ok(url::Host::Domain(name)) = url::Host::parse(name.trim_end_matches('.')) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        // The queried name and exact DNS match must use the same ASCII identity.
+        ech.insert("query_server_name".into(), json!(name));
+        let resolver = resolver.filter(|s| usable_ech_resolver(s));
+        names
+            .entry(name)
+            .and_modify(|old| {
+                if old.is_none() {
+                    *old = resolver.clone();
+                }
+            })
+            .or_insert(resolver);
+    }
+    if names.is_empty() {
+        return;
+    }
+    let servers = dns["servers"]
+        .as_array_mut()
+        .expect("generated DNS server array");
+    let local_tag = if servers.iter().any(|s| s["tag"] == "dns-local") {
+        "dns-local"
+    } else {
+        "local"
+    };
+    let direct_tag = if servers.iter().any(|s| s["tag"] == "dns-direct") {
+        "dns-direct"
+    } else {
+        local_tag
+    };
+    let mut head = Vec::new();
+    for (index, (name, resolver)) in names.into_iter().enumerate() {
+        let tag = if let Some(address) = resolver {
+            let tag = format!("dns-ech-{index}");
+            let mut server = build_dns_obj(&address, false, "");
+            server["tag"] = json!(tag);
+            server["domain_resolver"] = json!(local_tag);
+            servers.push(server);
+            tag
+        } else {
+            direct_tag.to_string()
+        };
+        head.push(json!({"domain":[name],"query_type":["HTTPS"],"action":"route","server":tag}));
+    }
+    if let Some(rules) = dns.get_mut("rules").and_then(Value::as_array_mut) {
+        head.append(rules);
+    }
+    dns["rules"] = json!(head);
+}
+
+fn usable_ech_resolver(address: &str) -> bool {
+    let address = address.trim();
+    !address.is_empty()
+        && address.split_once("://").is_none_or(|(scheme, _)| {
+            matches!(scheme, "udp" | "tcp" | "tls" | "https" | "quic" | "h3")
+        })
 }
 
 /// Upstream `outboundServerDomains` / `getEntDomains` for a single profile.
@@ -1828,6 +2041,13 @@ fn collect_outbound_server_domains(profile: &Profile) -> Vec<String> {
     if let Ok(v) = serde_json::from_str::<Value>(&profile.outbound_json) {
         if let Some(s) = v.get("server").and_then(|x| x.as_str()) {
             push(s);
+        }
+        if let Some(peers) = v.get("peers").and_then(Value::as_array) {
+            for peer in peers {
+                if let Some(address) = peer["address"].as_str() {
+                    push(address);
+                }
+            }
         }
         // Chain-like hop lists are rare in outbound_json; collect nested servers
         // when present (urltest/selector export blobs).
@@ -1898,11 +2118,23 @@ fn build_dns_obj(address: &str, tun_enabled: bool, underlying: &str) -> Value {
     } else {
         (rest, String::new())
     };
-    let (server, server_port) = host_port
-        .rsplit_once(':')
-        .filter(|(_, port)| port.chars().all(|ch| ch.is_ascii_digit()))
-        .map(|(host, port)| (host.to_string(), port.parse::<u16>().ok()))
-        .unwrap_or_else(|| (host_port.to_string(), None));
+    let (server, server_port) = if let Some(bracketed) = host_port.strip_prefix('[') {
+        match bracketed.split_once(']') {
+            Some((host, tail)) => (
+                host.to_string(),
+                tail.strip_prefix(':').and_then(|p| p.parse::<u16>().ok()),
+            ),
+            None => (host_port.to_string(), None),
+        }
+    } else if host_port.parse::<std::net::Ipv6Addr>().is_ok() {
+        (host_port.to_string(), None)
+    } else {
+        host_port
+            .rsplit_once(':')
+            .filter(|(_, port)| !port.is_empty() && port.chars().all(|ch| ch.is_ascii_digit()))
+            .map(|(host, port)| (host.to_string(), port.parse::<u16>().ok()))
+            .unwrap_or_else(|| (host_port.to_string(), None))
+    };
 
     let mut obj = json!({ "type": ty, "server": server });
     if let Some(port) = server_port {
@@ -1928,6 +2160,157 @@ fn build_dns_server_obj(address: &str) -> Value {
 mod tests {
     use super::*;
     use throne_domain::{ParsedOutbound, Profile, ProfileType, RulesetMirror};
+
+    #[test]
+    fn ech_query_and_bootstrap_rule_share_canonical_domain_identity() {
+        for (name, expected) in [
+            (" public.example. ", "public.example"),
+            ("例子.example", "xn--fsqu00a.example"),
+            ("PUBLIC.EXAMPLE", "public.example"),
+        ] {
+            let mut profile = Profile::new(1, 1, "ECH", ProfileType::Trojan);
+            profile.outbound_json = json!({"type":"trojan","server":"edge.example","server_port":443,"password":"pw","tls":{"enabled":true,"ech":{"enabled":true,"query_server_name":name}}}).to_string();
+            let built = build_load_config(
+                &profile,
+                &AppSettings {
+                    tun_mode_enabled: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+            let value: Value = serde_json::from_str(&built.core_config_json).unwrap();
+            assert_eq!(value["dns"]["rules"][0]["domain"][0], expected);
+            assert_eq!(
+                value["outbounds"][0]["tls"]["ech"]["query_server_name"],
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn wireguard_legacy_and_modern_profiles_build_endpoints_for_start_and_tests() {
+        for raw in [
+            json!({"type":"wireguard","server":"edge.example","server_port":51820,"private_key":"private","peer_public_key":"public","local_address":["10.0.0.2/32"]}),
+            json!({"type":"wireguard","private_key":"private","address":["10.0.0.2/32"],"peers":[{"address":"edge.example","port":51820,"public_key":"public"}],"amnezia_wg":{"jc":4}}),
+        ] {
+            let mut p = Profile::new(1, 1, "WG", ProfileType::Wireguard);
+            let mut raw = raw;
+            raw["worker_count"] = json!(2);
+            p.outbound_json = raw.to_string();
+            let settings = AppSettings {
+                tun_mode_enabled: true,
+                ..Default::default()
+            };
+            let start = build_load_config(&p, &settings, None)
+                .unwrap()
+                .core_config_json;
+            let (test, _) = build_url_test_config(&[&p], &settings).unwrap();
+            for config in [start, test] {
+                let config: Value = serde_json::from_str(&config).unwrap();
+                assert_eq!(config["endpoints"][0]["workers"], 2);
+                assert!(config["endpoints"][0].get("worker_count").is_none());
+                assert!(config["outbounds"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|o| o["type"] != "wireguard"));
+                assert_eq!(
+                    config["endpoints"][0]["peers"][0]["address"],
+                    "edge.example"
+                );
+                assert_eq!(
+                    config["endpoints"][0]["peers"][0]["allowed_ips"],
+                    json!(["0.0.0.0/0", "::/0"])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ech_dns_bootstraps_before_proxy_rules_and_strips_gui_metadata() {
+        let mut profile = Profile::new(1, 1, "ECH", ProfileType::Trojan);
+        profile.outbound_json = json!({"type":"trojan","server":"edge.example","server_port":443,"password":"pw","tls":{"enabled":true,"server_name":"sni.example","ech":{"enabled":true,"query_server_name":"public.example","resolver":"https://dns.example/dns-query"}}}).to_string();
+        for tun in [false, true] {
+            let settings = AppSettings {
+                tun_mode_enabled: tun,
+                ..Default::default()
+            };
+            let built = build_load_config(&profile, &settings, None).unwrap();
+            let value: Value = serde_json::from_str(&built.core_config_json).unwrap();
+            assert!(value["outbounds"][0]["tls"]["ech"]["resolver"].is_null());
+            let rule = &value["dns"]["rules"][0];
+            assert_eq!(rule["domain"], json!(["public.example"]));
+            assert_eq!(rule["query_type"], json!(["HTTPS"]));
+            let server = value["dns"]["servers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["tag"] == rule["server"])
+                .unwrap();
+            assert_eq!(server["server"], "dns.example");
+            assert!(server.get("detour").is_none());
+        }
+        let (test, _) = build_url_test_config(&[&profile], &AppSettings::default()).unwrap();
+        let test: Value = serde_json::from_str(&test).unwrap();
+        assert_eq!(test["dns"]["rules"][0]["domain"], json!(["public.example"]));
+        assert!(test["outbounds"][0]["tls"]["ech"]["resolver"].is_null());
+    }
+
+    #[test]
+    fn ech_static_config_never_adds_a_bootstrap_rule() {
+        let mut profile = Profile::new(1, 1, "ECH", ProfileType::Trojan);
+        profile.outbound_json = json!({"type":"trojan","server":"edge.example","server_port":443,"password":"pw","tls":{"enabled":true,"ech":{"enabled":true,"config":["pem"],"resolver":"https://dns.example/dns-query"}}}).to_string();
+        let built = build_load_config(&profile, &AppSettings::default(), None).unwrap();
+        let value: Value = serde_json::from_str(&built.core_config_json).unwrap();
+        assert!(value["dns"]["rules"]
+            .as_array()
+            .is_none_or(|rules| rules.is_empty()));
+        assert!(value["outbounds"][0]["tls"]["ech"]["resolver"].is_null());
+    }
+
+    #[test]
+    fn ech_unsupported_resolver_falls_back_to_direct_https_only() {
+        let mut profile = Profile::new(1, 1, "ECH", ProfileType::Trojan);
+        profile.outbound_json = json!({"type":"trojan","server":"edge.example","server_port":443,"password":"pw","tls":{"enabled":true,"server_name":"sni.example","ech":{"enabled":true,"resolver":"https+local://dns.example"}}}).to_string();
+        let settings = AppSettings {
+            tun_mode_enabled: true,
+            ..Default::default()
+        };
+        let built = build_load_config(&profile, &settings, None).unwrap();
+        let value: Value = serde_json::from_str(&built.core_config_json).unwrap();
+        assert_eq!(value["dns"]["rules"][0]["server"], "dns-direct");
+        assert_eq!(value["dns"]["rules"][0]["domain"], json!(["sni.example"]));
+        assert_eq!(value["dns"]["rules"][0]["query_type"], json!(["HTTPS"]));
+    }
+
+    #[test]
+    fn fakeip_ipv6_never_uses_the_private_bypass_range() {
+        let mut profile = Profile::new(1, 1, "Socks", ProfileType::Socks);
+        profile.outbound.server = Some("edge.example".into());
+        for disabled in [false, true] {
+            let settings = AppSettings {
+                tun_mode_enabled: true,
+                fake_dns: true,
+                fakeip_disable_ipv6: disabled,
+                ..Default::default()
+            };
+            let built = build_load_config(&profile, &settings, None).unwrap();
+            let value: Value = serde_json::from_str(&built.core_config_json).unwrap();
+            let fake = value["dns"]["servers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["type"] == "fakeip")
+                .unwrap();
+            assert_eq!(fake["inet4_range"], "198.18.0.0/15");
+            if disabled {
+                assert!(fake.get("inet6_range").is_none());
+            } else {
+                assert_eq!(fake["inet6_range"], "2001:db8::/32");
+            }
+        }
+    }
 
     fn tun_settings() -> AppSettings {
         let mut settings = AppSettings::default();

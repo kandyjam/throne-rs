@@ -41,7 +41,10 @@ pub fn parse_share_link(raw: &str) -> Option<ImportedProfile> {
     if lower.starts_with("snell://") {
         return parse_snell(link);
     }
-    if lower.starts_with("wg://") || lower.starts_with("wireguard://") {
+    if lower.starts_with("wg://")
+        || lower.starts_with("wireguard://")
+        || lower.starts_with("awg://")
+    {
         return parse_wireguard_link(link);
     }
     if lower.starts_with("http://") || lower.starts_with("https://") {
@@ -67,8 +70,15 @@ fn base_from_url(url: &Url) -> (String, Option<u16>, String) {
 }
 
 fn query_map(url: &Url) -> Vec<(String, String)> {
-    url.query_pairs()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
+    // Share links use URI query semantics, not form encoding: '+' is literal.
+    url.query()
+        .unwrap_or_default()
+        .split('&')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let (key, value) = part.split_once('=').unwrap_or((part, ""));
+            (percent_decode(key), percent_decode(value))
+        })
         .collect()
 }
 
@@ -273,6 +283,13 @@ fn parse_vless(link: &str) -> Option<ImportedProfile> {
             .map(|s| s.to_string()),
         ..Default::default()
     };
+    if outbound
+        .transport
+        .as_deref()
+        .is_some_and(|t| matches!(t, "xhttp" | "splithttp"))
+    {
+        return crate::tls::xhttp_profile(&name_or("VLESS", &name), &outbound, &q, link);
+    }
     Some(finish(
         name_or("VLESS", &name),
         ProfileType::Vless,
@@ -482,12 +499,14 @@ fn parse_wireguard_link(link: &str) -> Option<ImportedProfile> {
         path: local_addr,
         ..Default::default()
     };
-    Some(finish(
+    let mut profile = finish(
         name_or("WireGuard", &name),
         ProfileType::Wireguard,
         outbound,
         link,
-    ))
+    );
+    crate::wireguard::apply_options(&mut profile, &q);
+    Some(profile)
 }
 
 fn parse_snell(link: &str) -> Option<ImportedProfile> {
@@ -540,7 +559,12 @@ fn finish(
 ) -> ImportedProfile {
     outbound.tag = Some(name.clone());
     // Upstream ExportToJson shape (must include `"type"` for Qt ParseFromJson).
-    outbound.raw_json = Some(outbound.to_db_json(profile_type));
+    let mut raw: serde_json::Value = serde_json::from_str(&outbound.to_db_json(profile_type))
+        .expect("serialized outbound is valid JSON");
+    if let Ok(url) = Url::parse(source) {
+        crate::tls::apply_link_tls(&mut raw, &query_map(&url));
+    }
+    outbound.raw_json = Some(raw.to_string());
     ImportedProfile {
         name,
         profile_type,

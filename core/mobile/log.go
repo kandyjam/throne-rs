@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 
+	"ThroneCore/internal/xray"
+
 	"github.com/sagernet/sing-box/log"
 )
 
@@ -20,7 +22,8 @@ const (
 )
 
 // LogSink receives sing-box lines (already formatted by the box's platform formatter) with their
-// log.Level, and Go std log lines (Xray gates, probes, close timing) as LogLevelInfo.
+// log.Level, Go std log lines (Xray gates, probes, close timing) as LogLevelInfo, and an Xray gate that
+// cannot start as LogLevelError.
 type LogSink interface {
 	Write(level int32, message string)
 }
@@ -61,11 +64,12 @@ func (p *logPump) setSink(sink LogSink) {
 	}
 }
 
-func (p *logPump) push(level int32, message string) {
+// Reports whether a sink took the line.
+func (p *logPump) push(level int32, message string) bool {
 	p.access.Lock()
 	if p.sink == nil {
 		p.access.Unlock()
-		return
+		return false
 	}
 	limit := p.limit
 	if limit <= 0 {
@@ -77,6 +81,7 @@ func (p *logPump) push(level int32, message string) {
 	p.pending = append(p.pending, logEntry{level: level, message: message})
 	p.access.Unlock()
 	p.wake()
+	return true
 }
 
 func (p *logPump) wake() {
@@ -100,6 +105,15 @@ func (p *logPump) run() {
 			for _, entry := range batch {
 				sink.Write(entry.level, entry.message)
 			}
+		}
+	}
+}
+
+// Std log lines arrive as info, below the app's default warn level; a gate dropping its members must still show.
+func init() {
+	xray.FailureLog = func(message string) {
+		if !pump.push(LogLevelError, message) {
+			stdlog.Println(message)
 		}
 	}
 }
@@ -128,9 +142,24 @@ var _ log.PlatformWriter = platformLogWriter{}
 
 // Always handed to box.New for the main instance, sink or not: a non-nil PlatformLogWriter is what
 // switches on trafficcontrol, clash mode and the cache file, which Status()/Groups()/QueryOutboundStats()
-// read. Probe boxes pass nil so they never share cache.db or pay for accounting.
+// read. Probe boxes pass nil so they never share cache.db or pay for accounting, and get a testLogWriter.
 type platformLogWriter struct{}
 
 func (platformLogWriter) WriteMessage(level log.Level, message string) {
 	pump.push(int32(level), message)
+}
+
+var _ log.PlatformWriter = testLogWriter{}
+
+// A probe box's lines, marked as test output, attached to its log factory after box.New. The factory hands
+// its platform writers every line whatever its level, so the probe config's own level is applied here.
+type testLogWriter struct {
+	level log.Level
+}
+
+func (w testLogWriter) WriteMessage(level log.Level, message string) {
+	if level > w.level {
+		return
+	}
+	pump.push(int32(level), "[test] "+message)
 }

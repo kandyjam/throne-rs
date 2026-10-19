@@ -131,8 +131,8 @@ impl Database {
                     sub_last_update, front_proxy_id, landing_proxy_id,
                     column_width_json, profiles_json, scroll_last_profile,
                     test_sort_by, traffic_sort_by, test_items_to_show, type_sort_by,
-                    endpoint_json, sub_options_json, sub_metadata_json
-                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)"#,
+                    endpoint_json, sub_options_json, sub_metadata_json, sort_method, sort_descending
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)"#,
                 params![
                     g.id,
                     g.archive as i32,
@@ -154,6 +154,8 @@ impl Database {
                     serde_json::to_string(&g.endpoint)?,
                     serde_json::to_string(&g.sub_options)?,
                     serde_json::to_string(&g.sub_metadata)?,
+                    g.sort_method,
+                    g.sort_descending as i32,
                 ],
             )?;
         }
@@ -267,7 +269,7 @@ impl Database {
                       sub_last_update, front_proxy_id, landing_proxy_id,
                       column_width_json, profiles_json, scroll_last_profile,
                       test_sort_by, traffic_sort_by, test_items_to_show, type_sort_by,
-                      endpoint_json, sub_options_json, sub_metadata_json
+                      endpoint_json, sub_options_json, sub_metadata_json, sort_method, sort_descending
                FROM groups"#,
         )?;
         let rows = stmt.query_map([], |row| {
@@ -294,6 +296,8 @@ impl Database {
                 traffic_sort_by: row.get::<_, Option<i32>>(14)?.unwrap_or(0),
                 test_items_to_show: row.get::<_, Option<i32>>(15)?.unwrap_or(0),
                 type_sort_by: row.get::<_, Option<i32>>(16)?.unwrap_or(0),
+                sort_method: row.get::<_, Option<i32>>(20)?.unwrap_or(0),
+                sort_descending: row.get::<_, Option<i32>>(21)?.unwrap_or(0) != 0,
                 endpoint: serde_json::from_str(&row.get::<_, String>(17)?).unwrap_or_default(),
                 sub_options: serde_json::from_str(&row.get::<_, String>(18)?)
                     .unwrap_or_else(|_| serde_json::json!({})),
@@ -422,7 +426,7 @@ impl Database {
                       process_name_json, process_path_json, process_path_regex_json, rule_set_json,
                       invert, outbound_id, action, reject_method, no_drop,
                       override_address, override_port, sniffers_json, sniff_override_dest, strategy,
-                      wifi_ssid_json, wifi_bssid_json
+                      wifi_ssid_json, wifi_bssid_json, tls_fragment, tls_fragment_fallback_delay, tls_record_fragment
                FROM route_rules WHERE route_profile_id = ? ORDER BY rule_order"#,
         )?;
         let rows = stmt.query_map(params![profile_id], |row| {
@@ -465,6 +469,9 @@ impl Database {
                 strategy: row.get::<_, Option<String>>(31)?.unwrap_or_default(),
                 wifi_ssid: json_str_list(row.get::<_, Option<String>>(32)?),
                 wifi_bssid: json_str_list(row.get::<_, Option<String>>(33)?),
+                tls_fragment: row.get::<_, Option<i32>>(34)?.unwrap_or(0) != 0,
+                tls_fragment_fallback_delay: row.get::<_, Option<String>>(35)?.unwrap_or_default(),
+                tls_record_fragment: row.get::<_, Option<i32>>(36)?.unwrap_or(0) != 0,
             })
         })?;
         collect_rows(rows)
@@ -508,10 +515,10 @@ fn insert_route_rule(
             process_name_json, process_path_json, process_path_regex_json, rule_set_json,
             invert, outbound_id, action, reject_method, no_drop,
             override_address, override_port, sniffers_json, sniff_override_dest, strategy,
-            wifi_ssid_json, wifi_bssid_json
+            wifi_ssid_json, wifi_bssid_json, tls_fragment, tls_fragment_fallback_delay, tls_record_fragment
         ) VALUES (
             ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,
-            ?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36
+            ?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37,?38,?39
         )"#,
         params![
             profile_id,
@@ -554,6 +561,9 @@ fn insert_route_rule(
             rule.strategy,
             to_json_array(&rule.wifi_ssid),
             to_json_array(&rule.wifi_bssid),
+            rule.tls_fragment as i32,
+            rule.tls_fragment_fallback_delay,
+            rule.tls_record_fragment as i32,
         ],
     )?;
     Ok(())
@@ -574,7 +584,9 @@ fn parse_outbound_json(s: &str) -> (ParsedOutbound, Option<String>) {
     };
     // Prefer structured ParsedOutbound if we stored one
     if let Ok(p) = serde_json::from_value::<ParsedOutbound>(v.clone()) {
-        if p.server.is_some() || p.uuid.is_some() || p.raw_json.is_some() {
+        if v.get("type").and_then(serde_json::Value::as_str) != Some("wireguard")
+            && (p.server.is_some() || p.uuid.is_some() || p.raw_json.is_some())
+        {
             let name = p.tag.clone();
             return (p, name);
         }
@@ -635,6 +647,7 @@ fn parse_outbound_json(s: &str) -> (ParsedOutbound, Option<String>) {
             .map(|s| s.to_string());
         outbound.insecure = tls.get("insecure").and_then(|x| x.as_bool());
     }
+    outbound.hydrate_wireguard_fields(&v);
     (outbound, tag)
 }
 
@@ -732,6 +745,9 @@ fn merge_settings_tx(tx: &rusqlite::Transaction<'_>, s: &AppSettings) -> Result<
         ("system_dns_set", bool_str(s.system_dns_set)),
         ("theme", s.theme.clone()),
         ("log_level", s.log_level.clone()),
+        ("log_font_family", s.log_font_family.clone()),
+        ("log_font_size", s.log_font_size.to_string()),
+        ("max_log_line", s.max_log_line.to_string()),
         ("ruleset_mirror", s.ruleset_mirror.as_id().to_string()),
         ("adblock_enable", bool_str(s.adblock_enable)),
         ("hk_start_stop", s.hk_start_stop.clone()),
@@ -744,6 +760,7 @@ fn merge_settings_tx(tx: &rusqlite::Transaction<'_>, s: &AppSettings) -> Result<
         ("direct_dns_strategy", s.direct_dns_strategy.clone()),
         ("dns_cache_capacity", s.dns_cache_capacity.to_string()),
         ("dns_disable_cache", bool_str(s.dns_disable_cache)),
+        ("fakeip_disable_ipv6", bool_str(s.fakeip_disable_ipv6)),
         ("dns_disable_expire", bool_str(s.dns_disable_expire)),
         ("dns_persist_cache", bool_str(s.dns_persist_cache)),
         ("dns_reverse_mapping", bool_str(s.dns_reverse_mapping)),
@@ -878,6 +895,16 @@ fn apply_setting(s: &mut AppSettings, key: &str, value: &str) {
         "system_dns_set" => s.system_dns_set = parse_bool(value),
         "theme" => s.theme = value.to_string(),
         "log_level" => s.log_level = value.to_string(),
+        "log_font_family" => s.log_font_family = value.to_string(),
+        "log_font_size" => s.log_font_size = value.parse().unwrap_or(0),
+        "max_log_line" => {
+            s.max_log_line = value
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n > 0)
+                .unwrap_or(500)
+                .min(100_000);
+        }
         "ruleset_mirror" => {
             if let Ok(n) = value.parse::<i32>() {
                 s.ruleset_mirror = throne_domain::RulesetMirror::from_id(n);
@@ -907,6 +934,7 @@ fn apply_setting(s: &mut AppSettings, key: &str, value: &str) {
             }
         }
         "dns_disable_cache" => s.dns_disable_cache = parse_bool(value),
+        "fakeip_disable_ipv6" => s.fakeip_disable_ipv6 = parse_bool(value),
         "dns_disable_expire" => s.dns_disable_expire = parse_bool(value),
         "dns_persist_cache" => s.dns_persist_cache = parse_bool(value),
         "dns_reverse_mapping" => s.dns_reverse_mapping = parse_bool(value),
@@ -979,6 +1007,54 @@ pub fn load_or_seed_demo(db: &Database) -> Result<AppState, StorageError> {
 mod tests {
     use super::*;
     use throne_domain::{ProfileSortColumn, ProfileType};
+
+    #[test]
+    fn wireguard_peer_fields_and_endpoint_override_survive_database_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("throne.db");
+        let mut state = AppState::empty();
+        let gid = state.add_group("WG");
+        let raw = serde_json::json!({"type":"wireguard","tag":"WG","private_key":"private","address":["10.0.0.2/32"],"worker_count":2,"peers":[{"address":"edge.example","port":51820,"public_key":"public","pre_shared_key":"secret"}],"amnezia_wg":{"jc":4}});
+        state.import_profiles(vec![(
+            "WG".into(),
+            ProfileType::Wireguard,
+            ParsedOutbound {
+                raw_json: Some(raw.to_string()),
+                ..Default::default()
+            },
+            false,
+        )]);
+        let id = state.all_profiles()[0].id;
+        state
+            .set_profile_endpoint(
+                id,
+                throne_domain::EndpointSource::Address {
+                    address: "192.0.2.9".into(),
+                },
+            )
+            .unwrap();
+        Database::open(&path).unwrap().save_state(&state).unwrap();
+        let reopened = Database::open(&path).unwrap().load_state().unwrap();
+        let p = reopened.profile(id).unwrap();
+        assert_eq!(p.group_id, gid);
+        assert_eq!(p.outbound.server.as_deref(), Some("edge.example"));
+        assert_eq!(p.outbound.server_port, Some(51820));
+        assert_eq!(p.outbound.password.as_deref(), Some("private"));
+        assert_eq!(p.outbound.username.as_deref(), Some("public"));
+        assert_eq!(p.outbound.method.as_deref(), Some("secret"));
+        assert_eq!(p.outbound.path.as_deref(), Some("10.0.0.2/32"));
+        let materialized = throne_domain::materialize_profile_endpoint(p, None, None).unwrap();
+        let changed: serde_json::Value =
+            serde_json::from_str(&materialized.export_outbound_json()).unwrap();
+        assert_eq!(changed["peers"][0]["address"], "192.0.2.9");
+        assert_eq!(changed["peers"][0]["port"], 51820);
+        assert_eq!(changed["peers"][0]["pre_shared_key"], "secret");
+        assert_eq!(changed["amnezia_wg"]["jc"], 4);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&p.export_outbound_json()).unwrap(),
+            raw
+        );
+    }
 
     #[test]
     fn sorted_profile_order_survives_database_reopen() {
@@ -1163,5 +1239,24 @@ mod tests {
             )
             .unwrap();
         assert_eq!(v, "yes");
+    }
+
+    #[test]
+    fn beta2_log_and_fakeip_preferences_roundtrip_without_changing_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("throne.db")).unwrap();
+        let mut state = AppState::with_demo_data();
+        assert_eq!(state.settings().max_log_line, 500);
+        assert!(!state.settings().fakeip_disable_ipv6);
+        state.settings_mut().log_font_family = "Menlo".into();
+        state.settings_mut().log_font_size = 15;
+        state.settings_mut().max_log_line = 777;
+        state.settings_mut().fakeip_disable_ipv6 = true;
+        db.save_state(&state).unwrap();
+        let loaded = db.load_state().unwrap();
+        assert_eq!(loaded.settings().log_font_family, "Menlo");
+        assert_eq!(loaded.settings().log_font_size, 15);
+        assert_eq!(loaded.settings().max_log_line, 777);
+        assert!(loaded.settings().fakeip_disable_ipv6);
     }
 }

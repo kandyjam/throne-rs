@@ -187,6 +187,11 @@ impl RouteRule {
             && self.network.is_empty()
             && self.port.is_empty()
             && self.source_port.is_empty()
+            && !(matches!(self.action.as_str(), "route" | "route-options")
+                && (self.tls_fragment
+                    || self.tls_record_fragment
+                    || !self.override_address.is_empty()
+                    || !self.override_port.is_empty()))
     }
 
     fn blank_simple(rule_type: i32, action: SimpleAction) -> Self {
@@ -271,7 +276,14 @@ impl RouteProfile {
 
     fn reset_simple_rule(&mut self, rule_type: i32, action: SimpleAction) {
         if let Some(r) = self.rules.iter_mut().find(|r| r.rule_type == rule_type) {
-            *r = RouteRule::blank_simple(rule_type, action);
+            // Basic edits replace match lines, not the route options edited in Advanced.
+            let mut replacement = RouteRule::blank_simple(rule_type, action);
+            replacement.tls_fragment = r.tls_fragment;
+            replacement.tls_record_fragment = r.tls_record_fragment;
+            replacement.tls_fragment_fallback_delay = r.tls_fragment_fallback_delay.clone();
+            replacement.override_address = r.override_address.clone();
+            replacement.override_port = r.override_port.clone();
+            *r = replacement;
             return;
         }
         self.rules.push(RouteRule::blank_simple(rule_type, action));

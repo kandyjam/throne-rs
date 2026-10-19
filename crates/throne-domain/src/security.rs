@@ -251,7 +251,9 @@ fn singbox_security(ty: ProfileType, value: &Value, skip_cert: bool) -> Security
             let mut info = if has_tls && (must_tls || tls["enabled"] == true) {
                 if tls["reality"]["enabled"] == true {
                     SecurityInfo::new("Reality", Secure)
-                } else if nonempty(&tls["certificate_public_key_sha256"]) {
+                } else if nonempty(&tls["certificate_sha256"])
+                    || nonempty(&tls["certificate_public_key_sha256"])
+                {
                     SecurityInfo::new("TLS", Secure)
                 } else if tls["insecure"] == true {
                     SecurityInfo::new("Insecure TLS", Weak)
@@ -342,6 +344,7 @@ fn custom_security(value: &Value) -> SecurityInfo {
 fn masque_security(value: &Value) -> SecurityInfo {
     let tls = &value["tls"];
     let info = if !text(value, "peer_public_key").is_empty()
+        || nonempty(&tls["certificate_sha256"])
         || nonempty(&tls["certificate_public_key_sha256"])
     {
         SecurityInfo::new("TLS", SecurityLevel::Secure)
@@ -493,6 +496,7 @@ mod tests {
     #[test]
     fn pinned_tls_reality_naive_and_custom_are_not_globally_compromised() {
         for tls in [
+            json!({"enabled":true,"insecure":true,"certificate_sha256":["whole-certificate-pin"]}),
             json!({"enabled":true,"insecure":true,"certificate_public_key_sha256":["pin"]}),
             json!({"enabled":true,"reality":{"enabled":true}}),
         ] {

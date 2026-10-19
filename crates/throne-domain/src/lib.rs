@@ -15,7 +15,8 @@ mod store;
 mod version;
 
 pub use auto_selector::{
-    classify_custom_member, is_xray_full_config_member, plan_auto_selector, profile_auto_selector,
+    classify_custom_member, is_xray_full_config_member, plan_auto_selector,
+    plan_auto_selector_groups, profile_auto_selector, rerank_auto_selector_groups,
     rerank_auto_selector_pool, AutoSelectorConfig, AutoSelectorPlan, AutoSelectorSkip,
     CustomMemberKind,
 };

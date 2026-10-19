@@ -184,6 +184,52 @@ pub struct ParsedOutbound {
 }
 
 impl ParsedOutbound {
+    /// Recover display/edit fields from either upstream WireGuard JSON layout.
+    /// The caller retains the original JSON, including all additional peers.
+    pub fn hydrate_wireguard_fields(&mut self, value: &serde_json::Value) {
+        use serde_json::Value;
+        if value.get("type").and_then(Value::as_str) != Some("wireguard") {
+            return;
+        }
+        let peer = value.pointer("/peers/0");
+        let field = |modern: &str, legacy: &str| {
+            peer.and_then(|p| p.get(modern))
+                .or_else(|| value.get(legacy))
+        };
+        self.server = field("address", "server")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        self.server_port = field("port", "server_port")
+            .and_then(Value::as_u64)
+            .and_then(|port| u16::try_from(port).ok())
+            .filter(|port| *port > 0);
+        self.password = value
+            .get("private_key")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        self.username = field("public_key", "peer_public_key")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        self.method = field("pre_shared_key", "pre_shared_key")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        self.path = value
+            .get("address")
+            .or_else(|| value.get("local_address"))
+            .and_then(|addresses| {
+                addresses.as_str().map(str::to_owned).or_else(|| {
+                    Some(
+                        addresses
+                            .as_array()?
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    )
+                })
+            });
+    }
+
     /// Wire-compatible `outbound_json` for SQLite (upstream `ExportToJson` shape).
     ///
     /// Must include a real protocol `"type"` so Qt Throne's `ParseFromJson`
@@ -524,7 +570,10 @@ fn synthesize_upstream_outbound(
                     .collect::<Vec<_>>()),
             );
         }
-        if let Some(fp) = o.fp.as_ref().filter(|s| !s.is_empty()) {
+        if let Some(fp) =
+            o.fp.as_ref()
+                .filter(|s| !s.is_empty() && s.as_str() != "unsafe")
+        {
             tls.insert("utls".into(), json!({ "enabled": true, "fingerprint": fp }));
         }
         if o.security
@@ -540,6 +589,8 @@ fn synthesize_upstream_outbound(
             if let Some(sid) = o.sid.as_ref().filter(|s| !s.is_empty()) {
                 reality.insert("short_id".into(), Value::String(sid.clone()));
             }
+            tls.entry("utls")
+                .or_insert_with(|| json!({"enabled":true,"fingerprint":"random"}));
             tls.insert("reality".into(), Value::Object(reality));
         }
         map.insert("tls".into(), Value::Object(tls));
@@ -827,8 +878,13 @@ impl Profile {
     pub fn display_address(&self) -> String {
         if self.profile_type == ProfileType::AutoSelector {
             if let Some(cfg) = crate::auto_selector::profile_auto_selector(self) {
-                if cfg.gid >= 0 {
-                    return format!("group#{}", cfg.gid);
+                if !cfg.gids.is_empty() {
+                    return cfg
+                        .gids
+                        .iter()
+                        .map(|id| format!("group#{id}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
                 }
             }
             return "group".into();
@@ -891,6 +947,11 @@ pub struct Group {
     pub traffic_sort_by: i32,
     pub test_items_to_show: i32,
     pub type_sort_by: i32,
+    /// Upstream GroupSortMethod: raw=0, type=1, address=2, name=3, test=4, id=5, traffic=6, security=7, latency=8.
+    #[serde(default)]
+    pub sort_method: i32,
+    #[serde(default)]
+    pub sort_descending: bool,
     #[serde(default)]
     pub endpoint: crate::EndpointSource,
     /// Preserve upstream subscription extension keys without narrowing them.
@@ -920,6 +981,8 @@ impl Group {
             traffic_sort_by: 0,
             test_items_to_show: 0,
             type_sort_by: 0,
+            sort_method: 0,
+            sort_descending: false,
             endpoint: crate::EndpointSource::default(),
             sub_options: serde_json::json!({}),
             sub_metadata: serde_json::json!({}),
@@ -1216,6 +1279,12 @@ pub struct AppSettings {
     pub system_dns_set: bool,
     pub theme: String,
     pub log_level: String,
+    #[serde(default)]
+    pub log_font_family: String,
+    #[serde(default)]
+    pub log_font_size: i32,
+    #[serde(default = "default_max_log_line")]
+    pub max_log_line: usize,
     /// CDN for remote `.srs` rule-sets (`ruleset_mirror` in SettingsRepo).
     #[serde(default)]
     pub ruleset_mirror: RulesetMirror,
@@ -1250,6 +1319,8 @@ pub struct AppSettings {
     pub dns_persist_cache: bool,
     #[serde(default)]
     pub dns_reverse_mapping: bool,
+    #[serde(default)]
+    pub fakeip_disable_ipv6: bool,
     #[serde(default = "default_true")]
     pub enable_dns_routing: bool,
     #[serde(default)]
@@ -1329,6 +1400,10 @@ fn default_redirect_port() -> i32 {
     12345
 }
 
+fn default_max_log_line() -> usize {
+    500
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -1376,6 +1451,9 @@ impl Default for AppSettings {
             // Upstream default after migration: follow OS light/dark.
             theme: "System".into(),
             log_level: "info".into(),
+            log_font_family: String::new(),
+            log_font_size: 0,
+            max_log_line: default_max_log_line(),
             // upstream default: Mirrors::CLOUDFLARE
             ruleset_mirror: RulesetMirror::Cloudflare,
             adblock_enable: false,
@@ -1391,6 +1469,7 @@ impl Default for AppSettings {
             dns_disable_expire: false,
             dns_persist_cache: false,
             dns_reverse_mapping: false,
+            fakeip_disable_ipv6: false,
             enable_dns_routing: true,
             use_dns_object: false,
             dns_object: String::new(),
@@ -1645,6 +1724,12 @@ pub struct RouteRule {
     pub no_drop: bool,
     pub override_address: String,
     pub override_port: String,
+    #[serde(default)]
+    pub tls_fragment: bool,
+    #[serde(default)]
+    pub tls_fragment_fallback_delay: String,
+    #[serde(default)]
+    pub tls_record_fragment: bool,
     pub sniffers: Vec<String>,
     pub sniff_override_dest: bool,
     pub strategy: String,

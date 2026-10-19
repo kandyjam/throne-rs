@@ -670,11 +670,6 @@ pub fn input_area_tall(state: &Entity<TextareaState>, height: f32) -> impl IntoE
         .child(Textarea::new(state).h(px(height)))
 }
 
-/// Full-width [`Editor`] (used for rule fields that need completion).
-pub fn editor_area(state: &Entity<EditorState>) -> impl IntoElement {
-    div().w_full().child(Editor::new(state))
-}
-
 /// [`Editor`] with a definite pixel height.
 pub fn editor_area_tall(state: &Entity<EditorState>, height: f32) -> impl IntoElement {
     div()

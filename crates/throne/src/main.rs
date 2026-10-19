@@ -109,11 +109,9 @@ fn main() {
                 #[cfg(target_os = "macos")]
                 macos_hit::route_window_clicks();
 
-                if !dock_show && tray_cmd.is_none() {
-                    continue;
-                }
-
                 cx.update(|cx| {
+                    tray::sync_menu_state(main.read(cx).tray_menu_state());
+                    tray::apply_scheme(theme::active_scheme());
                     if dock_show && !closed_too_recently() {
                         show_main_window(cx, &window_slot, &main);
                     }
@@ -258,6 +256,9 @@ fn dispatch_tray_command(
         }
         tray::TrayCommand::ToggleStartWithSystem => {
             main.update(cx, |view, cx| view.tray_toggle_start_with_system(cx));
+        }
+        tray::TrayCommand::ToggleConnection => {
+            main.update(cx, |view, cx| view.toggle_proxy(cx));
         }
         tray::TrayCommand::ToggleRememberLast => {
             main.update(cx, |view, cx| view.tray_toggle_remember_last(cx));

@@ -12,13 +12,28 @@ description: >-
 Keep **throne-rs** (`rewrite/rust-gpui`) behaviorally aligned with
 [throneproj/Throne](https://github.com/throneproj/Throne) without reintroducing Qt.
 
+## 1.4.0-beta.3 feature notes (current pin)
+
+Verification on 2026-10-18: 310 workspace tests, desktop check, host core rebuild, 10 actual-core smoke groups and Go targeted/race tests passed. Strict Clippy remains blocked by 18 pre-existing domain lints; native desktop and privileged/cross-platform runtime remain untested.
+
+All **16 commits** since beta.2 are triaged in `docs/UPSTREAM_TRACKING.md`; the release pin is not a full-parity claim.
+
+- Multi-group Auto Selector `gids` preserves order, removes duplicates, retains legacy `gid`, tolerates missing groups, and resolves each group's eligibility for Start/rerank. The native profile editor selects tracked groups.
+- Group sorting persists upstream `sort_method`/`sort_descending`, re-sorts changed data and restores each group's header state.
+- TLS route fragmentation/record fragmentation and fallback delay survive DB/share round-trip, are editable and preserve non-terminal `route-options`.
+- Native TLS cipher suites are imported with unsupported values reported/dropped. `fp=unsafe` disables ordinary uTLS; REALITY retains required random uTLS. XHTTP/Xray JSON cipher suites use the full-config bridge. Invalid Clash ports cannot wrap and partial feeds block destructive subscription replacement.
+- Connections resolve generated tags to running profile/member names. QUIC I1–I5 generation and capability diagnostics have core/client support; desktop controls remain open.
+- Core matches beta.3 except retained Darwin NIC hardening. Rebuild with `./script/build-core`; existing staged setuid binaries require separate refresh.
+- Headless engine/service/API, country-provider customization, Clash VLESS engine preference, full validation/editor/export and historical scanner/Kill Switch/hotkey gaps remain explicit. See the matrix for executed evidence and runtime limits.
+
+
 ## Current pin
 
 | Item | Value |
 |------|--------|
 | Upstream remote | `upstream` → `https://github.com/throneproj/Throne.git` |
-| **Pin** | tag **`1.4.0-beta.1`** (`50a22014`, 2026-10-04) |
-| `upstream/dev` at last audit | `1.4.0-beta.1-13-g32138a44` on 2026-10-09 — do not absorb until asked |
+| **Pin** | tag **`1.4.0-beta.3`** (`01086027`, 2026-10-17) |
+| `upstream/dev` at last audit | `1.4.0-beta.3-6-gcb26b89e` on 2026-10-18 — later commits excluded |
 | Product version | root `VERSION` + workspace `Cargo.toml` `version` |
 | Matrix | [`docs/UPSTREAM_TRACKING.md`](../../docs/UPSTREAM_TRACKING.md) |
 | Audit command | `./script/upstream-audit [tag]` |
@@ -66,7 +81,20 @@ Proto lives at `core/gen/libcore.proto`. New contracts since 1.3.0-beta.3 includ
 | Main window / dialogs | `crates/throne/src/ui/` |
 | Import / deeplink | `throne-import` |
 
-## 1.4.0-beta.1 contracts and remaining gaps (current pin)
+## 1.4.0-beta.2 contracts and remaining gaps (current pin)
+
+All 14 release commits are triaged in `docs/UPSTREAM_TRACKING.md`.
+
+- TLS URI queries preserve literal `+`; ECH shorthand/legacy fields and whole-certificate pins persist. XHTTP VLESS and Xray JSON ECH use the existing `xrayfullconfig` bridge. Dedicated Xray editor/export and full-config batch-test parity remain open.
+- Native ECH HTTPS queries use direct/custom resolvers before proxy DNS, with the same ASCII query/match name; GUI resolver metadata is stripped from core TLS. Static configs skip bootstrap.
+- WireGuard/Amnezia names follow explicit/adjacent-peer and wrapper priority; `awg://` and obfuscation/peer options persist. DB reload restores display fields, and generation converts legacy beans and `worker_count` to core `workers`. INI imports one coherent last peer; full multi-peer INI remains open.
+- FakeIP uses `2001:db8::/32`, respects `fakeip_disable_ipv6`, and no longer overlaps ULA bypass.
+- Native log history uses monospace/font/size/max-line settings, a collapsible literal filter and hold/resume while scrolled up. Regex/highlighting remain a gap. Tray Connect/Disconnect transitions refresh independently of window visibility.
+- **Remote control API remains unported:** encrypted protocol/router/listener, key/allowlist and Integration settings are separate from the existing core tracker API. Kill Switch/global hotkeys/scanner and historical gaps remain open.
+- Core sources match beta.2 except the retained Darwin NIC patch; Go modules and proto did not change. Host core rebuilt; actual-core validation covers ECH, Amnezia endpoints, XHTTP/Xray and FakeIP. Live remote handshakes, privileged traffic and cross-platform GUI remain untested; see matrix for final test totals.
+- Verification on 2026-10-14: 290 workspace tests passed (10 suites), desktop check passed with two existing warnings, formatting/diff checks passed, and all seven rebuilt-core smoke groups passed. Regression fixes cover encoded plus/quoted repr preservation, WG peer association and DB reload/override, workers conversion and immediate log trimming.
+
+## 1.4.0-beta.1 contracts and remaining gaps (historical pin)
 
 The 23 commits from `1.3.2` to `1.4.0-beta.1` are individually triaged in `docs/UPSTREAM_TRACKING.md`. This is a core/schema baseline with partial product coverage, not a full-parity claim.
 

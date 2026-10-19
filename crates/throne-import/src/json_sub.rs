@@ -304,6 +304,7 @@ fn outbound_from_singbox(v: &Value) -> Option<ImportedProfile> {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
     }
+    outbound.hydrate_wireguard_fields(v);
     // Prefer original JSON for DB fidelity
     outbound.raw_json = Some(serde_json::to_string(v).unwrap_or_else(|_| "{}".into()));
 
@@ -326,6 +327,19 @@ fn xray_outbound(v: &Value) -> Option<ImportedProfile> {
         .and_then(|t| t.as_str())
         .unwrap_or(protocol)
         .to_string();
+
+    // Preserve Xray-only TLS/transport options through the existing full-config bridge.
+    // Flattening these into a sing-box leaf would silently lose ECH or XHTTP.
+    let stream = &v["streamSettings"];
+    if stream["tlsSettings"].get("echConfigList").is_some()
+        || stream["tlsSettings"].get("cipherSuites").is_some()
+        || matches!(stream["network"].as_str(), Some("xhttp" | "splithttp"))
+    {
+        return Some(custom_xray_full_profile(
+            &name,
+            &serde_json::json!({"outbounds":[v]}).to_string(),
+        ));
+    }
 
     // Prefer simplified extraction for vless/vmess/trojan/shadowsocks
     let mut outbound = ParsedOutbound {
@@ -477,7 +491,7 @@ fn custom_profile(name: &str, config: &str, full: bool) -> ImportedProfile {
 }
 
 /// Upstream `CustomXrayFullConfig` (`subtype = xrayfullconfig`).
-fn custom_xray_full_profile(name: &str, config: &str) -> ImportedProfile {
+pub(crate) fn custom_xray_full_profile(name: &str, config: &str) -> ImportedProfile {
     let outbound_json = serde_json::json!({
         "type": "custom",
         "name": name,
