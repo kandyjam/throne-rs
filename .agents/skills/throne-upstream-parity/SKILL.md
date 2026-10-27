@@ -19,8 +19,8 @@ Keep **throne-rs** (`rewrite/rust-gpui`) behaviorally aligned with
 |------|--------|
 | Upstream remote | `upstream` → `https://github.com/throneproj/Throne.git` |
 | Baseline branch | `upstream/dev` (or a release tag e.g. `1.2.4`) |
-| **Current pin** | tag **`1.4.0-beta.3`** (`01086027`, 2026-10-17) |
-| **Tip tracked** | `upstream/dev` describe `1.4.0-beta.3-6-gcb26b89e` on 2026-10-18; six later commits excluded |
+| **Current pin** | tag **`1.4.0-beta.4`** (`dd748826`, 2026-10-22) |
+| **Tip tracked** | `upstream/dev` describe `1.4.0-beta.4-15-g1f30af24` on 2026-10-27; 15 later commits excluded |
 | **1.2.5** | Never tagged; line jumped to **1.3.0-beta.1**. |
 | Product version | root [`VERSION`](../../VERSION) + workspace `Cargo.toml` `version` (= requested audited release tag / `NKR_VERSION`) |
 | Parity matrix | [`docs/UPSTREAM_TRACKING.md`](../../docs/UPSTREAM_TRACKING.md) |
@@ -101,7 +101,19 @@ Packaging scripts already read root `VERSION`.
 
 When **1.2.5** is tagged: `git log --oneline 1.2.4..1.2.5` → triage → bump `VERSION` + skill pin + matrix.
 
-## 1.4.0-beta.3 feature notes (current pin)
+## 1.4.0-beta.4 feature notes (current pin)
+
+Target `dd748826` (2026-10-22); audited 2026-10-27. All 32 commits since beta.3 are triaged in `docs/UPSTREAM_TRACKING.md`. `upstream/dev` is `1.4.0-beta.4-15-g1f30af24`; later commits are excluded. This release pin does not assert complete product parity.
+
+- Route-specific DNS and disabled rules persist through compatible DB/share/edit/remote refresh; Start/probe generation respects effective DNS and skips disabled rules before rule-set fetches.
+- Core and additive ResolveDomains/connection-rule RPCs match beta.4. Native selected/group domain resolution preserves identity; matched rules appear in Connections tooltips.
+- Native Ctrl/⌘K Command Palette and Core Options expose existing actions, mux presets, mixed-inbound disable and opt-in Xray system CA. Explicit trust choices and REALITY are retained.
+- XDrive JSON is losslessly bridged to Xray; unsupported XDrive share links fail visibly. Specialized form/validation/export remains.
+- Rebuild with `./script/build-core`; preserve the private source-guarded REALITY ML-KEM patch, Darwin physical-interface handling and managed local-resolver protection. Never overwrite legacy `core/server/` or assume installed privileged binaries refreshed automatically.
+- WebDAV, connection-to-specific-server routing, complete field search, full mux/XDrive forms and historical headless/API/scanner/Kill Switch/hotkey gaps remain explicit. See the matrix for executed checks and runtime limits.
+- Executed on 2026-10-27: 387 Rust workspace tests, strict production Clippy, desktop compilation, formatting, final host core rebuild with Darwin DNS patch race tests, and 13 actual-core smoke groups. Independent ECH review passed 18 extra config cases. All-target lint remains blocked by pre-existing test-only lints; native GUI, privileged DNS/TUN and cross-platform runtime remain untested.
+
+## 1.4.0-beta.3 feature notes (historical pin)
 
 Verification on 2026-10-18: 310 workspace tests, desktop check, host core rebuild, 10 actual-core smoke groups and Go targeted/race tests passed. Strict Clippy remains blocked by 18 pre-existing domain lints; native desktop and privileged/cross-platform runtime remain untested.
 

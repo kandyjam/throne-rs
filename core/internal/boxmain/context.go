@@ -6,6 +6,8 @@ import (
 	"os/user"
 	"strconv"
 
+	"ThroneCore/internal/sysdns"
+
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/experimental/deprecated"
 	"github.com/sagernet/sing-box/include"
@@ -18,7 +20,9 @@ var disableColor bool
 
 // Must stay per-box: boxes sharing one service.Registry each overwrite the previous box's MustRegister[OutboundManager].
 func newBoxContext() context.Context {
-	ctx := context.Background()
+	ctx := service.ContextWith[interface {
+		SystemDNSOverride(string) (string, []string, bool)
+	}](context.Background(), sysdns.DNSOverride{})
 	sudoUser := os.Getenv("SUDO_USER")
 	ownerUID, _ := strconv.Atoi(os.Getenv("SUDO_UID"))
 	ownerGID, _ := strconv.Atoi(os.Getenv("SUDO_GID"))

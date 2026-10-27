@@ -266,18 +266,8 @@ impl AutoSelectorConfig {
         let mut seen = std::collections::HashSet::new();
         self.gids.retain(|gid| *gid >= 0 && seen.insert(*gid));
         self.gid = self.gids.first().copied().unwrap_or(-1);
-        if self.pool_cap < 1 {
-            self.pool_cap = 1;
-        }
-        if self.pool_cap > Self::MAX_POOL_CAP {
-            self.pool_cap = Self::MAX_POOL_CAP;
-        }
-        if self.build_limit < 1 {
-            self.build_limit = 1;
-        }
-        if self.build_limit > Self::MAX_BUILD_LIMIT {
-            self.build_limit = Self::MAX_BUILD_LIMIT;
-        }
+        self.pool_cap = self.pool_cap.clamp(1, Self::MAX_POOL_CAP);
+        self.build_limit = self.build_limit.clamp(1, Self::MAX_BUILD_LIMIT);
         if self.build_limit > self.pool_cap {
             self.build_limit = self.pool_cap;
         }
@@ -308,12 +298,7 @@ impl AutoSelectorConfig {
         if self.active_size > self.build_limit {
             self.active_size = self.build_limit;
         }
-        if self.sampling < 2 {
-            self.sampling = 2;
-        }
-        if self.sampling > 60 {
-            self.sampling = 60;
-        }
+        self.sampling = self.sampling.clamp(2, 60);
         if self.tolerance_ms < 0 {
             self.tolerance_ms = 0;
         }
@@ -323,12 +308,7 @@ impl AutoSelectorConfig {
         if self.expected > self.build_limit {
             self.expected = self.build_limit;
         }
-        if self.dial_retries < 0 {
-            self.dial_retries = 0;
-        }
-        if self.dial_retries > 5 {
-            self.dial_retries = 5;
-        }
+        self.dial_retries = self.dial_retries.clamp(0, 5);
         if self.balance_interval_sec < 5 {
             self.balance_interval_sec = 5;
         }
@@ -406,19 +386,15 @@ impl AutoSelectorConfig {
 pub fn profile_auto_selector(profile: &Profile) -> Option<AutoSelectorConfig> {
     if profile.profile_type == ProfileType::AutoSelector {
         return AutoSelectorConfig::from_outbound_json(&profile.outbound_json).or_else(|| {
-            let mut cfg = AutoSelectorConfig::default();
-            cfg.name = profile.name.clone();
-            Some(cfg)
+            Some(AutoSelectorConfig {
+                name: profile.name.clone(),
+                ..AutoSelectorConfig::default()
+            })
         });
     }
-    AutoSelectorConfig::from_outbound_json(&profile.outbound_json).and_then(|cfg| {
-        // Only accept non-typed JSON when it clearly looks like a selector.
-        if !cfg.gids.is_empty() {
-            Some(cfg)
-        } else {
-            None
-        }
-    })
+    // Only accept non-typed JSON when it clearly looks like a selector.
+    AutoSelectorConfig::from_outbound_json(&profile.outbound_json)
+        .filter(|cfg| !cfg.gids.is_empty())
 }
 
 fn now_secs() -> i64 {
@@ -873,6 +849,57 @@ mod tests {
         p.outbound.server = Some(format!("{name}.example.com"));
         p.outbound.server_port = Some(443);
         p
+    }
+
+    #[test]
+    fn normalization_preserves_bounds_and_limits_build_to_pool() {
+        for (pool, build, sampling, retries, expected) in [
+            (i32::MIN, i32::MIN, i32::MIN, i32::MIN, (1, 1, 2, 0)),
+            (1, 1, 2, 0, (1, 1, 2, 0)),
+            (20, 10, 15, 3, (20, 10, 15, 3)),
+            (3000, 500, 60, 5, (3000, 500, 60, 5)),
+            (i32::MAX, i32::MAX, i32::MAX, i32::MAX, (3000, 500, 60, 5)),
+            (3, 500, 10, 1, (3, 3, 10, 1)),
+        ] {
+            let mut cfg = AutoSelectorConfig {
+                pool_cap: pool,
+                build_limit: build,
+                sampling,
+                dial_retries: retries,
+                ..AutoSelectorConfig::default()
+            };
+            cfg.normalize();
+            assert_eq!(
+                (
+                    cfg.pool_cap,
+                    cfg.build_limit,
+                    cfg.sampling,
+                    cfg.dial_retries
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_typed_selector_falls_back_to_profile_name() {
+        let mut profile = Profile::new(1, 1, "Saved selector", ProfileType::AutoSelector);
+        profile.outbound_json = "not json".into();
+        let cfg = profile_auto_selector(&profile).expect("typed selector fallback");
+        assert_eq!(cfg.name, "Saved selector");
+        assert!(cfg.gids.is_empty());
+        assert_eq!(cfg.pool_cap, AutoSelectorConfig::default().pool_cap);
+    }
+
+    #[test]
+    fn untyped_selector_requires_a_valid_tracked_group() {
+        let mut profile = Profile::new(1, 1, "Custom", ProfileType::Custom);
+        for raw in ["{}", r#"{"gids":[]}"#, r#"{"gids":[-1]}"#, "not json"] {
+            profile.outbound_json = raw.into();
+            assert!(profile_auto_selector(&profile).is_none(), "{raw}");
+        }
+        profile.outbound_json = r#"{"gids":[7]}"#.into();
+        assert_eq!(profile_auto_selector(&profile).unwrap().gids, vec![7]);
     }
 
     #[test]

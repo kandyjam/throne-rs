@@ -117,9 +117,7 @@ pub fn path_on_nosuid_volume(path: &Path) -> bool {
             continue;
         }
         let len = mnt.len();
-        let nosuid = opts
-            .split(|c| c == ',' || c == ' ' || c == ')')
-            .any(|t| t == "nosuid");
+        let nosuid = opts.split([',', ' ', ')']).any(|t| t == "nosuid");
         if best.map(|(l, _)| len >= l).unwrap_or(true) {
             best = Some((len, nosuid));
         }
@@ -237,7 +235,7 @@ pub fn reexec_off_nosuid_volume(core_source: Option<&Path>) -> Result<bool, Stri
     {
         use std::os::unix::process::CommandExt;
         let err = cmd.exec();
-        return Err(format!("exec {} failed: {err}", dest_gui.display()));
+        Err(format!("exec {} failed: {err}", dest_gui.display()))
     }
     #[cfg(not(unix))]
     {
@@ -250,10 +248,7 @@ fn elevation_on_cooldown(path: &Path) -> bool {
     let Ok(g) = RECENT_ELEVATION.lock() else {
         return false;
     };
-    match g.as_ref() {
-        Some((p, t)) if p == path && t.elapsed() < ELEVATION_COOLDOWN => true,
-        _ => false,
-    }
+    matches!(g.as_ref(), Some((p, t)) if p == path && t.elapsed() < ELEVATION_COOLDOWN)
 }
 
 fn mark_elevation(path: &Path) {

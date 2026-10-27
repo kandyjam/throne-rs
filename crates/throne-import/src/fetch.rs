@@ -40,7 +40,17 @@ impl FetchOptions {
             if !core_running {
                 return Err("Request with proxy but no profile started.".into());
             }
-            Self::with_http_proxy(&settings.inbound_address, settings.inbound_socks_port)?
+            if settings.disable_mixed_inbound {
+                if !settings.tun_mode_enabled {
+                    return Err(
+                        "Request with proxy but the mixed inbound is disabled and Tun Mode is off."
+                            .into(),
+                    );
+                }
+                Self::default()
+            } else {
+                Self::with_http_proxy(&settings.inbound_address, settings.inbound_socks_port)?
+            }
         } else {
             Self::default()
         };

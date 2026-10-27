@@ -1,0 +1,217 @@
+--- a/dns/transport/local/systemconfig/source_darwin.go
++++ b/dns/transport/local/systemconfig/source_darwin.go
+@@ -117,6 +117,7 @@
+ import (
+ 	"context"
+ 	"encoding/binary"
++	"net"
+ 	"net/netip"
+ 	"strconv"
+ 	"sync"
+@@ -134,16 +135,22 @@
+ 
+ type Source struct {
+ 	interfaceMonitor tun.DefaultInterfaceMonitor
+-	access           sync.Mutex
+-	notifyToken      C.int
+-	notifyValid      bool
+-	stale            bool
+-	interfaceIndex   int
+-	config           *Config
++	dnsOverride      interface {
++		SystemDNSOverride(string) (string, []string, bool)
++	}
++	access         sync.Mutex
++	notifyToken    C.int
++	notifyValid    bool
++	stale          bool
++	interfaceIndex int
++	config         *Config
+ }
+ 
+ func NewSource(ctx context.Context) *Source {
+ 	source := &Source{
++		dnsOverride: service.FromContext[interface {
++			SystemDNSOverride(string) (string, []string, bool)
++		}](ctx),
+ 		interfaceMonitor: service.FromContext[adapter.NetworkManager](ctx).InterfaceMonitor(),
+ 	}
+ 	if C.box_dnsinfo_load() != 0 {
+@@ -179,7 +186,9 @@
+ 	if s.interfaceMonitor != nil {
+ 		myInterfaces = s.interfaceMonitor.MyInterfaces()
+ 	}
+-	replaceOwnTunServers(config, interfaceIndex, myInterfaces)
++	if !s.replaceManagedServers(config, interfaceIndex) {
++		replaceOwnTunServers(config, interfaceIndex, myInterfaces)
++	}
+ 	if s.config != nil && config.Equal(s.config) {
+ 		return s.config
+ 	}
+@@ -367,3 +376,65 @@
+ 	}
+ 	return port
+ }
++
++// The owner retains static DNS before redirecting the system resolver. DHCP is
++// consulted only for services that originally had no explicit DNS servers.
++// An inaccessible ownership record cannot establish that DHCP is appropriate.
++func (s *Source) replaceManagedServers(config *Config, interfaceIndex int) bool {
++	if s.dnsOverride == nil {
++		return false
++	}
++	iface, err := net.InterfaceByIndex(interfaceIndex)
++	if err != nil {
++		// Without a device, saved DNS cannot be trusted or DHCP queried. The
++		// provider can still identify its alias for conservative exclusion.
++		alias, _, _ := s.dnsOverride.SystemDNSOverride("")
++		return replaceManagedDNS(config, alias, nil, false, nil)
++	}
++	alias, saved, known := s.dnsOverride.SystemDNSOverride(iface.Name)
++	return replaceManagedDNS(config, alias, saved, known, func() []M.Socksaddr { return leaseServers(iface.Name) })
++}
++
++func replaceManagedDNS(config *Config, alias string, saved []string, known bool, lease func() []M.Socksaddr) bool {
++	address, err := netip.ParseAddr(alias)
++	if err != nil {
++		return false
++	}
++	found := false
++	for _, server := range config.Servers {
++		if server.Addr.Unmap() == address.Unmap() {
++			found = true
++			break
++		}
++	}
++	if !found {
++		return false
++	}
++	var servers []M.Socksaddr
++	if known {
++		for _, value := range saved {
++			if parsed, err := netip.ParseAddr(value); err == nil && parsed.Unmap() != address.Unmap() {
++				servers = append(servers, M.SocksaddrFrom(parsed, 53))
++			}
++		}
++		if len(saved) == 0 {
++			servers = lease()
++		}
++	}
++	// Unknown saved DNS and unavailable DHCP leases must fail closed rather than
++	// resolve through our listener; retain independent resolvers in their order.
++	var replacement []M.Socksaddr
++	for _, server := range config.Servers {
++		if server.Addr.Unmap() == address.Unmap() {
++			for _, upstream := range servers {
++				if upstream.Addr.IsValid() && upstream.Addr.Unmap() != address.Unmap() {
++					replacement = append(replacement, upstream)
++				}
++			}
++		} else {
++			replacement = append(replacement, server)
++		}
++	}
++	config.Servers = replacement
++	return true
++}
+--- /dev/null
++++ b/dns/transport/local/systemconfig/override_darwin_test.go
+@@ -0,0 +1,98 @@
++//go:build darwin && cgo
++
++package systemconfig
++
++import (
++	"net"
++	"reflect"
++	"testing"
++
++	M "github.com/sagernet/sing/common/metadata"
++)
++
++func TestManagedDNSNeverReturnsOwnAlias(t *testing.T) {
++	const alias = "127.0.0.53"
++	addr := func(s string) M.Socksaddr { return M.ParseSocksaddrHostPort(s, 53) }
++	for _, tc := range []struct {
++		name    string
++		alias   string
++		system  []M.Socksaddr
++		saved   []string
++		known   bool
++		lease   []M.Socksaddr
++		want    []M.Socksaddr
++		calls   int
++		handled bool
++	}{
++		{name: "preserve static DNS and IPv6 order", alias: alias, system: []M.Socksaddr{addr(alias)}, saved: []string{"192.0.2.53", "2001:db8::53"}, known: true, want: []M.Socksaddr{addr("192.0.2.53"), addr("2001:db8::53")}, handled: true},
++		{name: "DHCP service uses current lease", alias: alias, system: []M.Socksaddr{addr(alias)}, known: true, lease: []M.Socksaddr{addr("192.0.2.1")}, want: []M.Socksaddr{addr("192.0.2.1")}, calls: 1, handled: true},
++		{name: "missing DHCP fails closed", alias: alias, system: []M.Socksaddr{addr(alias)}, known: true, calls: 1, handled: true},
++		{name: "self alias excluded from saved DNS", alias: alias, system: []M.Socksaddr{addr(alias)}, saved: []string{alias, "::ffff:127.0.0.53", "192.0.2.53"}, known: true, want: []M.Socksaddr{addr("192.0.2.53")}, handled: true},
++		{name: "DHCP cannot return alias", alias: alias, system: []M.Socksaddr{addr(alias)}, known: true, lease: []M.Socksaddr{addr(alias)}, calls: 1, handled: true},
++		{name: "unmanaged local DNS unchanged", system: []M.Socksaddr{addr(alias)}, want: []M.Socksaddr{addr(alias)}},
++		{name: "system resolver change respected", alias: alias, system: []M.Socksaddr{addr("192.0.2.2")}, saved: []string{"192.0.2.53"}, known: true, want: []M.Socksaddr{addr("192.0.2.2")}},
++		{name: "independent system resolvers retained", alias: alias, system: []M.Socksaddr{addr("192.0.2.2"), addr(alias)}, saved: []string{"192.0.2.53"}, known: true, want: []M.Socksaddr{addr("192.0.2.2"), addr("192.0.2.53")}, handled: true},
++		{name: "unknown saved DNS never uses DHCP", alias: alias, system: []M.Socksaddr{addr(alias)}, lease: []M.Socksaddr{addr("192.0.2.1")}, handled: true},
++		{name: "unknown saved DNS cannot authorize stale servers", alias: alias, system: []M.Socksaddr{addr(alias)}, saved: []string{"192.0.2.53"}, handled: true},
++		{name: "unknown saved DNS retains independent IPv4 and IPv6", alias: alias, system: []M.Socksaddr{addr("2001:db8::53"), addr(alias), addr("192.0.2.53")}, lease: []M.Socksaddr{addr("192.0.2.1")}, want: []M.Socksaddr{addr("2001:db8::53"), addr("192.0.2.53")}, handled: true},
++		{name: "unknown saved DNS removes mapped alias", alias: alias, system: []M.Socksaddr{addr("::ffff:127.0.0.53"), addr(alias)}, handled: true},
++		{name: "unknown ownership leaves unrelated resolvers unchanged", alias: alias, system: []M.Socksaddr{addr("192.0.2.53")}, want: []M.Socksaddr{addr("192.0.2.53")}},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			calls := 0
++			cfg := &Config{Servers: tc.system}
++			handled := replaceManagedDNS(cfg, tc.alias, tc.saved, tc.known, func() []M.Socksaddr { calls++; return tc.lease })
++			if handled != tc.handled || !reflect.DeepEqual(cfg.Servers, tc.want) || calls != tc.calls {
++				t.Fatalf("handled=%v servers=%v lease calls=%d; want %v %v %d", handled, cfg.Servers, calls, tc.handled, tc.want, tc.calls)
++			}
++		})
++	}
++}
++
++type staticDNSOverride struct {
++	device  string
++	servers []string
++	known   bool
++}
++
++func (p *staticDNSOverride) SystemDNSOverride(device string) (string, []string, bool) {
++	p.device = device
++	return "127.0.0.53", p.servers, p.known
++}
++
++func TestSourceUsesManagedInterfaceDNS(t *testing.T) {
++	iface, err := net.InterfaceByName("lo0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, tc := range []struct {
++		name    string
++		known   bool
++		servers []string
++		want    []M.Socksaddr
++	}{
++		{name: "saved static DNS", known: true, servers: []string{"192.0.2.53"}, want: []M.Socksaddr{M.ParseSocksaddrHostPort("192.0.2.53", 53)}},
++		{name: "unknown DNS fails closed"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			provider := &staticDNSOverride{servers: tc.servers, known: tc.known}
++			source := &Source{dnsOverride: provider}
++			cfg := &Config{Servers: []M.Socksaddr{M.ParseSocksaddrHostPort("127.0.0.53", 53)}}
++			if !source.replaceManagedServers(cfg, iface.Index) || provider.device != "lo0" || !reflect.DeepEqual(cfg.Servers, tc.want) {
++				t.Fatalf("source did not apply DNS ownership: device=%q servers=%v; want %v", provider.device, cfg.Servers, tc.want)
++			}
++		})
++	}
++}
++
++func TestSourceUnknownInterfaceStillExcludesAlias(t *testing.T) {
++	independent := M.ParseSocksaddrHostPort("192.0.2.53", 53)
++	for _, index := range []int{0, -1} {
++		provider := &staticDNSOverride{device: "not queried", servers: []string{"203.0.113.53"}, known: true}
++		source := &Source{dnsOverride: provider}
++		cfg := &Config{Servers: []M.Socksaddr{M.ParseSocksaddrHostPort("127.0.0.53", 53), independent}}
++		if !source.replaceManagedServers(cfg, index) || provider.device != "" || !reflect.DeepEqual(cfg.Servers, []M.Socksaddr{independent}) {
++			t.Fatalf("index=%d unknown interface did not exclude alias: device=%q servers=%v", index, provider.device, cfg.Servers)
++		}
++	}
++}

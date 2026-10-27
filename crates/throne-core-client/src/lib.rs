@@ -15,8 +15,8 @@ mod scan;
 mod sys_proxy;
 
 pub use config_build::{
-    apply_ruleset_mirror, build_load_config, build_load_config_ex, build_url_test_config,
-    AutoSelectorBuild, BuiltConfig,
+    apply_ruleset_mirror, build_load_config, build_load_config_ex, build_resolve_config,
+    build_url_test_config, AutoSelectorBuild, BuiltConfig,
 };
 pub use privilege::{
     core_has_setuid, core_is_root_setuid, core_path_beside_gui, find_core_real_path, is_setuid_set,
@@ -25,7 +25,7 @@ pub use privilege::{
 };
 pub use proto_wire::{
     AutoSelectorGroupStatus, AutoSelectorMemberStatus, ConnectionRow, CorePrivileges, IpTestResult,
-    SpeedTestResult, UrlTestResult,
+    ResolveDomainsRequest, ResolveDomainsResponse, ResolvedDomain, SpeedTestResult, UrlTestResult,
 };
 pub use rule_set_list::{lookup_rule_set_url, RULE_SET_LIST};
 pub use scan::{
@@ -477,6 +477,12 @@ impl CoreSession {
         auto_selector: Option<&AutoSelectorBuild>,
         apply_system_proxy: bool,
     ) -> Result<(), CoreError> {
+        if settings.disable_mixed_inbound && (apply_system_proxy || settings.system_proxy_enabled) {
+            return Err(CoreError::Config(
+                "System proxy requires the mixed SOCKS / HTTP inbound. Enable it before starting."
+                    .into(),
+            ));
+        }
         let built = build_load_config_ex(profile, settings, route_profile, auto_selector)?;
 
         // Tun needs a privileged core (setuid root). Check/request before Start.
@@ -879,6 +885,29 @@ impl CoreSession {
             direct_up,
             direct_down,
         })
+    }
+
+    /// Resolve domains through the core's direct DNS, using the supplied probe config
+    /// when no running instance provides `dns-direct` (core ≥ 1.4.0-beta.4).
+    ///
+    /// Keep per-domain errors in the response; transport or probe startup errors return
+    /// [`CoreError`]. Call outside the UI thread: each batch of 16 may take five seconds.
+    pub fn resolve_domains(
+        &mut self,
+        request: &ResolveDomainsRequest,
+    ) -> Result<ResolveDomainsResponse, CoreError> {
+        if request.domains.is_empty() {
+            return Ok(ResolveDomainsResponse::default());
+        }
+        self.ensure_connected()?;
+        let batches = (request.domains.len() as u64).div_ceil(16);
+        let timeout = Duration::from_secs(30u64.saturating_add(batches.saturating_mul(5)));
+        let data = self.call(
+            "ResolveDomains",
+            &proto_wire::encode_resolve_domains_req(request),
+            timeout,
+        )?;
+        proto_wire::decode_resolve_domains_resp(&data)
     }
 
     pub fn query_connections(&mut self) -> Result<Vec<ConnectionRow>, CoreError> {
@@ -1336,21 +1365,19 @@ fn prepare_core_beside_gui(config: &CoreConfig) -> Result<PathBuf, CoreError> {
             _ => true,
         }
     };
-    if need_copy {
-        if source != dest {
-            info!(
-                from = %source.display(),
-                to = %dest.display(),
-                "copying ThroneCore beside GUI for parentcheck"
-            );
-            std::fs::copy(&source, &dest).map_err(|e| {
-                CoreError::Spawn(format!(
-                    "copy {} → {}: {e}",
-                    source.display(),
-                    dest.display()
-                ))
-            })?;
-        }
+    if need_copy && source != dest {
+        info!(
+            from = %source.display(),
+            to = %dest.display(),
+            "copying ThroneCore beside GUI for parentcheck"
+        );
+        std::fs::copy(&source, &dest).map_err(|e| {
+            CoreError::Spawn(format!(
+                "copy {} → {}: {e}",
+                source.display(),
+                dest.display()
+            ))
+        })?;
     }
 
     #[cfg(unix)]
@@ -1924,4 +1951,108 @@ fn connection_outbound_names(
         );
     }
     names
+}
+
+#[cfg(all(test, unix))]
+mod beta4_rpc_contracts {
+    use super::*;
+
+    fn request(stream: &mut UnixStream) -> (u32, String, Vec<u8>) {
+        let mut id = [0; 4];
+        stream.read_exact(&mut id).unwrap();
+        let mut method_len = [0; 2];
+        stream.read_exact(&mut method_len).unwrap();
+        let mut method = vec![0; u16::from_le_bytes(method_len) as usize];
+        stream.read_exact(&mut method).unwrap();
+        let mut len = [0; 4];
+        stream.read_exact(&mut len).unwrap();
+        let mut payload = vec![0; u32::from_le_bytes(len) as usize];
+        stream.read_exact(&mut payload).unwrap();
+        (
+            u32::from_le_bytes(id),
+            String::from_utf8(method).unwrap(),
+            payload,
+        )
+    }
+
+    fn reply(stream: &mut UnixStream, id: u32, status: u8, data: &[u8]) {
+        stream.write_all(&id.to_le_bytes()).unwrap();
+        stream.write_all(&[status]).unwrap();
+        stream
+            .write_all(&(data.len() as u32).to_le_bytes())
+            .unwrap();
+        stream.write_all(data).unwrap();
+    }
+
+    fn resolver_session(status: u8, data: Vec<u8>) -> (CoreSession, std::thread::JoinHandle<()>) {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        server
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut session = CoreSession::new(CoreConfig::default());
+        session.stream = Some(client);
+        session.connected = true;
+        let task = std::thread::spawn(move || {
+            let (id, method, bytes) = request(&mut server);
+            assert_eq!(
+                (id, method.as_str(), bytes.as_slice()),
+                (1, "IsPrivileged", &[][..])
+            );
+            reply(&mut server, id, 0, &[]);
+            let (id, method, bytes) = request(&mut server);
+            assert_eq!((id, method.as_str()), (2, "ResolveDomains"));
+            assert_eq!(bytes, [10, 1, b'a', 10, 1, b'b', 18, 2, b'{', b'}']);
+            reply(&mut server, id, status, &data);
+        });
+        (session, task)
+    }
+
+    #[test]
+    fn resolver_rpc_uses_exact_method_frame_and_keeps_per_domain_failure() {
+        // ResolveDomainsResponse: a -> 1.2.3.4, b -> NXDOMAIN.
+        let data = b"\x0a\x0c\x0a\x01a\x12\x071.2.3.4\x0a\x0d\x0a\x01b\x1a\x08NXDOMAIN".to_vec();
+        let (mut session, task) = resolver_session(0, data);
+        let result = session
+            .resolve_domains(&ResolveDomainsRequest {
+                domains: vec!["a".into(), "b".into()],
+                config: "{}".into(),
+            })
+            .unwrap();
+        task.join().unwrap();
+        assert_eq!(
+            result.results,
+            [
+                ResolvedDomain {
+                    domain: "a".into(),
+                    addresses: vec!["1.2.3.4".into()],
+                    error: String::new()
+                },
+                ResolvedDomain {
+                    domain: "b".into(),
+                    addresses: vec![],
+                    error: "NXDOMAIN".into()
+                },
+            ]
+        );
+        assert_eq!(session.running_profile_id(), None);
+    }
+
+    #[test]
+    fn resolver_rpc_reports_probe_startup_error_without_os_fallback() {
+        let (mut session, task) =
+            resolver_session(1, b"the probe config has no dns-direct server".to_vec());
+        let error = session
+            .resolve_domains(&ResolveDomainsRequest {
+                domains: vec!["a".into(), "b".into()],
+                config: "{}".into(),
+            })
+            .unwrap_err();
+        task.join().unwrap();
+        assert!(
+            matches!(error, CoreError::Rpc(message) if message == "the probe config has no dns-direct server")
+        );
+    }
 }

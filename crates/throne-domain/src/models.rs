@@ -303,7 +303,11 @@ pub fn normalize_outbound_json(
         .filter(|s| !s.is_empty())
     {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(candidate) {
-            if is_upstream_shaped_outbound(&v) {
+            // A Custom profile may store an entire core document rather than
+            // a subtype wrapper. Preserve that document on editor/DB round trips.
+            let custom_document = profile_type == ProfileType::Custom
+                && v.get("outbounds").is_some_and(serde_json::Value::is_array);
+            if is_upstream_shaped_outbound(&v) || custom_document {
                 return serde_json::to_string(&v).unwrap_or_else(|_| "{}".into());
             }
         }
@@ -1190,11 +1194,39 @@ pub fn upgrade_tun_private_ranges(list: Vec<String>) -> Vec<String> {
 /// Subset of upstream `SettingsRepo` defaults used by the Rust client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
+    #[serde(default = "default_disable_mixed_inbound")]
+    pub disable_mixed_inbound: bool,
+    #[serde(default = "default_xray_use_system_ca")]
+    pub xray_use_system_ca: bool,
+    #[serde(default = "default_mux_default_on")]
+    pub mux_default_on: bool,
+    #[serde(default = "default_mux_protocol")]
+    pub mux_protocol: String,
+    #[serde(default = "default_mux_mode")]
+    pub mux_mode: String,
+    #[serde(default = "default_mux_concurrency")]
+    pub mux_concurrency: i32,
+    #[serde(default = "default_mux_max_connections")]
+    pub mux_max_connections: i32,
+    #[serde(default = "default_mux_min_streams")]
+    pub mux_min_streams: i32,
+    #[serde(default = "default_mux_padding")]
+    pub mux_padding: bool,
+    #[serde(default = "default_mux_brutal")]
+    pub mux_brutal: bool,
+    #[serde(default = "default_mux_brutal_up_mbps")]
+    pub mux_brutal_up_mbps: i32,
+    #[serde(default = "default_mux_brutal_down_mbps")]
+    pub mux_brutal_down_mbps: i32,
     pub inbound_socks_port: i32,
     pub inbound_address: String,
     pub test_latency_url: String,
     pub remote_dns: String,
+    #[serde(default)]
+    pub remote_dns_disable_ipv6: bool,
     pub direct_dns: String,
+    #[serde(default)]
+    pub direct_dns_disable_ipv6: bool,
     pub vpn_strict_route: bool,
     /// Linux auto-redirect (upstream default true). Prevents this host acting as a gateway.
     #[serde(default = "default_true")]
@@ -1404,15 +1436,66 @@ fn default_max_log_line() -> usize {
     500
 }
 
+fn default_disable_mixed_inbound() -> bool {
+    false
+}
+fn default_xray_use_system_ca() -> bool {
+    false
+}
+fn default_mux_default_on() -> bool {
+    false
+}
+fn default_mux_protocol() -> String {
+    "smux".into()
+}
+fn default_mux_mode() -> String {
+    "max_streams".into()
+}
+fn default_mux_concurrency() -> i32 {
+    8
+}
+fn default_mux_max_connections() -> i32 {
+    4
+}
+fn default_mux_min_streams() -> i32 {
+    4
+}
+fn default_mux_padding() -> bool {
+    false
+}
+fn default_mux_brutal() -> bool {
+    false
+}
+fn default_mux_brutal_up_mbps() -> i32 {
+    0
+}
+fn default_mux_brutal_down_mbps() -> i32 {
+    0
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            disable_mixed_inbound: default_disable_mixed_inbound(),
+            xray_use_system_ca: default_xray_use_system_ca(),
+            mux_default_on: default_mux_default_on(),
+            mux_protocol: default_mux_protocol(),
+            mux_mode: default_mux_mode(),
+            mux_concurrency: default_mux_concurrency(),
+            mux_max_connections: default_mux_max_connections(),
+            mux_min_streams: default_mux_min_streams(),
+            mux_padding: default_mux_padding(),
+            mux_brutal: default_mux_brutal(),
+            mux_brutal_up_mbps: default_mux_brutal_up_mbps(),
+            mux_brutal_down_mbps: default_mux_brutal_down_mbps(),
             inbound_socks_port: 2080,
             inbound_address: "127.0.0.1".into(),
             test_latency_url: "https://www.gstatic.com/generate_204".into(),
             // upstream 56d0d9fd — Google DoH as default remote DNS
             remote_dns: "https://dns.google/dns-query".into(),
+            remote_dns_disable_ipv6: false,
             direct_dns: "localhost".into(),
+            direct_dns_disable_ipv6: false,
             vpn_strict_route: false,
             vpn_auto_redirect: true,
             // upstream SettingsRepo default is 1500; keep 9000 only if user already persisted it
@@ -1692,6 +1775,9 @@ impl DefaultOutbound {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteRule {
     pub name: String,
+    /// Retained in the profile but omitted from generated routing and DNS rules.
+    #[serde(default)]
+    pub disabled: bool,
     /// Persisted as raw int enum (`ruleType` in RouteRule.h).
     pub rule_type: i32,
     /// Share-schema token when imported from JSON (not stored in SQLite).
@@ -1757,6 +1843,7 @@ impl RouteRule {
             "simple_address_warp_bypass" => 10,
             "simple_process_name_warp_bypass" => 11,
             "simple_process_path_warp_bypass" => 12,
+            "endpoint_preferred_by" => 13,
             // legacy / loose tokens
             "simple" | "custom" | "" => 0,
             _ => 0,
@@ -1777,6 +1864,7 @@ impl RouteRule {
             10 => "simple_address_warp_bypass",
             11 => "simple_process_name_warp_bypass",
             12 => "simple_process_path_warp_bypass",
+            13 => "endpoint_preferred_by",
             _ => "custom",
         }
     }
@@ -1802,6 +1890,11 @@ pub struct RouteProfile {
     /// Subset of `endpoint_profile_ids` whose inner chain hops are also addressable (1.3.0-beta.3).
     #[serde(default)]
     pub inner_hop_endpoint_ids: Vec<i64>,
+    /// Use this profile's DNS while retaining the saved override when disabled.
+    #[serde(default)]
+    pub custom_dns: bool,
+    #[serde(default)]
+    pub dns: Option<crate::RouteDns>,
 }
 
 impl RouteProfile {
@@ -1820,6 +1913,8 @@ impl RouteProfile {
             remote_last_update: 0,
             endpoint_profile_ids: Vec::new(),
             inner_hop_endpoint_ids: Vec::new(),
+            custom_dns: false,
+            dns: None,
         }
     }
 

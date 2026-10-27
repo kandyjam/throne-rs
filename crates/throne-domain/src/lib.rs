@@ -9,6 +9,8 @@ mod ip_list;
 mod ip_scan;
 mod local_network;
 mod models;
+mod profile_edit;
+mod route_dns;
 mod route_simple;
 mod security;
 mod store;
@@ -34,6 +36,8 @@ pub use local_network::{
     lan_inbound_is_wildcard,
 };
 pub use models::*;
+pub use profile_edit::{ProfileEditDraft, ProfileEditField, ProfileEditKind, ProfileEditSection};
+pub use route_dns::RouteDns;
 pub use route_simple::{connection_route_targets, ConnectionRouteTarget, SimpleAction};
 pub use security::{is_private_host, profile_security, SecurityInfo, SecurityLevel};
 pub use store::{

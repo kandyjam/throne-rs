@@ -18,7 +18,7 @@ pub struct BuiltConfig {
     pub need_xray: bool,
     pub xray_config: String,
     /// Upstream `LoadConfigReq.tun_ipv4_cidr` — set when Tun inbound is present.
-    /// Empty when Tun is off. Core uses this on Darwin to set system DNS to tunIP+1.
+    /// Empty when Tun is off. Core uses this to manage the Darwin DNS lifecycle.
     pub tun_ipv4_cidr: String,
     /// Opaque full Xray configs, each its own gated instance (proto field 16).
     pub xray_full_configs: Vec<String>,
@@ -61,6 +61,12 @@ pub fn build_load_config_ex(
     route_profile: Option<&RouteProfile>,
     auto_selector: Option<&AutoSelectorBuild>,
 ) -> Result<BuiltConfig, CoreError> {
+    let effective_settings = route_profile.and_then(RouteProfile::active_dns).map(|dns| {
+        let mut effective = settings.clone();
+        dns.apply_to_settings(&mut effective);
+        effective
+    });
+    let settings = effective_settings.as_ref().unwrap_or(settings);
     let mut xray_full_configs = Vec::new();
     let mut xray_lazy_start = false;
     let mut xray_idle_seconds = 0;
@@ -89,7 +95,7 @@ pub fn build_load_config_ex(
                 .into(),
         ));
     } else if is_xray_full_config_member(profile) {
-        let bridge = build_xray_full_member(profile)?;
+        let bridge = build_xray_full_member(profile, settings)?;
         xray_full_configs.push(bridge.xray_config);
         let domains = collect_outbound_server_domains(profile);
         (bridge.socks_outbound, Vec::new(), domains)
@@ -117,6 +123,9 @@ pub fn build_load_config_ex(
         "listen": listen,
         "listen_port": port
     })];
+    if settings.disable_mixed_inbound {
+        inbounds.clear();
+    }
     // TUN inbound when toolbar Tun is on (needs privileges on macOS/Linux).
     // Mirrors upstream `buildInboundSection` (generate.cpp).
     let mut tun_ipv4_cidr = String::new();
@@ -160,8 +169,8 @@ pub fn build_load_config_ex(
         // - loopback + broadcast always excluded
         // - private LAN ranges excluded when bypass is enabled
         // - on Darwin, punch a hole for the Tun subnet itself: system DNS is
-        //   repointed at tunIP+1 (inside that subnet), and excluding the whole
-        //   172.16.0.0/12 would black-hole every DNS query.
+        //   historically used this subnet; preserve the compatibility carve-out
+        //   while beta.4 system DNS itself uses the loopback alias below.
         if !settings.disable_private_range_bypass {
             let excludes = build_tun_route_exclude_addrs(
                 &tun_ipv4_cidr,
@@ -173,10 +182,16 @@ pub fn build_load_config_ex(
                 .insert("route_exclude_address".into(), json!(excludes));
         }
         inbounds.push(tun);
+        if cfg!(target_os = "macos") {
+            inbounds.push(json!({"type":"direct","tag":"dns-system","listen":"127.0.0.53","listen_port":53,"reuse_addr":true}));
+        }
     }
 
     let (mut route_rules, mut rule_sets, route_final) =
         compile_route_section(route_profile, settings.ruleset_mirror);
+    if cfg!(target_os = "macos") && settings.tun_mode_enabled {
+        route_rules.insert(0, json!({"inbound":"dns-system","action":"hijack-dns"}));
+    }
     let l3_bridge = l3_bridge_enabled(settings, route_profile);
     if l3_bridge {
         route_rules = with_l3_bridge_twins(route_rules);
@@ -217,8 +232,13 @@ pub fn build_load_config_ex(
         route_rules.push(json!({ "action": "reject" }));
     }
 
-    let (mut dns, default_resolver_tag) =
-        build_dns_section(settings, settings.tun_mode_enabled, &proxy_direct_domains)?;
+    let (mut dns, default_resolver_tag) = build_dns_section(
+        settings,
+        settings.tun_mode_enabled,
+        &proxy_direct_domains,
+        route_profile,
+        effective_settings.is_some(),
+    )?;
 
     // Upstream buildRouteSection: default_domain_resolver = dns-direct (+ strategy);
     // auto_detect_interface only when Tun is on.
@@ -246,7 +266,10 @@ pub fn build_load_config_ex(
     let mut outbounds = extra_outbounds;
     outbounds.push(outbound);
     outbounds.push(json!({ "type": "direct", "tag": "direct" }));
-    apply_ech_dns(&mut dns, &mut outbounds);
+    for outbound in &mut outbounds {
+        apply_multiplex(outbound, settings);
+    }
+    apply_ech_dns(&mut dns, &mut outbounds, &default_resolver_tag)?;
     if l3_bridge {
         outbounds.push(json!({ "type": "bridge", "tag": "l3-direct", "bridge_name": "throne-br" }));
     }
@@ -294,6 +317,216 @@ pub fn build_load_config_ex(
     })
 }
 
+/// Preserve the mixed-inbound OS resolver while exposing configured direct DNS to RPCs.
+fn direct_dns_for_mixed(settings: &AppSettings) -> Value {
+    let mut dns = build_dns_obj(
+        &settings.direct_dns,
+        false,
+        &settings.core_box_underlying_dns,
+    );
+    dns["tag"] = json!("dns-direct");
+    dns["domain_resolver"] = json!("local");
+    dns
+}
+
+/// Upstream On follows the preset; Custom overrides its pool and padding/brutal choices.
+fn apply_multiplex(outbound: &mut Value, settings: &AppSettings) {
+    if !matches!(
+        outbound["type"].as_str(),
+        Some("vless" | "vmess" | "trojan" | "shadowsocks")
+    ) {
+        return;
+    }
+    let Some(object) = outbound.as_object_mut() else {
+        return;
+    };
+    let own = object.remove("multiplex").unwrap_or(Value::Null);
+    let unspecified = own["unspecified"]
+        .as_bool()
+        .unwrap_or(own.get("enabled").is_none());
+    let enabled = own["enabled"].as_bool().unwrap_or(false);
+    if !enabled && !(unspecified && settings.mux_default_on) {
+        return;
+    }
+    let custom = !unspecified
+        && enabled
+        && (own["protocol"].as_str().is_some_and(|v| !v.is_empty())
+            || ["max_connections", "min_streams", "max_streams"]
+                .iter()
+                .any(|k| own[k].as_i64().unwrap_or(0) > 0)
+            || own["padding"] == true
+            || own["brutal"]["enabled"] == true);
+    let mut protocol = settings.mux_protocol.as_str();
+    let mut by_connections = settings.mux_mode == "max_connections";
+    let mut max_connections = i64::from(settings.mux_max_connections);
+    let mut min_streams = i64::from(settings.mux_min_streams);
+    let mut max_streams = i64::from(settings.mux_concurrency);
+    let mut padding = settings.mux_padding;
+    let mut brutal = settings.mux_brutal;
+    let mut up = i64::from(settings.mux_brutal_up_mbps);
+    let mut down = i64::from(settings.mux_brutal_down_mbps);
+    if custom {
+        if let Some(p) = own["protocol"].as_str().filter(|p| !p.is_empty()) {
+            protocol = p;
+        }
+        if own["max_connections"].as_i64().unwrap_or(0) > 0 {
+            by_connections = true;
+            max_connections = own["max_connections"].as_i64().unwrap_or(0);
+            min_streams = own["min_streams"].as_i64().unwrap_or(0);
+        } else if own["max_streams"].as_i64().unwrap_or(0) > 0 {
+            by_connections = false;
+            max_streams = own["max_streams"].as_i64().unwrap_or(0);
+        }
+        padding = own["padding"].as_bool().unwrap_or(false);
+        brutal = own["brutal"]["enabled"].as_bool().unwrap_or(false);
+        if brutal {
+            up = own["brutal"]["up_mbps"].as_i64().unwrap_or(0);
+            down = own["brutal"]["down_mbps"].as_i64().unwrap_or(0);
+        }
+    }
+    let mut mux = json!({"enabled":true});
+    if !protocol.is_empty() {
+        mux["protocol"] = json!(protocol);
+    }
+    if by_connections {
+        if max_connections > 0 {
+            mux["max_connections"] = json!(max_connections);
+        }
+        if min_streams > 0 {
+            mux["min_streams"] = json!(min_streams);
+        }
+    } else if max_streams > 0 {
+        mux["max_streams"] = json!(max_streams);
+    }
+    if padding {
+        mux["padding"] = json!(true);
+    }
+    if brutal {
+        mux["brutal"] = json!({"enabled":true,"up_mbps":up.max(1),"down_mbps":down.max(1)});
+    }
+    object.insert("multiplex".into(), mux);
+}
+
+/// Apply the opt-in only to live TLS fields, retaining explicit true/false.
+/// Xray merges case-insensitive pointer spellings; null resets prior objects.
+fn apply_xray_system_ca(config: &mut Value) {
+    fn keys(object: &Map<String, Value>, name: &str) -> Vec<String> {
+        object
+            .keys()
+            .filter(|key| key.eq_ignore_ascii_case(name))
+            .cloned()
+            .collect()
+    }
+    fn last<'a>(holders: &'a [Map<String, Value>], name: &str, pointer: bool) -> Option<&'a Value> {
+        holders
+            .iter()
+            .flat_map(|h| h.iter())
+            .filter(|(key, value)| key.eq_ignore_ascii_case(name) && (pointer || !value.is_null()))
+            .map(|(_, v)| v)
+            .next_back()
+    }
+    fn edit_live(
+        holders: &mut [Map<String, Value>],
+        name: &str,
+        create: bool,
+        edit: impl FnOnce(&mut [Map<String, Value>]),
+    ) -> bool {
+        let mut locations: Vec<(usize, String)> = holders
+            .iter()
+            .enumerate()
+            .flat_map(|(i, holder)| keys(holder, name).into_iter().map(move |key| (i, key)))
+            .collect();
+        if let Some(reset) = locations
+            .iter()
+            .rposition(|(i, key)| holders[*i][key].is_null())
+        {
+            for (i, key) in locations.drain(..=reset) {
+                holders[i].remove(&key);
+            }
+        }
+        let mut live = Vec::new();
+        let mut objects = Vec::new();
+        for (i, key) in locations {
+            let value = &holders[i][&key];
+            let parsed = value
+                .as_str()
+                .and_then(|text| serde_json::from_str::<Value>(text).ok());
+            if let Some(object) = parsed.as_ref().unwrap_or(value).as_object() {
+                live.push((i, key, value.is_string()));
+                objects.push(object.clone());
+            }
+        }
+        if live.is_empty() {
+            if !create || holders.is_empty() {
+                return false;
+            }
+            live.push((holders.len() - 1, name.into(), false));
+            objects.push(Map::new());
+        }
+        edit(&mut objects);
+        for ((i, key, string), object) in live.into_iter().zip(objects) {
+            let value = Value::Object(object);
+            holders[i].insert(
+                key,
+                if string {
+                    Value::String(value.to_string())
+                } else {
+                    value
+                },
+            );
+        }
+        true
+    }
+    fn apply_tls(streams: &mut [Map<String, Value>]) {
+        if !last(streams, "security", false)
+            .and_then(Value::as_str)
+            .is_some_and(|v| v.eq_ignore_ascii_case("tls"))
+        {
+            return;
+        }
+        edit_live(streams, "tlsSettings", true, |tls| {
+            if last(tls, "useSystemCA", false).is_none() {
+                tls.last_mut()
+                    .unwrap()
+                    .insert("useSystemCA".into(), json!(true));
+            }
+        });
+    }
+    fn download(holders: &mut [Map<String, Value>]) {
+        // `extra` is RawMessage: its last spelling replaces direct settings.
+        let extra = holders
+            .iter()
+            .enumerate()
+            .flat_map(|(i, h)| keys(h, "extra").into_iter().map(move |key| (i, key)))
+            .last();
+        if let Some((i, key)) = extra {
+            let value = &mut holders[i][&key];
+            if let Some(object) = value.as_object() {
+                let mut extra = vec![object.clone()];
+                edit_live(&mut extra, "downloadSettings", false, apply_tls);
+                *value = Value::Object(extra.remove(0));
+            }
+        } else {
+            edit_live(holders, "downloadSettings", false, apply_tls);
+        }
+    }
+    if let Some(outbounds) = config.get_mut("outbounds").and_then(Value::as_array_mut) {
+        for outbound in outbounds {
+            let Some(object) = outbound.as_object() else {
+                continue;
+            };
+            let mut holders = vec![object.clone()];
+            edit_live(&mut holders, "streamSettings", false, |streams| {
+                apply_tls(streams);
+                if !edit_live(streams, "xhttpSettings", false, download) {
+                    edit_live(streams, "splithttpSettings", false, download);
+                }
+            });
+            *outbound = Value::Object(holders.remove(0));
+        }
+    }
+}
+
 fn xray_outbound_domain_strategy(settings: &AppSettings) -> String {
     let s = settings.default_domain_strategy.trim();
     match s {
@@ -337,7 +570,7 @@ fn compile_route_section(
                 }
             }
         } else {
-            for rule in &rp.rules {
+            for rule in rp.rules.iter().filter(|rule| !rule.disabled) {
                 if rule.ip_is_private {
                     saw_private = true;
                 }
@@ -433,6 +666,9 @@ fn outbound_tag_for_id(id: i64) -> &'static str {
 
 /// Convert one Throne `RouteRule` into a sing-box route rule object.
 fn route_rule_to_json(rule: &RouteRule) -> Option<Value> {
+    if rule.disabled {
+        return None;
+    }
     let mut obj = Map::new();
     let action = if rule.action.trim().is_empty() {
         "route"
@@ -608,10 +844,8 @@ fn remote_rule_set_entry(tag: &str, mirror: RulesetMirror) -> Option<Value> {
     }
     let raw_url = if tag.starts_with("https://") || tag.starts_with("http://") {
         tag.to_string()
-    } else if let Some(u) = well_known_rule_set_url(tag) {
-        u
     } else {
-        return None;
+        well_known_rule_set_url(tag)?
     };
     let url = apply_ruleset_mirror(&raw_url, mirror);
     Some(json!({
@@ -714,6 +948,46 @@ fn well_known_rule_set_url(tag: &str) -> Option<String> {
     None
 }
 
+/// A listener-free direct DNS probe for ResolveDomains when no running box has dns-direct.
+pub fn build_resolve_config(
+    settings: &AppSettings,
+    route: Option<&RouteProfile>,
+) -> Result<String, CoreError> {
+    let mut effective = settings.clone();
+    if let Some(dns) = route.and_then(RouteProfile::active_dns) {
+        dns.apply_to_settings(&mut effective);
+    }
+    let mut local = build_dns_obj(
+        if effective.core_box_underlying_dns.trim().is_empty() {
+            "local"
+        } else {
+            &effective.core_box_underlying_dns
+        },
+        false,
+        "",
+    );
+    local["tag"] = json!("dns-local");
+    let mut direct = build_dns_obj(
+        &effective.direct_dns,
+        false,
+        &effective.core_box_underlying_dns,
+    );
+    direct["tag"] = json!("dns-direct");
+    direct["domain_resolver"] = json!("dns-local");
+    let strategy = if effective.direct_dns_disable_ipv6 {
+        "ipv4_only"
+    } else if effective.default_domain_strategy.is_empty() {
+        "prefer_ipv4"
+    } else {
+        &effective.default_domain_strategy
+    };
+    Ok(json!({
+        "log":{"level":"warn"},"dns":{"servers":[local,direct],"final":"dns-direct"},
+        "inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}],
+        "route":{"final":"direct","auto_detect_interface":true,"default_domain_resolver":{"server":"dns-direct","strategy":strategy}}
+    }).to_string())
+}
+
 /// Build a temporary sing-box config for batch URL-testing `profiles`.
 ///
 /// Each profile becomes outbound tag `p{id}`; route final is `direct` so the box
@@ -739,6 +1013,7 @@ pub fn build_url_test_config(
             obj.insert("tag".into(), json!(tag.clone()));
         }
         apply_skip_cert_to_outbound(p, &mut ob, settings.skip_cert);
+        apply_multiplex(&mut ob, settings);
         outbounds.push(ob);
         tags.push(tag);
     }
@@ -771,8 +1046,20 @@ pub fn build_url_test_config(
             }
         }
     });
+    let mut direct = build_dns_obj(
+        &settings.direct_dns,
+        false,
+        &settings.core_box_underlying_dns,
+    );
+    direct["tag"] = json!("dns-direct");
+    direct["domain_resolver"] = json!("dns-local");
+    config["dns"]["servers"][1] = direct;
     let mut dns = config["dns"].take();
-    apply_ech_dns(&mut dns, config["outbounds"].as_array_mut().unwrap());
+    apply_ech_dns(
+        &mut dns,
+        config["outbounds"].as_array_mut().unwrap(),
+        "dns-direct",
+    )?;
     config["dns"] = dns;
     extract_wireguard_endpoints(&mut config);
     let s = serde_json::to_string(&config).map_err(|e| CoreError::Config(e.to_string()))?;
@@ -1051,7 +1338,7 @@ fn build_auto_selector_outbounds(
     for member in &auto.members {
         let tag = format!("p{}", member.id);
         let mut ob = if is_xray_full_config_member(member) {
-            let bridge = build_xray_full_member(member)?;
+            let bridge = build_xray_full_member(member, settings)?;
             xray_full_configs.push(bridge.xray_config);
             any_xray_member = true;
             bridge.socks_outbound
@@ -1150,7 +1437,10 @@ struct XrayFullBridge {
 /// Build a socks bridge outbound + Xray full config with a matching socks inbound.
 ///
 /// Upstream Custom::Build for `xrayfullconfig` + generate.cpp soleXrayInbound path.
-fn build_xray_full_member(profile: &Profile) -> Result<XrayFullBridge, CoreError> {
+fn build_xray_full_member(
+    profile: &Profile,
+    settings: &AppSettings,
+) -> Result<XrayFullBridge, CoreError> {
     let raw = xray_full_config_raw(profile).ok_or_else(|| {
         CoreError::Config(format!(
             "Xray full config profile '{}' has no config body",
@@ -1191,6 +1481,9 @@ fn build_xray_full_member(profile: &Profile) -> Result<XrayFullBridge, CoreError
         ));
     }
 
+    if settings.xray_use_system_ca {
+        apply_xray_system_ca(&mut user_cfg);
+    }
     let xray_config =
         serde_json::to_string(&user_cfg).map_err(|e| CoreError::Config(e.to_string()))?;
     let socks_outbound = json!({
@@ -1773,7 +2066,7 @@ fn apply_tls(v: &mut Value, o: &ParsedOutbound, default_on: bool) {
 /// Tun path mirrors Qt Throne:
 /// - `dns-remote` detour=proxy, domain_resolver=dns-local
 /// - `dns-direct` from `direct_dns`, domain_resolver=dns-local (no detour)
-/// - `dns-local` from `core_box_underlying_dns` (required on Darwin Tun)
+/// - `dns-local` from `core_box_underlying_dns`, or the core's OS resolver
 /// - proxy server hostnames → route to dns-direct
 /// - final DNS rule from `dns_final_out`
 /// - no top-level `dns.final` (rules carry the final server)
@@ -1781,16 +2074,36 @@ fn build_dns_section(
     settings: &AppSettings,
     tun_enabled: bool,
     proxy_domains: &[String],
-) -> Result<(Value, &'static str), CoreError> {
-    if !tun_enabled && !settings.fake_dns {
+    route_profile: Option<&RouteProfile>,
+    route_owns_dns: bool,
+) -> Result<(Value, String), CoreError> {
+    if settings.use_dns_object && !route_owns_dns {
+        let dns: Value = serde_json::from_str(&settings.dns_object)
+            .map_err(|e| CoreError::Config(format!("invalid DNS object: {e}")))?;
+        let servers = dns
+            .get("servers")
+            .and_then(Value::as_array)
+            .ok_or_else(|| CoreError::Config("DNS object needs a servers array".into()))?;
+        let tag = servers
+            .iter()
+            .find(|v| v["tag"] == "dns-direct")
+            .and_then(|v| v["tag"].as_str())
+            .or_else(|| dns["final"].as_str())
+            .or_else(|| servers.first().and_then(|v| v["tag"].as_str()))
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| CoreError::Config("DNS object needs a resolver tag".into()))?
+            .to_string();
+        return Ok((dns, tag));
+    }
+    if !tun_enabled && !settings.fake_dns && !route_owns_dns {
         // Mixed/system-proxy path: OS resolver is proven-stable here.
         return Ok((
             json!({
-                "servers": [ { "type": "local", "tag": "local" } ],
+                "servers": [ { "type": "local", "tag": "local" }, direct_dns_for_mixed(settings) ],
                 "final": "local",
                 "strategy": "prefer_ipv4"
             }),
-            "local",
+            "local".into(),
         ));
     }
 
@@ -1811,7 +2124,7 @@ fn build_dns_section(
         obj.insert("domain_resolver".into(), json!("dns-local"));
     }
 
-    // local — upstream: empty underlying → "local"; Darwin Tun rewrites to UDP underlying
+    // local — the patched core bypasses its own Darwin DNS alias.
     let dns_local_address = if settings.core_box_underlying_dns.trim().is_empty() {
         "local".to_string()
     } else {
@@ -1828,12 +2141,21 @@ fn build_dns_section(
     } else {
         "dns-remote"
     };
-    let final_strategy = if use_direct_final {
+    let direct_strategy = if settings.direct_dns_disable_ipv6 {
+        "ipv4_only"
+    } else {
         settings.direct_dns_strategy.trim()
+    };
+    let remote_strategy = if settings.remote_dns_disable_ipv6 {
+        "ipv4_only"
     } else {
         settings.remote_dns_strategy.trim()
     };
-    let direct_strategy = settings.direct_dns_strategy.trim();
+    let final_strategy = if use_direct_final {
+        direct_strategy
+    } else {
+        remote_strategy
+    };
 
     // Upstream rule order (subset we support): localhost → proxy domains → final
     let mut rules = vec![
@@ -1878,6 +2200,46 @@ fn build_dns_section(
         servers.push(fake);
         rules.push(json!({"query_type":["A","AAAA"],"action":"route","server":"dns-fake"}));
     }
+    if settings.enable_dns_routing {
+        if let Some(rp) = route_profile.filter(|rp| !rp.is_raw) {
+            for (outbound_id, tag, strategy) in [
+                (-2, "dns-direct", direct_strategy),
+                (-1, "dns-remote", remote_strategy),
+            ] {
+                for rule in rp.rules.iter().filter(|r| {
+                    !r.disabled
+                        && r.outbound_id == outbound_id
+                        && (r.action.is_empty() || r.action == "route")
+                }) {
+                    let mut matched = Map::new();
+                    for (key, values) in [
+                        ("domain", &rule.domain),
+                        ("domain_suffix", &rule.domain_suffix),
+                        ("domain_keyword", &rule.domain_keyword),
+                        ("domain_regex", &rule.domain_regex),
+                    ] {
+                        insert_str_list(&mut matched, key, values);
+                    }
+                    let sets: Vec<String> = rule
+                        .rule_set
+                        .iter()
+                        .filter(|s| s.starts_with("geosite-"))
+                        .map(|s| rule_set_tag_name(s))
+                        .collect();
+                    insert_str_list(&mut matched, "rule_set", &sets);
+                    if matched.is_empty() {
+                        continue;
+                    }
+                    matched.insert("action".into(), json!("route"));
+                    matched.insert("server".into(), json!(tag));
+                    if !strategy.is_empty() {
+                        matched.insert("strategy".into(), json!(strategy));
+                    }
+                    rules.push(Value::Object(matched));
+                }
+            }
+        }
+    }
     let mut final_rule = json!({
         "action": "route",
         "server": final_tag
@@ -1912,12 +2274,16 @@ fn build_dns_section(
     }
 
     // Upstream buildRouteSection always uses dns-direct as default_domain_resolver.
-    Ok((dns, "dns-direct"))
+    Ok((dns, "dns-direct".into()))
 }
 
 /// ECH bootstrap HTTPS queries cannot travel through the proxy they unlock.
 /// Consume the GUI-only resolver field after collecting it; never send it to sing-box.
-fn apply_ech_dns(dns: &mut Value, outbounds: &mut [Value]) {
+fn apply_ech_dns(
+    dns: &mut Value,
+    outbounds: &mut [Value],
+    fallback_tag: &str,
+) -> Result<(), CoreError> {
     let mut names = std::collections::BTreeMap::<String, Option<String>>::new();
     for outbound in outbounds {
         let server_name = outbound["tls"]["server_name"]
@@ -1979,25 +2345,62 @@ fn apply_ech_dns(dns: &mut Value, outbounds: &mut [Value]) {
             .or_insert(resolver);
     }
     if names.is_empty() {
-        return;
+        return Ok(());
     }
     let servers = dns["servers"]
         .as_array_mut()
         .expect("generated DNS server array");
-    let local_tag = if servers.iter().any(|s| s["tag"] == "dns-local") {
-        "dns-local"
-    } else {
-        "local"
+    // Bootstrap must not use the proxy whose TLS handshake needs this ECH key.
+    fn independent(tag: &str, servers: &[Value], seen: &mut Vec<String>) -> bool {
+        if seen.iter().any(|prior| prior == tag) {
+            return false;
+        }
+        let Some(server) = servers.iter().find(|s| s["tag"] == tag) else {
+            return false;
+        };
+        if server["detour"]
+            .as_str()
+            .is_some_and(|v| !v.is_empty() && v != "direct")
+        {
+            return false;
+        }
+        let kind = server["type"].as_str().unwrap_or("");
+        if matches!(kind, "local" | "dhcp") {
+            return true;
+        }
+        if !matches!(kind, "udp" | "tcp" | "tls" | "https" | "h3" | "quic") {
+            return false;
+        }
+        let dependency = server["domain_resolver"]
+            .as_str()
+            .or_else(|| server["domain_resolver"]["server"].as_str());
+        if let Some(dependency) = dependency {
+            seen.push(tag.to_string());
+            return independent(dependency, servers, seen);
+        }
+        server["server"].as_str().is_some_and(|host| {
+            host.trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .is_ok()
+        })
+    }
+    let choose = |preferred: &[&str]| {
+        preferred
+            .iter()
+            .copied()
+            .chain(servers.iter().filter_map(|s| s["tag"].as_str()))
+            .find(|tag| independent(tag, servers, &mut Vec::new()))
+            .map(str::to_string)
     };
-    let direct_tag = if servers.iter().any(|s| s["tag"] == "dns-direct") {
-        "dns-direct"
-    } else {
-        local_tag
-    };
+    let local_tag = choose(&["dns-local", "local", fallback_tag]).ok_or_else(||CoreError::Config("ECH requires a direct DNS bootstrap resolver independent of the proxy; add a local or direct resolver to the DNS object".into()))?;
+    let direct_tag = choose(&["dns-direct", &local_tag]).unwrap_or_else(|| local_tag.clone());
     let mut head = Vec::new();
     for (index, (name, resolver)) in names.into_iter().enumerate() {
         let tag = if let Some(address) = resolver {
-            let tag = format!("dns-ech-{index}");
+            let mut tag = format!("dns-ech-{index}");
+            while servers.iter().any(|server| server["tag"] == tag) {
+                tag.push('-');
+            }
             let mut server = build_dns_obj(&address, false, "");
             server["tag"] = json!(tag);
             server["domain_resolver"] = json!(local_tag);
@@ -2012,6 +2415,7 @@ fn apply_ech_dns(dns: &mut Value, outbounds: &mut [Value]) {
         head.append(rules);
     }
     dns["rules"] = json!(head);
+    Ok(())
 }
 
 fn usable_ech_resolver(address: &str) -> bool {
@@ -2080,15 +2484,21 @@ fn underlying_dns_address(settings: &AppSettings) -> Result<String, CoreError> {
 fn build_dns_obj(address: &str, tun_enabled: bool, underlying: &str) -> Value {
     let _ = (tun_enabled, underlying);
     let address = address.trim();
-    if address.is_empty()
-        || address.eq_ignore_ascii_case("local")
-        || address.eq_ignore_ascii_case("localhost")
-    {
+    // Normalize only the scheme; resolver paths and interface names retain case.
+    let normalized = address
+        .split_once("://")
+        .map(|(scheme, rest)| format!("{}://{rest}", scheme.to_ascii_lowercase()));
+    let address = normalized.as_deref().unwrap_or(address);
+    if address.is_empty() || address.to_ascii_lowercase().starts_with("local") {
         return json!({ "type": "local" });
     }
 
     if let Some(ifc) = address.strip_prefix("dhcp://") {
-        let ifc = if ifc == "auto" { "" } else { ifc };
+        let ifc = if ifc.eq_ignore_ascii_case("auto") {
+            ""
+        } else {
+            ifc
+        };
         return json!({ "type": "dhcp", "interface": ifc });
     }
 

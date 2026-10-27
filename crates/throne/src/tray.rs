@@ -379,18 +379,17 @@ pub fn next_command() -> Option<TrayCommand> {
 
 /// Whether a tray icon pointer event should bring the main window forward.
 pub fn tray_event_shows_window(event: &TrayIconEvent) -> bool {
-    match event {
+    matches!(
+        event,
         TrayIconEvent::Click {
             button: MouseButton::Left,
             button_state: MouseButtonState::Up,
             ..
-        } => true,
-        TrayIconEvent::DoubleClick {
+        } | TrayIconEvent::DoubleClick {
             button: MouseButton::Left,
             ..
-        } => true,
-        _ => false,
-    }
+        }
+    )
 }
 
 /// Upstream Allow LAN: inbound `::` / `0.0.0.0` vs loopback `127.0.0.1`.

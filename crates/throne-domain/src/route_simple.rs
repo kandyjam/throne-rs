@@ -278,6 +278,7 @@ impl RouteProfile {
         if let Some(r) = self.rules.iter_mut().find(|r| r.rule_type == rule_type) {
             // Basic edits replace match lines, not the route options edited in Advanced.
             let mut replacement = RouteRule::blank_simple(rule_type, action);
+            replacement.disabled = r.disabled;
             replacement.tls_fragment = r.tls_fragment;
             replacement.tls_record_fragment = r.tls_record_fragment;
             replacement.tls_fragment_fallback_delay = r.tls_fragment_fallback_delay.clone();
@@ -387,6 +388,9 @@ impl RouteProfile {
             return None;
         }
         for rule in &self.rules {
+            if rule.disabled {
+                continue;
+            }
             if rule.rule_type == action.address_type() {
                 break;
             }

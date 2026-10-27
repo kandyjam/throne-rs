@@ -283,6 +283,14 @@ fn parse_vless(link: &str) -> Option<ImportedProfile> {
             .map(|s| s.to_string()),
         ..Default::default()
     };
+    // XDrive has no share-link format; importing it as TCP loses storage credentials.
+    if outbound
+        .transport
+        .as_deref()
+        .is_some_and(|t| t.eq_ignore_ascii_case("xdrive"))
+    {
+        return None;
+    }
     if outbound
         .transport
         .as_deref()

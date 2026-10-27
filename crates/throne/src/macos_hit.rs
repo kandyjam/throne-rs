@@ -30,7 +30,7 @@ pub fn route_window_clicks() {
     // AppKit inserts the scroll pocket just after the window appears, and again
     // after appearance changes. Cover the first few seconds, then re-check
     // occasionally so we do not reorder views on every pump.
-    if tick > 40 && tick % 20 != 0 {
+    if tick > 40 && !tick.is_multiple_of(20) {
         return;
     }
     let Some(mtm) = MainThreadMarker::new() else {
@@ -64,7 +64,7 @@ fn pass_through_pockets(view: &NSView) {
 }
 
 fn force_hit_test_nil(view: &NSView) {
-    let class = view_class(view) as *const AnyClass as *mut AnyClass;
+    let class = view_class(view) as *mut AnyClass;
     if class.is_null() {
         return;
     }

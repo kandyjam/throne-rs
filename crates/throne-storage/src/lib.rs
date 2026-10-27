@@ -218,8 +218,8 @@ impl Database {
                 r#"INSERT INTO route_profiles (
                     id, name, default_outbound_id, is_raw, raw_route,
                     prevent_modifications, is_remote, remote_url, auto_update,
-                    remote_last_update, endpoint_profile_ids, inner_hop_endpoint_ids
-                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)"#,
+                    remote_last_update, endpoint_profile_ids, inner_hop_endpoint_ids, dns_json, custom_dns
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)"#,
                 params![
                     r.id,
                     r.name,
@@ -233,6 +233,8 @@ impl Database {
                     r.remote_last_update,
                     to_json_i64_array(&r.endpoint_profile_ids),
                     to_json_i64_array(&r.inner_hop_endpoint_ids),
+                    r.dns.as_ref().map(serde_json::to_string).transpose()?.unwrap_or_default(),
+                    r.custom_dns as i32,
                 ],
             )?;
             for (order, rule) in r.rules.iter().enumerate() {
@@ -378,7 +380,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             r#"SELECT id, name, default_outbound_id, is_raw, raw_route,
                       prevent_modifications, is_remote, remote_url, auto_update,
-                      remote_last_update, endpoint_profile_ids, inner_hop_endpoint_ids
+                      remote_last_update, endpoint_profile_ids, inner_hop_endpoint_ids, dns_json, custom_dns
                FROM route_profiles ORDER BY id ASC"#,
         )?;
         let mut profiles = Vec::new();
@@ -404,6 +406,8 @@ impl Database {
                     inner_hop_endpoint_ids: json_i64_list(
                         row.get::<_, Option<String>>(11)?.unwrap_or_default(),
                     ),
+                    dns: serde_json::from_str(&row.get::<_, String>(12)?).ok(),
+                    custom_dns: row.get::<_, i32>(13)? != 0,
                 })
             })?;
             for r in rows {
@@ -426,7 +430,7 @@ impl Database {
                       process_name_json, process_path_json, process_path_regex_json, rule_set_json,
                       invert, outbound_id, action, reject_method, no_drop,
                       override_address, override_port, sniffers_json, sniff_override_dest, strategy,
-                      wifi_ssid_json, wifi_bssid_json, tls_fragment, tls_fragment_fallback_delay, tls_record_fragment
+                      wifi_ssid_json, wifi_bssid_json, tls_fragment, tls_fragment_fallback_delay, tls_record_fragment, disabled
                FROM route_rules WHERE route_profile_id = ? ORDER BY rule_order"#,
         )?;
         let rows = stmt.query_map(params![profile_id], |row| {
@@ -472,6 +476,7 @@ impl Database {
                 tls_fragment: row.get::<_, Option<i32>>(34)?.unwrap_or(0) != 0,
                 tls_fragment_fallback_delay: row.get::<_, Option<String>>(35)?.unwrap_or_default(),
                 tls_record_fragment: row.get::<_, Option<i32>>(36)?.unwrap_or(0) != 0,
+                disabled: row.get::<_, i32>(37)? != 0,
             })
         })?;
         collect_rows(rows)
@@ -515,10 +520,10 @@ fn insert_route_rule(
             process_name_json, process_path_json, process_path_regex_json, rule_set_json,
             invert, outbound_id, action, reject_method, no_drop,
             override_address, override_port, sniffers_json, sniff_override_dest, strategy,
-            wifi_ssid_json, wifi_bssid_json, tls_fragment, tls_fragment_fallback_delay, tls_record_fragment
+            wifi_ssid_json, wifi_bssid_json, tls_fragment, tls_fragment_fallback_delay, tls_record_fragment, disabled
         ) VALUES (
             ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,
-            ?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37,?38,?39
+            ?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37,?38,?39,?40
         )"#,
         params![
             profile_id,
@@ -564,6 +569,7 @@ fn insert_route_rule(
             rule.tls_fragment as i32,
             rule.tls_fragment_fallback_delay,
             rule.tls_record_fragment as i32,
+            rule.disabled as i32,
         ],
     )?;
     Ok(())
@@ -690,10 +696,30 @@ where
 /// Merge known settings; preserve unknown keys already in the DB.
 fn merge_settings_tx(tx: &rusqlite::Transaction<'_>, s: &AppSettings) -> Result<(), StorageError> {
     let pairs: Vec<(&str, String)> = vec![
+        ("disable_mixed_inbound", bool_str(s.disable_mixed_inbound)),
+        ("xray_use_system_ca", bool_str(s.xray_use_system_ca)),
+        ("mux_default_on", bool_str(s.mux_default_on)),
+        ("mux_protocol", s.mux_protocol.clone()),
+        ("mux_mode", s.mux_mode.clone()),
+        ("mux_concurrency", s.mux_concurrency.to_string()),
+        ("mux_max_connections", s.mux_max_connections.to_string()),
+        ("mux_min_streams", s.mux_min_streams.to_string()),
+        ("mux_padding", bool_str(s.mux_padding)),
+        ("mux_brutal", bool_str(s.mux_brutal)),
+        ("mux_brutal_up_mbps", s.mux_brutal_up_mbps.to_string()),
+        ("mux_brutal_down_mbps", s.mux_brutal_down_mbps.to_string()),
         ("inbound_socks_port", s.inbound_socks_port.to_string()),
         ("inbound_address", s.inbound_address.clone()),
         ("test_url", s.test_latency_url.clone()),
         ("remote_dns", s.remote_dns.clone()),
+        (
+            "remote_dns_disable_ipv6",
+            bool_str(s.remote_dns_disable_ipv6),
+        ),
+        (
+            "direct_dns_disable_ipv6",
+            bool_str(s.direct_dns_disable_ipv6),
+        ),
         ("direct_dns", s.direct_dns.clone()),
         ("vpn_strict_route", bool_str(s.vpn_strict_route)),
         ("kill_switch", bool_str(s.kill_switch)),
@@ -815,6 +841,38 @@ fn parse_bool(v: &str) -> bool {
 
 fn apply_setting(s: &mut AppSettings, key: &str, value: &str) {
     match key {
+        "disable_mixed_inbound" => s.disable_mixed_inbound = parse_bool(value),
+        "xray_use_system_ca" => s.xray_use_system_ca = parse_bool(value),
+        "mux_default_on" => s.mux_default_on = parse_bool(value),
+        "mux_protocol" => s.mux_protocol = value.to_string(),
+        "mux_mode" => s.mux_mode = value.to_string(),
+        "mux_concurrency" => {
+            if let Ok(n) = value.parse() {
+                s.mux_concurrency = n;
+            }
+        }
+        "mux_max_connections" => {
+            if let Ok(n) = value.parse() {
+                s.mux_max_connections = n;
+            }
+        }
+        "mux_min_streams" => {
+            if let Ok(n) = value.parse() {
+                s.mux_min_streams = n;
+            }
+        }
+        "mux_padding" => s.mux_padding = parse_bool(value),
+        "mux_brutal" => s.mux_brutal = parse_bool(value),
+        "mux_brutal_up_mbps" => {
+            if let Ok(n) = value.parse() {
+                s.mux_brutal_up_mbps = n;
+            }
+        }
+        "mux_brutal_down_mbps" => {
+            if let Ok(n) = value.parse() {
+                s.mux_brutal_down_mbps = n;
+            }
+        }
         "inbound_socks_port" => {
             if let Ok(n) = value.parse() {
                 s.inbound_socks_port = n;
@@ -823,6 +881,8 @@ fn apply_setting(s: &mut AppSettings, key: &str, value: &str) {
         "inbound_address" => s.inbound_address = value.to_string(),
         "test_url" => s.test_latency_url = value.to_string(),
         "remote_dns" => s.remote_dns = value.to_string(),
+        "remote_dns_disable_ipv6" => s.remote_dns_disable_ipv6 = parse_bool(value),
+        "direct_dns_disable_ipv6" => s.direct_dns_disable_ipv6 = parse_bool(value),
         "direct_dns" => s.direct_dns = value.to_string(),
         "vpn_strict_route" => s.vpn_strict_route = parse_bool(value),
         "kill_switch" => s.kill_switch = parse_bool(value),
@@ -1007,6 +1067,54 @@ pub fn load_or_seed_demo(db: &Database) -> Result<AppState, StorageError> {
 mod tests {
     use super::*;
     use throne_domain::{ProfileSortColumn, ProfileType};
+
+    #[test]
+    fn profile_editor_port_and_tls_edits_survive_database_reopen_losslessly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("throne.db");
+        let mut state = AppState::empty();
+        let gid = state.add_group("Edit");
+        let id = state.add_profile(gid, "before", ProfileType::Vless);
+        let mut expected = serde_json::json!({"type":"vless","server":"node.example","server_port":38584,"uuid":"server-identity","flow":"xtls-rprx-vision",
+            "tls":{"enabled":true,"server_name":"tls.example","utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":"A".repeat(43),"short_id":"abcd"},"ech":{"enabled":true,"config":["opaque"]}},
+            "future_field":{"nested":[1,2,3]}});
+        state
+            .update_profile_outbound_json(id, expected.to_string())
+            .unwrap();
+        state.set_profile_traffic(id, 9999, 4567);
+        let mut draft =
+            throne_domain::ProfileEditDraft::from_profile(state.profile(id).unwrap()).unwrap();
+        draft.name = "after".into();
+        draft
+            .fields
+            .iter_mut()
+            .find(|f| f.key == "/server_port")
+            .unwrap()
+            .value = "443".into();
+        draft
+            .fields
+            .iter_mut()
+            .find(|f| f.key == "/tls/server_name")
+            .unwrap()
+            .value = "new.example".into();
+        state
+            .replace_edited_profile(draft.build().unwrap())
+            .unwrap();
+        Database::open(&path).unwrap().save_state(&state).unwrap();
+        let reopened = Database::open(&path).unwrap().load_state().unwrap();
+        let saved = reopened.profile(id).unwrap();
+        expected["server_port"] = serde_json::json!(443);
+        expected["tls"]["server_name"] = serde_json::json!("new.example");
+        assert_eq!(saved.name, "after");
+        assert_eq!(saved.display_address(), "node.example:443");
+        assert_eq!(saved.outbound.sni.as_deref(), Some("new.example"));
+        assert_eq!(saved.traffic_downlink, 9999);
+        assert_eq!(saved.traffic_uplink, 4567);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&saved.outbound_json).unwrap(),
+            expected
+        );
+    }
 
     #[test]
     fn wireguard_peer_fields_and_endpoint_override_survive_database_reopen() {
@@ -1244,7 +1352,7 @@ mod tests {
     #[test]
     fn beta2_log_and_fakeip_preferences_roundtrip_without_changing_defaults() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(&dir.path().join("throne.db")).unwrap();
+        let db = Database::open(dir.path().join("throne.db")).unwrap();
         let mut state = AppState::with_demo_data();
         assert_eq!(state.settings().max_log_line, 500);
         assert!(!state.settings().fakeip_disable_ipv6);

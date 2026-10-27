@@ -45,7 +45,7 @@ echo "==> generating gen/ from libcore.proto"
     libcore.proto
 )
 
-# Match upstream throneproj/Throne `script/build_go.sh` (tag 1.4.0-beta.3, module root `core/`).
+# Match upstream throneproj/Throne `script/build_go.sh` (tag 1.4.0-beta.4, module root `core/`).
 # Base tags + platform extras. Override with THRONE_CORE_TAGS=...
 if [[ -n "${THRONE_CORE_TAGS:-}" ]]; then
   TAGS="$THRONE_CORE_TAGS"
@@ -75,7 +75,52 @@ echo "    tags: $TAGS"
       fi
     done
   fi
-  VERSION_SINGBOX="$("$GO_BIN" list -m -f '{{.Version}}' github.com/sagernet/sing-box 2>/dev/null || true)"
+  # Apply the pinned REALITY compatibility fix to a private dependency copy.
+  # Never modify GOMODCACHE: other projects and unpatched builds share it.
+  export GOWORK=off
+  VERSION_SINGBOX="$("$GO_BIN" list -m -f '{{.Version}}' github.com/sagernet/sing-box)"
+  SINGBOX_REPLACE="$("$GO_BIN" list -m -f '{{with .Replace}}{{.Path}} {{.Version}}{{end}}' github.com/sagernet/sing-box)"
+  EXPECTED_SINGBOX="github.com/throneproj/sing-box v1.11.16-0.20261019002151-a29d468286bc"
+  if [[ "$SINGBOX_REPLACE" != "$EXPECTED_SINGBOX" ]]; then
+    echo "error: re-audit core/patches/sing-box-reality-mlkem.patch for $SINGBOX_REPLACE" >&2
+    exit 1
+  fi
+  "$GO_BIN" mod download github.com/sagernet/sing-box
+  SINGBOX_SOURCE="$("$GO_BIN" list -m -f '{{.Dir}}' github.com/sagernet/sing-box)"
+  if [[ -z "$SINGBOX_SOURCE" || ! -f "$SINGBOX_SOURCE/common/tls/reality_client.go" ]]; then
+    echo "error: pinned sing-box source is unavailable after download" >&2
+    exit 1
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    SOURCE_SHA="$(shasum -a 256 "$SINGBOX_SOURCE/common/tls/reality_client.go" | awk '{print $1}')"
+  else
+    SOURCE_SHA="$(sha256sum "$SINGBOX_SOURCE/common/tls/reality_client.go" | awk '{print $1}')"
+  fi
+  if [[ "$SOURCE_SHA" != "cb4fcbd0f76347282cd31e630271c02bb3c5273205b005f47987804e2adc4742" ]]; then
+    echo "error: pinned REALITY source changed; refusing to apply an unaudited patch" >&2
+    exit 1
+  fi
+  DNS_SOURCE="$SINGBOX_SOURCE/dns/transport/local/systemconfig/source_darwin.go"
+  if command -v shasum >/dev/null 2>&1; then
+    DNS_SOURCE_SHA="$(shasum -a 256 "$DNS_SOURCE" | awk '{print $1}')"
+  else
+    DNS_SOURCE_SHA="$(sha256sum "$DNS_SOURCE" | awk '{print $1}')"
+  fi
+  if [[ "$DNS_SOURCE_SHA" != "9a272357e282eb48d9d1e80a589fe0729c422c7d96cb792d3c2049a30704e104" ]]; then
+    echo "error: pinned Darwin DNS source changed; re-audit sing-box-darwin-system-dns.patch" >&2
+    exit 1
+  fi
+  mkdir -p "$ROOT/target"
+  PATCH_DIR="$(mktemp -d "$ROOT/target/core-patches.XXXXXX")"
+  trap 'rm -rf "$PATCH_DIR"' EXIT
+  cp -R "$SINGBOX_SOURCE" "$PATCH_DIR/sing-box"
+  chmod -R u+w "$PATCH_DIR/sing-box"
+  patch --batch --fuzz=0 -d "$PATCH_DIR/sing-box" -p1 < "$CORE_DIR/patches/sing-box-reality-mlkem.patch"
+  patch --batch --fuzz=0 -d "$PATCH_DIR/sing-box" -p1 < "$CORE_DIR/patches/sing-box-darwin-system-dns.patch"
+  cp "$CORE_DIR/go.mod" "$PATCH_DIR/core.mod"
+  cp "$CORE_DIR/go.sum" "$PATCH_DIR/core.sum"
+  "$GO_BIN" mod edit -modfile="$PATCH_DIR/core.mod" \
+    -replace="github.com/sagernet/sing-box=$PATCH_DIR/sing-box"
   LDFLAGS="-w -s -X 'internal/godebug.defaultGODEBUG=multipathtcp=0' -checklinkname=0"
   if [[ -n "$VERSION_SINGBOX" ]]; then
     LDFLAGS="-w -s -X 'github.com/sagernet/sing-box/constant.Version=${VERSION_SINGBOX}' -X 'internal/godebug.defaultGODEBUG=multipathtcp=0' -checklinkname=0"
@@ -85,7 +130,12 @@ echo "    tags: $TAGS"
   if [[ "$(uname -s)" == "Darwin" ]]; then
     extra_env+=(CGO_ENABLED=1 CGO_LDFLAGS="-weak_framework UniformTypeIdentifiers")
   fi
-  env "${extra_env[@]}" "$GO_BIN" build -trimpath -tags "$TAGS" -ldflags "$LDFLAGS" -o "$OUT_BIN" .
+  if [[ "${THRONE_CORE_VERIFY_PATCHES:-0}" == "1" ]]; then
+    env "${extra_env[@]}" "$GO_BIN" test -race -count=1 -modfile="$PATCH_DIR/core.mod" -mod=readonly \
+      -tags "$TAGS" -ldflags "-checklinkname=0" \
+      github.com/sagernet/sing-box/dns/transport/local/systemconfig ./internal/sysdns ./internal/boxmain
+  fi
+  env "${extra_env[@]}" "$GO_BIN" build -modfile="$PATCH_DIR/core.mod" -mod=readonly -trimpath -tags "$TAGS" -ldflags "$LDFLAGS" -o "$OUT_BIN" .
 )
 
 # macOS: clear quarantine so setuid / Gatekeeper don't block

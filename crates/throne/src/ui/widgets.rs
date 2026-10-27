@@ -505,10 +505,8 @@ pub fn format_hotkey_chord(keystroke: &gpui::Keystroke) -> Option<String> {
                 format!("F{rest}")
             } else {
                 let mut chars = other.chars();
-                match chars.next() {
-                    Some(c) => format!("{}{}", c.to_uppercase(), chars.as_str()),
-                    None => return None,
-                }
+                let c = chars.next()?;
+                format!("{}{}", c.to_uppercase(), chars.as_str())
             }
         }
     };

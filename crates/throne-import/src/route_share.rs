@@ -158,6 +158,22 @@ fn profile_from_share_object(
         .unwrap_or("Imported route")
         .to_string();
     let mut p = RouteProfile::new(0, name);
+    if let Some(value) = root.get("dns") {
+        match serde_json::from_value::<throne_domain::RouteDns>(value.clone()) {
+            Ok(dns) => match dns.validate() {
+                Ok(()) => {
+                    p.custom_dns = true;
+                    p.dns = Some(dns);
+                }
+                Err(error) => warnings.push(format!(
+                    "Profile DNS dropped; using global settings: {error}"
+                )),
+            },
+            Err(error) => warnings.push(format!(
+                "Invalid profile DNS; using global settings: {error}"
+            )),
+        }
+    }
 
     if root.get("raw").and_then(|v| v.as_bool()).unwrap_or(false) {
         p.is_raw = true;
@@ -226,6 +242,10 @@ fn rules_from_array(arr: &[Value], warnings: &mut Vec<String>) -> Vec<RouteRule>
                 token
             },
             outbound_id,
+            disabled: obj
+                .get("disabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             invert: obj.get("invert").and_then(|v| v.as_bool()).unwrap_or(false),
             action: obj
                 .get("action")
@@ -329,6 +349,15 @@ pub fn to_share_link(profile: &RouteProfile) -> String {
 
 /// Build upstream-compatible share object for export.
 pub fn to_share_object(profile: &RouteProfile) -> Value {
+    let mut object = share_body(profile);
+    if let Some(dns) = profile.active_dns() {
+        object["dns"] =
+            serde_json::to_value(dns).expect("RouteDns contains serializable primitives");
+    }
+    object
+}
+
+fn share_body(profile: &RouteProfile) -> Value {
     if profile.is_raw {
         let route: Value =
             serde_json::from_str(&profile.raw_route).unwrap_or(Value::Object(Default::default()));
@@ -353,6 +382,7 @@ pub fn to_share_object(profile: &RouteProfile) -> Value {
             serde_json::json!({
                 "name": r.name,
                 "type": token,
+                "disabled": r.disabled,
                 "outbound": DefaultOutbound::from_id(r.outbound_id).to_share_token(),
                 "domain": r.domain,
                 "domain_suffix": r.domain_suffix,

@@ -41,9 +41,13 @@ use crate::ui::connections::{connections_panel, ConnectionSpeedTracker};
 use crate::ui::dialog_inputs::{DialogInputs, NestedInputs};
 use crate::ui::dialogs::{
     add_input_body, auto_selector_stats_body, basic_settings_body, edit_group_body,
-    edit_profile_body, hotkey_settings_body, manage_groups_body, subscription_diff_body,
-    traffic_stats_body, tun_settings_body, AutoSelectorGroupView, AutoSelectorMemberRow,
-    BasicSubToggle, Dialog, EditGroupView, HotkeyField,
+    hotkey_settings_body, manage_groups_body, subscription_diff_body, traffic_stats_body,
+    tun_settings_body, AutoSelectorGroupView, AutoSelectorMemberRow, BasicSubToggle, Dialog,
+    EditGroupView, HotkeyField,
+};
+use crate::ui::profile_editor::{
+    profile_editor_body, ProfileEditorEvent, ProfileEditorInputs, ProfileEditorTab,
+    ProfileEditorView,
 };
 use crate::ui::routing::{
     routing_nested_title_owned, routing_nested_view, routing_nested_width, routing_settings_view,
@@ -82,6 +86,7 @@ actions!(
         DeleteUnavailable,
         CycleRoute,
         CopyLogs,
+        OpenCommandPalette,
         Quit
     ]
 );
@@ -314,11 +319,7 @@ struct TestProgressPanel {
 }
 
 fn test_progress_percent(done: usize, total: usize) -> usize {
-    if total == 0 {
-        0
-    } else {
-        100 * done / total
-    }
+    std::num::NonZeroUsize::new(total).map_or(0, |total| 100 * done / total.get())
 }
 
 fn try_take_core_logs(core: &Mutex<CoreSession>) -> Option<Vec<String>> {
@@ -639,6 +640,8 @@ pub struct MainWindow {
     pending_stop: bool,
     /// Display captured from the profile actually passed to the running core.
     running_profile_display: Option<String>,
+    /// Identity captured by an in-flight Start; selection may change meanwhile.
+    starting_profile_id: Option<ProfileId>,
     /// Target profile to start once the current core has fully stopped.
     pending_profile_switch: PendingProfileSwitch,
     /// True while a URL-test / sub-update job is in flight.
@@ -726,6 +729,8 @@ impl MainWindow {
             // Profile table: arrow-key row selection (upstream QTableView).
             gpui::KeyBinding::new("up", SelectPrevProfile, Some("Main")),
             gpui::KeyBinding::new("down", SelectNextProfile, Some("Main")),
+            gpui::KeyBinding::new("cmd-k", OpenCommandPalette, Some("Main")),
+            gpui::KeyBinding::new("ctrl-k", OpenCommandPalette, Some("Main")),
             gpui::KeyBinding::new("cmd-q", Quit, None),
         ]);
 
@@ -775,6 +780,7 @@ impl MainWindow {
             restart_when_idle: false,
             pending_stop: false,
             running_profile_display: None,
+            starting_profile_id: None,
             pending_profile_switch: PendingProfileSwitch::default(),
             background_busy: false,
             test_progress: None,
@@ -1307,6 +1313,114 @@ impl MainWindow {
         cx.notify();
     }
 
+    fn open_core_options(&mut self, cx: &mut Context<Self>) {
+        self.close_menus();
+        let initial = self.state.settings().clone();
+        let owner = cx.entity().downgrade();
+        let baseline = initial.clone();
+        let save = move |edited: AppSettings, cx: &mut App| {
+            owner
+                .update(cx, |this, cx| {
+                    let previous = this.state.settings().clone();
+                    let mut next = previous.clone();
+                    crate::ui::core_options::apply_changed(&baseline, &edited, &mut next);
+                    if next.disable_mixed_inbound && next.system_proxy_enabled {
+                        return Err(
+                            "Turn off System Proxy before disabling the mixed inbound.".into()
+                        );
+                    }
+                    if previous.disable_mixed_inbound != next.disable_mixed_inbound
+                        && (this.state.core_status().is_running() || this.core_op_busy)
+                    {
+                        return Err(
+                            "Stop the running profile before changing the mixed inbound.".into(),
+                        );
+                    }
+                    this.state.set_settings(next);
+                    if let Err(error) = this.persist_db() {
+                        this.state.set_settings(previous);
+                        return Err(error);
+                    }
+                    this.state
+                        .set_status_message("Core options saved · apply on next Start");
+                    cx.notify();
+                    Ok(())
+                })
+                .map_err(|e| e.to_string())?
+        };
+        if let Err(error) = crate::ui::core_options::open(initial, save, cx) {
+            self.state
+                .set_status_message(format!("Could not open core options: {error}"));
+        }
+        cx.notify();
+    }
+
+    fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_menus();
+        let entries = [
+            ("start-stop", "Start / Stop selected profile"),
+            ("import", "Import profiles from clipboard"),
+            ("input", "Add profile from input"),
+            ("files", "Import profiles from files"),
+            ("edit", "Edit selected profile"),
+            ("basic", "Settings: Basic preferences"),
+            (
+                "core",
+                "Settings: Core options, multiplex presets and Xray system CA",
+            ),
+            ("routing", "Settings: Routing and DNS"),
+            ("tun", "Settings: TUN"),
+            ("hotkeys", "Settings: Hotkeys"),
+            ("groups", "Manage groups"),
+            ("url-test", "URL test selected profile"),
+            ("resolve", "Resolve selected domain to IP"),
+            ("scanner", "IP Lists and Scanner"),
+            ("logs", "Show logs"),
+            ("connections", "Show connections and matched rules"),
+            ("traffic", "Show traffic graph"),
+            ("save", "Save database"),
+        ]
+        .into_iter()
+        .map(|(key, label)| (key.to_string(), label.to_string()))
+        .collect();
+        let owner = cx.entity().downgrade();
+        let main_window = window.window_handle();
+        let apply = Box::new(move |key: &str, cx: &mut App| {
+            let _ = main_window.update(cx, |_, window, cx| {
+                let _ = owner.update(cx, |this, cx| {
+                    window.activate_window();
+                    match key {
+                        "start-stop" => this.toggle_proxy(cx),
+                        "import" => this.import_clipboard(cx),
+                        "input" => this.open_add_from_input(window, cx),
+                        "files" => this.import_from_files(cx),
+                        "edit" => this.open_edit_profile(window, cx),
+                        "basic" => this.open_basic_settings(window, cx),
+                        "core" => this.open_core_options(cx),
+                        "routing" => this.open_routing_settings(Some(window), cx),
+                        "tun" => this.open_tun_settings(window, cx),
+                        "hotkeys" => this.open_hotkey_settings(window, cx),
+                        "groups" => this.open_manage_groups(window, cx),
+                        "url-test" => this.url_test_selected(cx),
+                        "resolve" => this.resolve_profile_domains(false, cx),
+                        "scanner" => this.open_scanner(cx),
+                        "logs" => this.bottom_tab = 0,
+                        "connections" => this.bottom_tab = 1,
+                        "traffic" => this.bottom_tab = 2,
+                        "save" => this.save_db(cx),
+                        _ => {}
+                    }
+                    cx.notify();
+                });
+            });
+        });
+        if let Err(error) = crate::ui::command_palette::open(entries, apply, cx) {
+            self.state
+                .set_status_message(format!("Could not open command palette: {error}"));
+        }
+        cx.notify();
+    }
+
     fn open_basic_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_menus();
         self.dialog = Dialog::basic_from_state(&self.state);
@@ -1374,7 +1488,7 @@ impl MainWindow {
         let mut ids = vec![-1_i64];
         for g in self.state.all_groups() {
             for &pid in &g.profile_ids {
-                ids.push(pid as i64);
+                ids.push(pid);
             }
         }
         ids
@@ -1568,18 +1682,16 @@ impl MainWindow {
     fn open_edit_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_menus();
         match Dialog::edit_profile_from_state(&self.state) {
-            Some(d) => {
-                let name = match &d {
-                    Dialog::EditProfile { name, .. } => name.clone(),
-                    _ => String::new(),
-                };
+            Ok(d) => {
+                if let Dialog::EditProfile { draft, .. } = &d {
+                    self.dialog_inputs = Some(DialogInputs::edit_profile(window, cx, draft));
+                }
                 self.dialog = d;
-                self.dialog_inputs = Some(DialogInputs::edit_profile(window, cx, &name));
                 self.present_gpui_dialog(window, cx);
                 cx.notify();
             }
-            None => {
-                self.state.set_status_message("Select a profile to edit");
+            Err(error) => {
+                self.state.set_status_message(error);
                 cx.notify();
             }
         }
@@ -1968,57 +2080,214 @@ impl MainWindow {
     }
 
     fn save_edit_profile(&mut self, cx: &mut Context<Self>) {
-        let id = match &self.dialog {
-            Dialog::EditProfile { id, .. } => *id,
+        let (id, draft, tab, groups) = match &self.dialog {
+            Dialog::EditProfile {
+                id,
+                draft,
+                tab,
+                selector_groups,
+                ..
+            } => (*id, draft, *tab, selector_groups),
             _ => return,
         };
-        let name = match &self.dialog_inputs {
-            Some(DialogInputs::EditProfile { name }) => DialogInputs::read_string(name, cx),
-            _ => return,
-        };
-        let selector_json = if let Dialog::EditProfile {
-            selector_groups: Some(groups),
-            ..
-        } = &self.dialog
+        if self
+            .state
+            .profile(id)
+            .is_none_or(|current| !draft.matches_source(current))
         {
-            if groups.is_empty() || !groups.iter().any(|id| self.state.group(*id).is_some()) {
-                self.state
-                    .set_status_message("Select at least one existing tracked group");
-                cx.notify();
+            self.profile_edit_error("This profile changed while the editor was open. Reopen it before saving. Your draft has been retained.".into(), cx);
+            return;
+        }
+        let editor = match &self.dialog_inputs {
+            Some(DialogInputs::EditProfile { editor }) => editor,
+            _ => return,
+        };
+        let result = editor
+            .read_draft(draft, tab, cx)
+            .and_then(|draft| draft.build())
+            .and_then(|profile| Self::apply_editor_groups(profile, groups.as_deref(), tab));
+        let profile = match result {
+            Ok(profile) => profile,
+            Err(error) => {
+                self.profile_edit_error(error, cx);
                 return;
             }
-            let Some(mut config) = self
-                .state
-                .profile(id)
-                .and_then(throne_domain::profile_auto_selector)
-            else {
-                return;
-            };
-            config.gids = groups.clone();
-            config.gid = groups[0];
-            config.name = name.trim().to_string();
-            Some(config.to_outbound_json())
-        } else {
-            None
         };
+        if let Some(config) = throne_domain::profile_auto_selector(&profile) {
+            if !config.gids.iter().any(|id| self.state.group(*id).is_some()) {
+                self.profile_edit_error("Select at least one existing tracked group".into(), cx);
+                return;
+            }
+        }
+        let changed = self
+            .state
+            .profile(id)
+            .is_some_and(|old| old.export_outbound_json() != profile.export_outbound_json());
+        let running_id = match self.state.core_status() {
+            CoreStatus::Running { profile_id, .. } => Some(*profile_id),
+            CoreStatus::Starting => self.starting_profile_id,
+            _ => None,
+        };
+        // Database writes are transactional. Publish the draft only after validation;
+        // restore the complete snapshot if persistence fails (including sort order).
+        let original = self.state.clone();
         let result = self
             .state
-            .rename_profile(id, name)
-            .map_err(|e| e.to_string())
-            .and_then(|()| {
-                if let Some(json) = selector_json {
-                    self.state
-                        .update_profile_outbound_json(id, json)
-                        .map_err(|e| e.to_string())?;
-                }
-                self.persist_db()
-            });
-        match result {
-            Ok(()) => {
-                self.close_dialog();
-                self.state.set_status_message("Profile saved");
+            .replace_edited_profile(profile)
+            .map_err(|error| error.to_string())
+            .and_then(|()| self.persist_db());
+        if let Err(error) = result {
+            self.state = original;
+            self.profile_edit_error(format!("Save failed: {error}"), cx);
+            return;
+        }
+        self.close_dialog();
+        self.state.set_status_message("Profile saved");
+        if changed
+            && running_id == Some(id)
+            && !self.pending_stop
+            && self
+                .pending_profile_switch
+                .peek()
+                .is_none_or(|target| target == id)
+        {
+            if matches!(self.state.core_status(), CoreStatus::Starting) {
+                self.restart_when_idle = true;
+                self.state
+                    .set_status_message_only("Profile saved · reload queued after Start");
+            } else {
+                self.pending_profile_switch.set(id);
+                self.stop_proxy(cx);
             }
-            Err(e) => self.state.set_status_message(format!("Save failed: {e}")),
+        } else if changed {
+            self.state
+                .set_status_message_only("Profile saved · apply on next Start");
+        }
+        cx.notify();
+    }
+
+    fn profile_edit_error(&mut self, message: String, cx: &mut Context<Self>) {
+        if let Dialog::EditProfile { error, .. } = &mut self.dialog {
+            *error = message;
+        }
+        cx.notify();
+    }
+
+    fn apply_editor_groups(
+        mut profile: Profile,
+        groups: Option<&[GroupId]>,
+        tab: ProfileEditorTab,
+    ) -> Result<Profile, String> {
+        if tab != ProfileEditorTab::Json {
+            if let Some(groups) = groups {
+                let mut json: serde_json::Value =
+                    serde_json::from_str(&profile.outbound_json).map_err(|e| e.to_string())?;
+                json["gids"] = serde_json::json!(groups);
+                json["gid"] = serde_json::json!(groups.first().copied().unwrap_or(-1));
+                profile.outbound_json = json.to_string();
+                profile.outbound.raw_json = Some(profile.outbound_json.clone());
+            }
+        }
+        Ok(profile)
+    }
+
+    fn handle_profile_editor_event(
+        &mut self,
+        event: ProfileEditorEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            ProfileEditorEvent::Save => {
+                self.save_edit_profile(cx);
+                if matches!(self.dialog, Dialog::None) {
+                    window.close_all_dialogs(cx);
+                }
+            }
+            ProfileEditorEvent::Cancel => {
+                self.close_dialog();
+                window.close_all_dialogs(cx);
+            }
+            ProfileEditorEvent::Toggle(index) => {
+                if let Some(DialogInputs::EditProfile { editor }) = &self.dialog_inputs {
+                    if let Some(input) = editor.fields.get(index) {
+                        let value = DialogInputs::read_string(input, cx) != "true";
+                        DialogInputs::set_string(input, value.to_string(), window, cx);
+                    }
+                }
+            }
+            ProfileEditorEvent::Group(gid) => {
+                if let Dialog::EditProfile {
+                    selector_groups: Some(groups),
+                    ..
+                } = &mut self.dialog
+                {
+                    if groups.contains(&gid) {
+                        groups.retain(|id| *id != gid);
+                    } else {
+                        groups.push(gid);
+                    }
+                }
+            }
+            ProfileEditorEvent::Tab(next) => {
+                let Dialog::EditProfile {
+                    draft,
+                    tab,
+                    selector_groups,
+                    ..
+                } = &self.dialog
+                else {
+                    return;
+                };
+                if *tab == next {
+                    return;
+                }
+                // Ordinary form tabs keep the same entities and accept unfinished fields.
+                if *tab != ProfileEditorTab::Json && next != ProfileEditorTab::Json {
+                    if let Dialog::EditProfile { tab, .. } = &mut self.dialog {
+                        *tab = next;
+                    }
+                } else {
+                    let Some(DialogInputs::EditProfile { editor }) = &self.dialog_inputs else {
+                        return;
+                    };
+                    let result = editor
+                        .read_draft(draft, *tab, cx)
+                        .and_then(|draft| draft.serialize_draft())
+                        .and_then(|profile| {
+                            Self::apply_editor_groups(profile, selector_groups.as_deref(), *tab)
+                        })
+                        .and_then(|profile| {
+                            let groups =
+                                throne_domain::profile_auto_selector(&profile).map(|cfg| cfg.gids);
+                            draft.with_json(profile.outbound_json).map(|mut rebased| {
+                                rebased.name = profile.name;
+                                (rebased, groups)
+                            })
+                        });
+                    match result {
+                        Ok((new_draft, groups)) => {
+                            self.dialog_inputs = Some(DialogInputs::EditProfile {
+                                editor: ProfileEditorInputs::new(&new_draft, window, cx),
+                            });
+                            if let Dialog::EditProfile {
+                                draft,
+                                tab,
+                                error,
+                                selector_groups,
+                                ..
+                            } = &mut self.dialog
+                            {
+                                *draft = new_draft;
+                                *tab = next;
+                                *selector_groups = groups;
+                                error.clear();
+                            }
+                        }
+                        Err(error) => self.profile_edit_error(error, cx),
+                    }
+                }
+            }
         }
         cx.notify();
     }
@@ -2123,6 +2392,12 @@ impl MainWindow {
             (RoutingNested::RouteEditor(ed), NestedInputs::RouteEditor(re)) => {
                 ed.profile.name = DialogInputs::read_string(&re.name, cx);
                 ed.profile.remote_url = DialogInputs::read_string(&re.url, cx);
+                let dns = ed
+                    .profile
+                    .dns
+                    .get_or_insert_with(|| throne_domain::RouteDns::from_settings(&draft.settings));
+                dns.remote_dns = DialogInputs::read_string(&re.dns.remote, cx);
+                dns.direct_dns = DialogInputs::read_string(&re.dns.direct, cx);
                 ed.simple_direct = DialogInputs::read_string(&re.simple_direct, cx);
                 ed.simple_proxy = DialogInputs::read_string(&re.simple_proxy, cx);
                 ed.simple_block = DialogInputs::read_string(&re.simple_block, cx);
@@ -2144,6 +2419,8 @@ impl MainWindow {
             (RoutingNested::RawEditor(ed), NestedInputs::RawEditor(raw)) => {
                 ed.name = DialogInputs::read_string(&raw.name, cx);
                 ed.raw_route = DialogInputs::read_string(&raw.json, cx);
+                ed.dns.remote_dns = DialogInputs::read_string(&raw.dns.remote, cx);
+                ed.dns.direct_dns = DialogInputs::read_string(&raw.dns.direct, cx);
             }
             (RoutingNested::ImportPaste { text }, NestedInputs::ImportPaste { text: inp }) => {
                 *text = DialogInputs::read_string(inp, cx);
@@ -2246,6 +2523,10 @@ impl MainWindow {
                     &ed.simple_proxy,
                     &ed.simple_block,
                     &ed.simple_warp,
+                    &ed.profile
+                        .dns
+                        .clone()
+                        .unwrap_or_else(|| throne_domain::RouteDns::from_settings(&draft.settings)),
                 ));
             }
             RoutingNested::RawEditor(ed) => {
@@ -2254,6 +2535,7 @@ impl MainWindow {
                     cx,
                     &ed.name,
                     &ed.raw_route,
+                    &ed.dns,
                 ));
             }
             RoutingNested::ImportPaste { text } => {
@@ -2325,10 +2607,8 @@ impl MainWindow {
                     .or_else(read_os_clipboard)
                     .unwrap_or_default();
                 let clip = clip.trim().to_string();
-                if !clip.is_empty() {
-                    if self.try_import_route_text(&clip, true, window, cx) {
-                        return;
-                    }
+                if !clip.is_empty() && self.try_import_route_text(&clip, true, window, cx) {
+                    return;
                 }
                 if let Dialog::RoutingSettings(d) = &mut self.dialog {
                     d.nested = RoutingNested::ImportPaste {
@@ -3295,6 +3575,7 @@ impl MainWindow {
         (self.runtime_generation, self.runtime_poll_failures) =
             next_runtime_generation(self.runtime_generation);
         self.state.set_core_status(CoreStatus::Starting);
+        self.starting_profile_id = Some(profile.id);
         let profile_display = runtime_profile_display(profile.profile_type, &profile.name);
         self.running_profile_display = Some(profile_display.clone());
         self.state.push_log(start_profile_log(&profile_display));
@@ -3327,6 +3608,7 @@ impl MainWindow {
                         Ok(members) => members,
                         Err(error) => {
                             self.core_op_busy = false;
+                            self.starting_profile_id = None;
                             self.running_profile_display = None;
                             self.state.set_core_status(CoreStatus::Error(error.clone()));
                             self.state.set_status_message_only(format!(
@@ -3358,6 +3640,7 @@ impl MainWindow {
                 }
                 Err(e) => {
                     self.core_op_busy = false;
+                    self.starting_profile_id = None;
                     self.running_profile_display = None;
                     self.state.set_core_status(CoreStatus::Error(e.to_string()));
                     self.state
@@ -3394,6 +3677,7 @@ impl MainWindow {
 
             this.update(cx, |this, cx| {
                 this.core_op_busy = false;
+                this.starting_profile_id = None;
                 if let Err(e) = &result {
                     this.state
                         .push_log(failed_start_profile_log(&profile_display));
@@ -3450,7 +3734,7 @@ impl MainWindow {
                         // Apply system proxy from *current* settings (not kickoff snapshot).
                         let live = this.state.settings();
                         let tun = live.tun_mode_enabled;
-                        let proxy_on = live.system_proxy_enabled;
+                        let proxy_on = live.system_proxy_enabled && !live.disable_mixed_inbound;
                         if proxy_on {
                             let host = throne_core_client::proxy_client_host(&live.inbound_address);
                             let port = live.inbound_socks_port;
@@ -3493,6 +3777,7 @@ impl MainWindow {
                         this.pending_profile_switch.set(profile_id);
                         this.stop_proxy(cx);
                     } else {
+                        this.pending_profile_switch.set(profile_id);
                         this.start_proxy(cx);
                     }
                     return;
@@ -3662,6 +3947,154 @@ impl MainWindow {
             return;
         }
         self.import_text(&text, cx);
+    }
+
+    fn resolve_profile_domains(&mut self, whole_group: bool, cx: &mut Context<Self>) {
+        if self.background_busy {
+            self.state.set_status_message("Busy — wait for current job");
+            cx.notify();
+            return;
+        }
+        let selected = self.state.selected_profile_id();
+        let group = self.state.active_group_id();
+        let pending: Vec<Profile> = self
+            .state
+            .all_profiles()
+            .into_iter()
+            .filter(|p| {
+                (if whole_group {
+                    p.group_id == group
+                } else {
+                    Some(p.id) == selected
+                }) && throne_domain::endpoint_override_blocker(p).is_none()
+                    && p.outbound.server.as_deref().is_some_and(|host| {
+                        !host.is_empty() && host.parse::<std::net::IpAddr>().is_err()
+                    })
+            })
+            .cloned()
+            .collect();
+        if pending.is_empty() {
+            self.state
+                .set_status_message("No supported profile domains to resolve");
+            cx.notify();
+            return;
+        }
+        let config = match throne_core_client::build_resolve_config(
+            self.state.settings(),
+            self.state.active_route(),
+        ) {
+            Ok(config) => config,
+            Err(error) => {
+                self.state
+                    .set_status_message(format!("DNS probe config failed: {error}"));
+                cx.notify();
+                return;
+            }
+        };
+        let mut domains: Vec<String> = pending
+            .iter()
+            .filter_map(|p| p.outbound.server.clone())
+            .collect();
+        domains.sort();
+        domains.dedup();
+        let core = Arc::clone(&self.core);
+        self.background_busy = true;
+        self.state.set_status_message(format!(
+            "Resolving {} domain(s) through core DNS…",
+            domains.len()
+        ));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    core.lock()
+                        .map_err(|e| format!("core lock: {e}"))?
+                        .resolve_domains(&throne_core_client::ResolveDomainsRequest {
+                            domains,
+                            config,
+                        })
+                        .map_err(|e| e.to_string())
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.background_busy = false;
+                match result {
+                    Err(error) => this
+                        .state
+                        .set_status_message(format!("Resolve domains failed: {error}")),
+                    Ok(reply) => {
+                        let before = this.state.clone();
+                        let mut changed = 0;
+                        for profile in pending {
+                            let Some(current) = this.state.profile(profile.id) else {
+                                continue;
+                            };
+                            if current.export_outbound_json() != profile.export_outbound_json()
+                                || current.profile_type != profile.profile_type
+                                || current.group_id != profile.group_id
+                            {
+                                this.state.push_log(format!(
+                                    "Skipped DNS result for {}: profile changed",
+                                    profile.name
+                                ));
+                                continue;
+                            }
+                            let Some(result) = reply.results.iter().find(|r| {
+                                Some(r.domain.as_str()) == profile.outbound.server.as_deref()
+                            }) else {
+                                continue;
+                            };
+                            let Some(address) = result
+                                .addresses
+                                .first()
+                                .filter(|s| s.parse::<std::net::IpAddr>().is_ok())
+                            else {
+                                this.state.push_log(format!(
+                                    "Could not resolve {}: {}",
+                                    result.domain, result.error
+                                ));
+                                continue;
+                            };
+                            let mut resolved = current.clone();
+                            resolved.endpoint = throne_domain::EndpointSource::Address {
+                                address: address.clone(),
+                            };
+                            let updated =
+                                throne_domain::materialize_profile_endpoint(&resolved, None, None)
+                                    .map_err(|e| e.to_string())
+                                    .and_then(|p| {
+                                        this.state
+                                            .replace_edited_profile(p)
+                                            .map_err(|e| e.to_string())
+                                    });
+                            match updated {
+                                Ok(()) => changed += 1,
+                                Err(error) => this
+                                    .state
+                                    .push_log(format!("Resolve {} failed: {error}", profile.name)),
+                            }
+                        }
+                        if changed > 0 {
+                            if let Err(error) = this.persist_db() {
+                                this.state = before;
+                                this.state.set_status_message(format!(
+                                    "Could not save resolved addresses: {error}"
+                                ));
+                                cx.notify();
+                                return;
+                            }
+                        }
+                        this.state.set_status_message(format!(
+                            "Resolved {changed} profile(s) · addresses saved, apply on next Start"
+                        ));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn persist_db(&mut self) -> Result<(), String> {
@@ -4662,6 +5095,13 @@ impl MainWindow {
     }
 
     fn set_sys_proxy(&mut self, on: bool, cx: &mut Context<Self>) {
+        if on && self.state.settings().disable_mixed_inbound {
+            self.state.set_status_message(
+                "Enable the mixed inbound in Core Options before using System Proxy",
+            );
+            cx.notify();
+            return;
+        }
         self.state.set_spmode_system_proxy(on);
         let s = self.state.settings();
         let host = s.inbound_address.clone();
@@ -5135,7 +5575,7 @@ impl MainWindow {
                 };
                 Some((field, false))
             }
-            Dialog::EditProfile { name, .. } => Some((name, false)),
+            Dialog::EditProfile { .. } => None,
             Dialog::ConfirmDeleteUnavailable { .. } | Dialog::None => None,
         }
     }
@@ -5218,11 +5658,6 @@ impl MainWindow {
             return true;
         }
 
-        if key == "enter" && matches!(self.dialog, Dialog::EditProfile { .. }) {
-            self.save_edit_profile(cx);
-            return true;
-        }
-
         // Hotkey capture rows own keystrokes (QKeySequenceEdit-style).
         if matches!(self.dialog, Dialog::HotkeySettings { .. }) {
             return false;
@@ -5249,33 +5684,32 @@ impl MainWindow {
 
         // Prefer GPUI key_char (IME / layout-correct typed text).
         let is_back = key == "backspace" || key == "delete";
-        let typed: Option<String> = if is_back {
-            None
-        } else if event.keystroke.modifiers.platform || event.keystroke.modifiers.control {
-            None
-        } else if let Some(kc) = event.keystroke.key_char.as_ref() {
-            if kc.chars().all(|c| c.is_control()) {
+        let typed: Option<String> =
+            if is_back || event.keystroke.modifiers.platform || event.keystroke.modifiers.control {
                 None
+            } else if let Some(kc) = event.keystroke.key_char.as_ref() {
+                if kc.chars().all(|c| c.is_control()) {
+                    None
+                } else {
+                    Some(kc.clone())
+                }
+            } else if key == "space" {
+                Some(" ".into())
+            } else if key == "enter"
+                && matches!(
+                    self.dialog,
+                    Dialog::AddFromInput { .. } | Dialog::RoutingSettings(_)
+                )
+            {
+                Some("\n".into())
+            } else if key.len() == 1 {
+                key.chars()
+                    .next()
+                    .filter(|c| !c.is_control())
+                    .map(|c| c.to_string())
             } else {
-                Some(kc.clone())
-            }
-        } else if key == "space" {
-            Some(" ".into())
-        } else if key == "enter"
-            && matches!(
-                self.dialog,
-                Dialog::AddFromInput { .. } | Dialog::RoutingSettings(_)
-            )
-        {
-            Some("\n".into())
-        } else if key.len() == 1 {
-            key.chars()
-                .next()
-                .filter(|c| !c.is_control())
-                .map(|c| c.to_string())
-        } else {
-            None
-        };
+                None
+            };
 
         if !is_back && typed.is_none() {
             return true; // swallow other keys while dialog open
@@ -5443,6 +5877,10 @@ impl MainWindow {
             }
             OpenMenu::Settings => {
                 panel = panel.child(menu_label("Preferences"));
+                item!("set-search", "Command Palette (Ctrl/⌘K)", |t, w, cx| t
+                    .open_command_palette(w, cx));
+                item!("set-core", "Core Options…", |t, _w, cx| t
+                    .open_core_options(cx));
                 item!("set-basic", "Basic Settings", |t, w, cx| t
                     .open_basic_settings(w, cx));
                 item!("set-route", "Routing Settings", |t, w, cx| {
@@ -5544,6 +5982,16 @@ impl MainWindow {
             }
             OpenMenu::Tools => {
                 panel = panel.child(menu_label("Tools"));
+                item!(
+                    "t-resolve-selected",
+                    "Resolve Selected Domain to IP",
+                    |t, _w, cx| t.resolve_profile_domains(false, cx)
+                );
+                item!(
+                    "t-resolve-group",
+                    "Resolve Group Domains to IP",
+                    |t, _w, cx| t.resolve_profile_domains(true, cx)
+                );
                 item!("t-ip-scanner", "IP Lists & Scanner…", |t, _w, cx| t
                     .open_scanner(cx));
                 item!("t-url", "Url Test Selected", |t, _w, cx| t
@@ -6554,7 +7002,11 @@ fn load_initial_state() -> (AppState, String) {
 fn fetch_route_from_body(body: &str) -> Result<throne_domain::RouteProfile, String> {
     if let Some(rr) = throne_import::try_import_routes(body) {
         if let Some(r) = rr.routes.into_iter().next() {
-            return Ok(r);
+            return if r.is_raw {
+                Err("Remote route updates must use a structured route profile".into())
+            } else {
+                Ok(r)
+            };
         }
         if !rr.errors.is_empty() {
             return Err(rr.errors.join("; "));
@@ -6562,11 +7014,19 @@ fn fetch_route_from_body(body: &str) -> Result<throne_domain::RouteProfile, Stri
     }
     let rr = throne_import::import_route_payload(body);
     if let Some(r) = rr.routes.into_iter().next() {
-        return Ok(r);
+        return if r.is_raw {
+            Err("Remote route updates must use a structured route profile".into())
+        } else {
+            Ok(r)
+        };
     }
     let report = throne_import::import_text(body);
     if let Some(r) = report.routes.into_iter().next() {
-        return Ok(r);
+        return if r.is_raw {
+            Err("Remote route updates must use a structured route profile".into())
+        } else {
+            Ok(r)
+        };
     }
     let mut errs = rr.errors;
     errs.extend(report.errors);
@@ -6824,6 +7284,9 @@ impl Render for MainWindow {
             }))
             .on_action(cx.listener(|this, _: &CycleRoute, _, cx| this.cycle_route(cx)))
             .on_action(cx.listener(|this, _: &CopyLogs, _, cx| this.copy_logs(cx)))
+            .on_action(cx.listener(|this, _: &OpenCommandPalette, window, cx| {
+                this.open_command_palette(window, cx)
+            }))
             .on_action(cx.listener(|_this, _: &Quit, _, cx| cx.quit()))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.bottom_tab == 0
@@ -7589,9 +8052,12 @@ fn build_gpui_dialog(
         Dialog::EditProfile {
             type_label,
             selector_groups,
+            draft,
+            tab,
+            error,
             ..
         } => {
-            let Some(DialogInputs::EditProfile { name }) = this.dialog_inputs.as_ref() else {
+            let Some(DialogInputs::EditProfile { editor }) = this.dialog_inputs.as_ref() else {
                 return dialog.title("Edit Profile").child(div().child("…"));
             };
             let type_label = type_label.clone();
@@ -7612,12 +8078,13 @@ fn build_gpui_dialog(
                     }
                 }
             }
-            let e_groups = entity.clone();
-            let e_save = entity.clone();
-            let e_cancel = entity.clone();
+            let events = entity.clone();
+            let content_height =
+                (f32::from(window.viewport_size().height) - 360.).clamp(160., 440.);
+            let width = (f32::from(window.viewport_size().width) - 48.).clamp(320., 740.);
             dialog
                 .title("Edit Profile")
-                .w(px(420.))
+                .w(px(width))
                 .on_cancel({
                     let entity = entity.clone();
                     move |_, _, cx| {
@@ -7629,42 +8096,22 @@ fn build_gpui_dialog(
                     }
                 })
                 .on_close(on_dismiss)
-                .child(edit_profile_body(
-                    name,
-                    &type_label,
-                    &group_options,
-                    is_selector,
-                    move |gid, _, cx| {
-                        e_groups.update(cx, |t, cx| {
-                            if let Dialog::EditProfile {
-                                selector_groups: Some(groups),
-                                ..
-                            } = &mut t.dialog
-                            {
-                                if groups.contains(&gid) {
-                                    groups.retain(|id| *id != gid);
-                                } else {
-                                    groups.push(gid);
-                                }
-                            }
-                            cx.notify();
-                        });
+                .child(profile_editor_body(
+                    ProfileEditorView {
+                        inputs: editor,
+                        draft,
+                        tab: *tab,
+                        type_label: &type_label,
+                        error,
+                        groups: &group_options,
+                        is_selector,
+                        content_height,
                     },
-                    move |window, cx| {
-                        let saved = e_save.update(cx, |t, cx| {
-                            t.save_edit_profile(cx);
-                            matches!(t.dialog, Dialog::None)
+                    cx,
+                    move |event, window, cx| {
+                        events.update(cx, |this, cx| {
+                            this.handle_profile_editor_event(event, window, cx)
                         });
-                        if saved {
-                            window.close_all_dialogs(cx);
-                        }
-                    },
-                    move |window, cx| {
-                        e_cancel.update(cx, |t, cx| {
-                            t.close_dialog();
-                            cx.notify();
-                        });
-                        window.close_all_dialogs(cx);
                     },
                 ))
         }

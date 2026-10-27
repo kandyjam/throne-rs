@@ -90,6 +90,10 @@ impl BasicSettingsTab {
 }
 
 #[derive(Clone, Debug, Default)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Only one dialog draft is active; retain its existing inline ownership."
+)]
 pub enum Dialog {
     #[default]
     None,
@@ -158,10 +162,12 @@ pub enum Dialog {
         /// 0..4 field index
         focus: usize,
     },
-    /// Rename a single profile (display name).
+    /// Lossless profile form and raw outbound editor.
     EditProfile {
         id: ProfileId,
-        name: String,
+        draft: throne_domain::ProfileEditDraft,
+        tab: super::profile_editor::ProfileEditorTab,
+        error: String,
         /// Read-only type label shown in the dialog.
         type_label: String,
         selector_groups: Option<Vec<GroupId>>,
@@ -291,65 +297,28 @@ impl Dialog {
         }
     }
 
-    pub fn edit_profile_from_state(state: &AppState) -> Option<Self> {
-        let id = state.selected_profile_id()?;
-        let p = state.profile(id)?;
-        Some(Self::EditProfile {
+    pub fn edit_profile_from_state(state: &AppState) -> Result<Self, String> {
+        let id = state
+            .selected_profile_id()
+            .ok_or("Select a profile to edit")?;
+        let p = state.profile(id).ok_or("Profile not found")?;
+        let draft = throne_domain::ProfileEditDraft::from_profile(p)?;
+        let tab = if draft.is_structured()
+            || p.profile_type == throne_domain::ProfileType::AutoSelector
+        {
+            super::profile_editor::ProfileEditorTab::General
+        } else {
+            super::profile_editor::ProfileEditorTab::Json
+        };
+        Ok(Self::EditProfile {
             id,
-            name: p.name.clone(),
+            draft,
+            tab,
+            error: String::new(),
             type_label: p.profile_type.as_str().to_string(),
             selector_groups: throne_domain::profile_auto_selector(p).map(|cfg| cfg.gids),
         })
     }
-}
-
-/// Edit profile name and ordered Auto Selector group membership.
-pub fn edit_profile_body(
-    name_input: &Entity<InputState>,
-    type_label: &str,
-    groups: &[(GroupId, String, bool)],
-    is_selector: bool,
-    on_group_toggle: impl Fn(GroupId, &mut Window, &mut App) + Clone + 'static,
-    on_save: impl Fn(&mut Window, &mut App) + 'static,
-    on_cancel: impl Fn(&mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_col()
-        .child(section_hint(format!(
-            "Type: {type_label} · edit name below"
-        )))
-        .child(div().mb_3().child(input_field_row("Name", name_input, 80.)))
-        .when(is_selector, |body| {
-            let mut list = div()
-                .id("selector-groups")
-                .max_h(px(240.))
-                .overflow_y_scroll()
-                .flex()
-                .flex_col();
-            for (id, label, selected) in groups {
-                let id = *id;
-                let callback = on_group_toggle.clone();
-                list = list.child(settings_switch_row(
-                    format!("selector-group-{id}"),
-                    label.clone(),
-                    *selected,
-                    move |_, w, cx| callback(id, w, cx),
-                ));
-            }
-            body.child(section_hint(
-                "Tracked groups · selection order is preserved",
-            ))
-            .child(list)
-        })
-        .child(dialog_actions(
-            "ep-cancel",
-            "Cancel",
-            "ep-ok",
-            "Save",
-            on_cancel,
-            on_save,
-        ))
 }
 
 /// Toggle ids for Basic Settings → Subscription checkboxes.
@@ -373,6 +342,10 @@ pub enum BasicSubToggle {
 /// Common (Inbound / Testing group boxes) · Subscription (2-col grid order).
 ///
 /// `content_max_h` is the scrollable form area height (tabs + footer stay fixed).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep explicit form fields and callbacks consistent with the existing dialog API."
+)]
 pub fn basic_settings_body(
     inbound_address: &Entity<InputState>,
     inbound_port: &Entity<InputState>,
@@ -731,6 +704,10 @@ pub fn manage_groups_body(
 /// Upstream DialogEditGroup body.
 ///
 /// Content scrolls when taller than the dialog; OK/Cancel stay pinned below.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep explicit form fields and callbacks consistent with the existing dialog API."
+)]
 pub fn edit_group_body(
     draft: &crate::ui::dialogs::EditGroupView,
     name: &Entity<InputState>,
@@ -968,6 +945,10 @@ pub struct AutoSelectorGroupView {
 }
 
 /// Live Auto Selector monitor (upstream `DialogAutoSelector`).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep explicit form fields and callbacks consistent with the existing dialog API."
+)]
 pub fn auto_selector_stats_body(
     groups: &[AutoSelectorGroupView],
     only_problems: bool,
@@ -1256,6 +1237,10 @@ fn detect_hint(text: &str) -> &'static str {
     "Unknown — will try import anyway"
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep explicit form fields and callbacks consistent with the existing dialog API."
+)]
 pub fn tun_settings_body(
     mtu_input: &Entity<InputState>,
     ranges_input: &Entity<InputState>,
@@ -1317,6 +1302,10 @@ pub enum HotkeyField {
     CopyLogs,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep explicit form fields and callbacks consistent with the existing dialog API."
+)]
 pub fn hotkey_settings_body(
     start_stop: &str,
     import: &str,
@@ -1386,6 +1375,10 @@ pub fn hotkey_settings_body(
 }
 
 /// Historical Traffic Stats dashboard body (upstream DialogTrafficStats).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep explicit form fields and callbacks consistent with the existing dialog API."
+)]
 pub fn traffic_stats_body(
     period: usize,
     tab: usize,

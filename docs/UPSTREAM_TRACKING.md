@@ -2,9 +2,9 @@
 
 Remote: `upstream` → `https://github.com/throneproj/Throne.git`  
 Baseline branch: `upstream/dev`  
-**Target release (this audit):** tag **`1.4.0-beta.3`** (`01086027`, 2026-10-17).
-**Last audited tip:** `upstream/dev` describe **`1.4.0-beta.3-6-gcb26b89e`** on 2026-10-18 (six commits past the pin; not absorbed).
-**Product version:** `1.4.0-beta.3` (root [`VERSION`](../VERSION) + workspace Cargo version = this pin).
+**Target release (this audit):** tag **`1.4.0-beta.4`** (`dd748826`, 2026-10-22).
+**Last audited tip:** `upstream/dev` describe **`1.4.0-beta.4-15-g1f30af24`** on 2026-10-27 (15 commits past the pin; not absorbed).
+**Product version:** `1.4.0-beta.4` (root [`VERSION`](../VERSION) + workspace Cargo version = this pin).
 
 This pin identifies the audited release baseline; it does not claim complete product parity. The new remote control API, full scanner, Kill Switch, global hotkeys, OS proxy refactor, and historical gaps below remain partial or unported.
 
@@ -14,16 +14,72 @@ Agent skill for ongoing parity work: [`skills/throne-upstream-parity/SKILL.md`](
 
 ```bash
 ./script/upstream-audit            # current VERSION → newest 1.* tag
-./script/upstream-audit 1.4.0-beta.3 # explicit release tag
+./script/upstream-audit 1.4.0-beta.4 # explicit release tag
 ```
 
 Manual equivalent:
 
 ```bash
 git fetch upstream --prune --tags
-git log --oneline 1.4.0-beta.2..1.4.0-beta.3
-git diff --dirstat=files,0 1.4.0-beta.2 1.4.0-beta.3
+git log --oneline 1.4.0-beta.3..1.4.0-beta.4
+git diff --dirstat=files,0 1.4.0-beta.3 1.4.0-beta.4
 ```
+
+## 1.4.0-beta.4 audit (2026-10-27)
+
+**Pinned release:** `dd7488268d560b6924de9d787098a9c9c0e5082f` (2026-10-22), **32 commits** after beta.3 (`01086027`). `upstream/dev` is `1.4.0-beta.4-15-g1f30af24`; those 15 subsequent commits are excluded. This audit closes the contracts below and explicitly retains product gaps.
+
+| Commit | Upstream change | Disposition in this rewrite |
+|--------|-----------------|-----------------------------|
+| `e7362114` | README refresh | ✅ Native README/version and parity scope refreshed |
+| `ebe68079` | Release download table | ⏳ Native release automation/download table not ported |
+| `464db7fb` | False-positive ERROR highlighting | N/A to current literal log view; full severity highlighting remains a documented gap |
+| `2169bae5` | Dock reopen | ✅ Existing GPUI reopen handler restores the retained main session; source and tests inspected, live Dock behavior not re-exercised |
+| `c164ad0c` | Large route-editor freezes | N/A Qt widget/model implementation; native editor uses separate drafts/inputs. Large-subscription performance is not benchmarked |
+| `cb26b89e` | Russian translation | ⏳ Native i18n remains unported |
+| `de65b898` | Subscription fetch with mixed inbound disabled | ✅ Persisted setting/native control, no mixed listener emitted; proxy fetch uses active TUN or reports an unavailable proxy. Conflicting System Proxy activation fails before core/OS changes |
+| `23b5bfcb` | Disable rules and route-editor shortcut | 🧩 Disabled state round-trips DB/share/editor, survives Basic saves and remote refresh, and is excluded from routes/DNS/rule-set downloads. Routing menu right-click shortcut remains |
+| `bd2a713d` | Connections column sizing | 🧩 Existing native fixed/flexible column layout retained; upstream persistent sizing parity not claimed |
+| `67261f7d` | Per-route DNS | ✅ Own/Global DNS for structured/raw profiles, native editor, compatible `dns_json`/`custom_dns`, validation/share/remote-refresh semantics and effective Start/probe config |
+| `464265bf` | Homebrew packaging | ⏳ Upstream Qt formula cannot ship the Rust GUI unchanged; native formula/release artifacts remain |
+| `4a90f3d4` | WebDAV backup/sync | ⏳ Remote backup, credentials, conflict/restore workflow and native integration remain unported |
+| `3ecda025` | Homebrew docs | ⏳ No unsupported native Homebrew install claim added |
+| `e5734625` | Qt 6.12 | N/A native GPUI GUI |
+| `d1a7521a` | Go 1.27.2 CI | ✅ Target core metadata synced and host rebuild uses Go 1.27.2; upstream CI execution not claimed |
+| `73cc65a1` | quirc dependency | N/A Qt QR implementation; native QR import remains a separate gap |
+| `8afd25ff` | fkYAML dependency | N/A C++ parser; Rust YAML importer retained with its documented partial format coverage |
+| `8caa1cbc` | simple-protobuf 1.0.1 | ✅ Target proto synced; Rust length-prefixed protobuf fields/methods tested. C++ dependency itself is N/A |
+| `56bc0d36` | MSVC x86 protobuf fix | N/A C++ library; Windows runtime/build not exercised on this host |
+| `72c70df4` | Chain errors, proxy-user parsing, subscription IDs | 🧩 Native plain HTTP/SOCKS names already avoid accidental base64 reinterpretation; full encoded-credential compatibility, descriptive missing-hop and VPN override behavior remain |
+| `a2180b7b` | Route connection to a specific server | ⏳ Native context menu still supports Proxy/Direct/Block; referenced-profile materialization and server-selection workflow remain |
+| `b83d367e` | Show matched connection rule | ✅ Core metadata, additive fields 15/16, Rust decoding and native outbound tooltip with rule/item; old-core empty metadata remains compatible |
+| `ba9ff85f` | Ctrl+K command palette | 🧩 Native Ctrl/⌘K search, case-insensitive tokens, ranked results, Enter/Escape and existing action/settings navigation; exhaustive per-setting field index remains |
+| `4a469df5` | Multiplex presets/customization | 🧩 Persisted global preset and Core Options, On/Off/Unspecified/custom JSON for supported native leaves and URL tests. Specialized per-node mux form and share export remain |
+| `580c6c59` | TUN leftovers policy | 🧩 Core lifecycle synced; native interactive leftover/retry policy and privileged cross-platform execution remain |
+| `d07ea291` | Subscription expiry countdown | N/A five-minute countdown threshold: native usage card displays a fixed expiry timestamp |
+| `0ca06f23` | Native file pickers | ✅ Existing native OS file selection retained; live multi-platform picker exercise not repeated |
+| `9be37cf0` | macOS DNS loopback lifecycle | 🧩 Target core DNS snapshot/alias/restoration and physical-interface hardening; Rust dns-system inbound/leading hijack rule. Local-resolver loop fix and runtime limits below |
+| `b646dc66` | macOS DNS failure handling | 🧩 Target rollback/recovery synced; unit/build evidence only, no privileged DNS changes performed |
+| `0a9479d0` | Xray update and XDrive | 🧩 Core dependency synced; XDrive Xray JSON stays lossless through full-config bridge; unsupported XDrive URI rejected. Opt-in system CA preserves explicit false/REALITY and XHTTP extra precedence. Dedicated XDrive wizard/validator/export remains |
+| `f491e877` | Resolve domains through core | ✅ Typed ordered per-domain RPC, active/fallback dns-direct config, selected/group native actions preserving transport identity and rejecting stale edits; no OS resolver fallback |
+| `dd748826` | Rename search settings | 🧩 Native Command Palette naming and Settings entry; complete upstream field catalog remains |
+
+### Core baseline and verification boundaries
+
+Active `core/` is based on beta.4, with local Darwin physical-interface selection and saved-resolver hardening retained. Dependency pins: sing-box `a29d468286bc`, Xray `ace47b20f7fe`, WireGuard `de3e4a28dbfe`, gRPC `v1.84.0`. The build applies source-hash-guarded patches to a private sing-box copy, preserving the pre-existing REALITY ML-KEM fix. Legacy untracked `core/server/` is not a build input.
+
+Darwin local DNS resolves through the saved per-service static servers or a confirmed DHCP lease. Unreadable/corrupt/stale ownership data causes the local transport to exclude its own alias without guessing DNS settings; independent system servers remain usable, and an alias-only probe fails resolution instead of recursing. No state-file permissions are loosened. See `core/patches/README.md` for the source guards and limits.
+
+The host audit binary is `target/parity-beta4/ThroneCore`. Packaging must rebuild through `script/build-core`; installed/setuid copies require a separate runtime refresh. Schema acceptance does not prove privileged macOS DNS restoration, TUN/L3/Kill Switch protection, remote XDrive/WebDAV handshakes or Windows/Linux runtime. No production network state is changed by this audit.
+
+### Verification evidence
+
+- **Executed:** 387 Rust workspace tests across 20 suites, desktop compilation, strict production Clippy (`cargo clippy --offline --workspace --lib --bins -- -D warnings`), formatting and diff checks. The final test run used the standard compiler with both Rust wrappers disabled. Tests cover route DNS/rule migration/share/update, compatible RPC framing, resolver contracts, mux/trust behavior, native draft/search behavior and persistence.
+- **Executed:** final rebuilt-core configuration and RPC smoke passed 13 groups, including deterministic hosts-backed ResolveDomains ordering/errors/duplicates, beta.4 DNS/mux settings and custom raw-DNS ECH bootstrap with proxy-default DNS. These checks never start TUN or change the OS proxy.
+- **Executed:** all nine targeted Go packages and RPC/Xray/Xray-DNS race checks passed on the release sync. The final shipping-path rebuild with `THRONE_CORE_VERIFY_PATCHES=1` passed the patched Darwin systemconfig and sysdns race tests, including unreadable ownership records, unknown saved DNS, static/DHCP separation, alias filtering and invalid interface indices. The patched core was then used for the 13 smoke groups above.
+- **Executed / inspected:** independent ECH review passed 18 additional generated-configuration cases covering safe bootstrap, proxy dependency, resolver cycles, object-form dependencies and tag selection; no new blocking findings. This does not establish a live ECH handshake.
+- **Executed limitation:** strict all-target Clippy still encounters pre-existing test-only `field_reassign_with_default` lints in domain/import. The production-target strict command above passes.
+- **Not executed:** live native desktop operation, privileged DNS alias/setup/restoration or service-switch recovery, remote handshakes, Windows/Linux runtime. WebDAV, specific-server routing, full setting search and historical product gaps above remain open.
 
 ## 1.4.0-beta.3 audit (2026-10-18)
 
@@ -67,10 +123,24 @@ The host binary is rebuilt at `target/parity-beta3/ThroneCore`. Packaging still 
 
 ## Feature parity matrix
 
+### Node editor slice (2026-10-27)
+
+The native **Edit Profile** dialog now edits name, server/port, protocol authentication, transport, and TLS/REALITY through General / Transport / TLS / JSON tabs. Supported native outbound shapes have structured fields; complex Xray, Custom, WireGuard and other layouts use the complete outbound JSON editor. This closes the former name-only editing limitation without claiming every upstream protocol-specific form or core validator. This earlier editor slice was built against `1.4.0-beta.3` without core/schema changes; the beta.4 audit above supersedes that release pin.
+
+Changed fields patch the original JSON, retaining unknown settings, ECH, certificate pins, multiplex and custom full documents. Save validates common endpoint/auth and Vision/REALITY/transport contracts, refreshes cached address/auth fields, preserves runtime measurements, rejects a draft if subscription/configuration changed meanwhile, and restores state on persistence failure. Cancel discards the draft. Editing the directly running profile restarts that profile; edits during its Start queue a reload. Other profiles apply on their next Start (automatic reload of indirect chain/selector members is not claimed).
+
+Regression coverage includes port changes, optional-field removal, raw/form round trips, protocol identity protection, custom/WireGuard preservation, transport transitions, REALITY/uTLS, stale drafts and SQLite reopen. Native desktop evidence and final verification totals are recorded after the checks below.
+
 Status legend: ✅ implemented for the stated contract · 🧩 partial · ⏳ planned · ❌ out of scope to rewrite (the Go core is still synced and shipped). Runtime verification limits are listed below.
 
 | Area | Upstream signal (commits / modules) | Rust status | Target crate |
 |------|-------------------------------------|-------------|--------------|
+| **Route DNS and disabled rules (beta.4)** | `67261f7d`, `23b5bfcb` | ✅ Compatible model/DB/share/native editing, remote-refresh preservation and effective generated config; privileged DNS runtime untested | domain, storage, import, core-client, throne |
+| **Core domain resolution / matched connection rules** | `f491e877`, `b83d367e` | ✅ Ordered additive RPC and native selected/group actions; matched rule tooltip; deterministic actual-core smoke | core, core-client, throne |
+| **Mux / Xray CA / XDrive** | `4a469df5`, `0a9479d0` | 🧩 Core Options and preset generation, lossless Xray JSON + explicit CA choices; specialized forms and export remain | domain, storage, import, core-client, throne |
+| **Command Palette** | `ba9ff85f`, `dd748826` | 🧩 Ctrl/⌘K search and existing actions/settings; full field index remains | throne |
+| **WebDAV / specific-server connection routing** | `4a90f3d4`, `a2180b7b` | ⏳ Native workflows not implemented | throne, domain, core-client |
+| **Native node editing** | `DialogEditProfile`, protocol editors, beta.3 validators | 🧩 Structured common/auth/transport/TLS/REALITY forms plus lossless complete JSON editing; validation, cancel/save, stale-draft guard, database reopen and direct active-profile reload. Specialized Xray/WireGuard/other protocol forms and full upstream validation remain | `throne-domain`, `throne-storage`, `throne` |
 | **Multiple Auto Selector groups (1.4.0-beta.3)** | `01086027` | ✅ Ordered/deduplicated `gids`, legacy `gid`, missing-group tolerance, per-group chain eligibility, DB round-trip, Start/rerank and native group checklist; generated config checked by actual core | `throne-domain`, `throne`, `throne-core-client` |
 | **Retained group sorting (1.4.0-beta.3)** | `6906912f` | ✅ DB-compatible mode/direction, per-group header state, stable ties, raw-order preservation and re-sort on data updates/reload; tested | `throne-domain`, `throne-storage`, `throne` |
 | **Route TLS fragmentation (1.4.0-beta.3)** | `a6d042c2` | ✅ Fragment/record flags and delay in model, DB, shares and editor; Basic/Advanced round trips preserve options; generated route-options checked by actual core | `throne-domain`, `throne-import`, `throne-storage`, `throne-core-client`, `throne` |
@@ -120,7 +190,7 @@ Status legend: ✅ implemented for the stated contract · 🧩 partial · ⏳ pl
 | Profile editor tab order (1.2.4) | `33777e27` | ⏳ GPUI focus order later | `throne` |
 | Linux CLI installer | `89f3ec1d` | ⏳ | `script/` / xtask |
 | Windows unwritable config dir (1.2.4) | `d8e663cc` | ⏳ NSI; macOS package already uses AppConfig | `script/`, `throne` |
-| Core: sing-box / xray / TUN / DNS | Go `core/` (moved out of `core/server` in 1.3.0-beta.4) | ❌ Rust data-plane rewrite remains out of scope; shipping `ThroneCore` **synced to 1.4.0-beta.3** (sing-box `8b3b24f856bd`, Xray `0858933635b5`, wireguard-go `98b1170bc9f0`; additive capability/QUIC RPCs) with local Darwin physical-NIC patch retained via `netmon` | `core/` |
+| Core: sing-box / xray / TUN / DNS | Go `core/` (moved out of `core/server` in 1.3.0-beta.4) | ❌ Rust data-plane rewrite remains out of scope; shipping `ThroneCore` **synced to 1.4.0-beta.4** (sing-box `a29d468286bc`, Xray `ace47b20f7fe`, WireGuard `de3e4a28dbfe`; ResolveDomains and rule metadata) with retained local Darwin/REALITY hardening | `core/` |
 | Core IPC Start/Stop | `dispatch.go` + Qt framing | 🧩 Start/Stop/Test/QueryStats/QueryConnections/**CloseConnections**, AutoSelector, scanner/egress RPCs; API service keeps trackers available; Xray strategy reserved field 12 and connection source field 14 retained | `throne-core-client`, `core/` |
 | **IP lists and scanner (1.4.0-beta.1)** | `86f196d4` | 🧩 native manual lists and bounded TCP scanning only: 4,096 targets, 256 hosts per CIDR, concurrency 16, batches 64; scan models/storage/RPCs exist, but full probes, resume UI, remote updates and default list seeds are not ported | `throne-domain`, `throne-storage`, `throne-core-client`, `throne` |
 | **Profile/group endpoint sources** | `1809cb0e` | 🧩 group/profile inheritance and DB round-trip; profile list assignment and Own/Inherit restoration; Start and stored-profile tests clone server overrides while retaining identity; group/fixed-address editor remains | `throne-domain`, `throne-storage`, `throne` |
@@ -137,7 +207,7 @@ Status legend: ✅ implemented for the stated contract · 🧩 partial · ⏳ pl
 | **Group URL/Speed test** | `09e49039` | ✅ group-tab context menu | `throne` |
 | **Route endpoints** | `3ab8b595`, `8a844c5e` | 🧩 `endpoint_profile_ids` + `inner_hop_endpoint_ids` persisted; share/materialize later | `throne-domain`, `throne-storage` |
 | **Xray DNS inject (1.3.0-beta.1)** | `a7f20dd1` | ✅ stop sending reserved field 12; core injects direct-dns | `throne-core-client`, `core/server` |
-| **macOS Tun DNS addr** | `6e9848c2` | ✅ core uses tun prefix addr (not Next) + local physical iface helper | `core/server` |
+| **macOS Tun DNS addr** | `9be37cf0`, `b646dc66` | 🧩 beta.4 loopback alias `127.0.0.53`, DNS snapshot/restore and physical-interface selection; saved-resolver hardening and privileged limits above supersede historical TUN-prefix address | `core/` |
 | **OTP / dashboard / JSON editor** | 1.3.0-beta.1 | ⏳ dashboard RPC present in core; OTP/dashboard/deep editor GUI remains | `throne` |
 | System proxy | `QvProxyConfigurator`, `b19a4b95` | 🧩 existing macOS `networksetup` integration; upstream cross-platform OS proxy refactor not ported | `throne-core-client` |
 | GPUI shell | — | ✅ M0 | `throne` |

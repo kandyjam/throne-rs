@@ -14,6 +14,10 @@ use throne_domain::{AppSettings, AppState};
 
 /// Active dialog text fields backed by gpui-component Input.
 #[derive(Clone)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "One active dialog owns its input handles; retain inline storage."
+)]
 pub enum DialogInputs {
     Basic {
         inbound_address: Entity<InputState>,
@@ -31,7 +35,7 @@ pub enum DialogInputs {
         route_auto_minutes: Entity<InputState>,
     },
     EditProfile {
-        name: Entity<InputState>,
+        editor: super::profile_editor::ProfileEditorInputs,
     },
     Tun {
         mtu: Entity<InputState>,
@@ -51,6 +55,10 @@ pub enum DialogInputs {
 
 /// Nested route-editor / raw / import fields (created when nested opens).
 #[derive(Clone)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "One active dialog owns its input handles; retain inline storage."
+)]
 pub enum NestedInputs {
     /// Structured route editor: Name, remote URL, simple rules, advanced rule attrs.
     RouteEditor(RouteEditorInputs),
@@ -63,6 +71,7 @@ pub enum NestedInputs {
 /// Real Inputs for the raw route profile editor.
 #[derive(Clone)]
 pub struct RawEditorInputs {
+    pub dns: RouteDnsInputs,
     pub name: Entity<InputState>,
     pub json: Entity<TextareaState>,
 }
@@ -70,6 +79,7 @@ pub struct RawEditorInputs {
 /// Real Inputs for the structured route profile editor.
 #[derive(Clone)]
 pub struct RouteEditorInputs {
+    pub dns: RouteDnsInputs,
     pub name: Entity<InputState>,
     pub url: Entity<InputState>,
     pub simple_direct: Entity<EditorState>,
@@ -85,7 +95,31 @@ pub struct RouteEditorInputs {
     pub rule_ip: Entity<TextareaState>,
 }
 
+/// Resolver address inputs shared by structured and raw routing profiles.
+#[derive(Clone)]
+pub struct RouteDnsInputs {
+    pub remote: Entity<InputState>,
+    pub direct: Entity<InputState>,
+}
+
+impl RouteDnsInputs {
+    fn new<V: 'static>(
+        window: &mut Window,
+        cx: &mut Context<V>,
+        dns: &throne_domain::RouteDns,
+    ) -> Self {
+        Self {
+            remote: single_line(window, cx, dns.remote_dns.clone(), "https://…/dns-query"),
+            direct: single_line(window, cx, dns.direct_dns.clone(), "localhost"),
+        }
+    }
+}
+
 impl NestedInputs {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep explicit editor inputs alongside the GPUI window and context."
+    )]
     pub fn route_editor<V: 'static>(
         window: &mut Window,
         cx: &mut Context<V>,
@@ -95,8 +129,10 @@ impl NestedInputs {
         simple_proxy: &str,
         simple_block: &str,
         simple_warp: &str,
+        dns: &throne_domain::RouteDns,
     ) -> Self {
         Self::RouteEditor(RouteEditorInputs {
+            dns: RouteDnsInputs::new(window, cx, dns),
             name: single_line(window, cx, name.to_string(), "Profile name"),
             url: single_line(window, cx, url.to_string(), "https://…"),
             simple_direct: editor_simple_rules(
@@ -137,8 +173,10 @@ impl NestedInputs {
         cx: &mut Context<V>,
         name: &str,
         json: &str,
+        dns: &throne_domain::RouteDns,
     ) -> Self {
         Self::RawEditor(RawEditorInputs {
+            dns: RouteDnsInputs::new(window, cx, dns),
             name: single_line(window, cx, name.to_string(), "Profile name"),
             json: multi_line(window, cx, json.to_string(), "{\n  \"rules\": []\n}", 12),
         })
@@ -368,9 +406,13 @@ impl DialogInputs {
         }
     }
 
-    pub fn edit_profile<V: 'static>(window: &mut Window, cx: &mut Context<V>, name: &str) -> Self {
+    pub fn edit_profile<V: 'static>(
+        window: &mut Window,
+        cx: &mut Context<V>,
+        draft: &throne_domain::ProfileEditDraft,
+    ) -> Self {
         Self::EditProfile {
-            name: single_line(window, cx, name.to_string(), "Profile name"),
+            editor: super::profile_editor::ProfileEditorInputs::new(draft, window, cx),
         }
     }
 

@@ -316,6 +316,34 @@ fn outbound_from_singbox(v: &Value) -> Option<ImportedProfile> {
     })
 }
 
+// Go's JSON decoder folds field names and merges repeated object aliases. Keep the
+// original JSON whenever any alias needs Xray, including explicit null TLS choices,
+// rather than trying to normalize method/network precedence or pointer resets here.
+fn xray_requires_full_config(outbound: &serde_json::Map<String, Value>) -> bool {
+    outbound.iter().any(|(key, value)| {
+        key.eq_ignore_ascii_case("streamSettings")
+            && value.as_object().is_some_and(|stream| {
+                stream.iter().any(|(key, value)| {
+                    if key.eq_ignore_ascii_case("method") || key.eq_ignore_ascii_case("network") {
+                        return value.as_str().is_some_and(|transport| {
+                            ["xhttp", "splithttp", "xdrive"]
+                                .iter()
+                                .any(|kind| transport.eq_ignore_ascii_case(kind))
+                        });
+                    }
+                    key.eq_ignore_ascii_case("tlsSettings")
+                        && value.as_object().is_some_and(|tls| {
+                            tls.keys().any(|key| {
+                                ["echConfigList", "cipherSuites", "useSystemCA"]
+                                    .iter()
+                                    .any(|field| key.eq_ignore_ascii_case(field))
+                            })
+                        })
+                })
+            })
+    })
+}
+
 fn xray_outbound(v: &Value) -> Option<ImportedProfile> {
     let obj = v.as_object()?;
     let protocol = obj.get("protocol")?.as_str()?;
@@ -328,13 +356,7 @@ fn xray_outbound(v: &Value) -> Option<ImportedProfile> {
         .unwrap_or(protocol)
         .to_string();
 
-    // Preserve Xray-only TLS/transport options through the existing full-config bridge.
-    // Flattening these into a sing-box leaf would silently lose ECH or XHTTP.
-    let stream = &v["streamSettings"];
-    if stream["tlsSettings"].get("echConfigList").is_some()
-        || stream["tlsSettings"].get("cipherSuites").is_some()
-        || matches!(stream["network"].as_str(), Some("xhttp" | "splithttp"))
-    {
+    if xray_requires_full_config(obj) {
         return Some(custom_xray_full_profile(
             &name,
             &serde_json::json!({"outbounds":[v]}).to_string(),

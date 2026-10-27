@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use gpui::{div, prelude::*, px, App, SharedString, Window};
+use gpui_component::tooltip::Tooltip;
 use throne_core_client::ConnectionRow;
 use throne_domain::{endpoint_host, is_own_address};
 
@@ -45,6 +46,27 @@ pub fn display_protocol(network: &str, protocol: &str) -> String {
         network.to_string()
     } else {
         format!("{network} ({protocol})")
+    }
+}
+
+/// Complete matched route information; the precise entry takes priority over the whole rule.
+pub fn matched_rule_tooltip(c: &ConnectionRow) -> String {
+    let matched = if !c.rule_item.is_empty() {
+        c.rule_item.as_str()
+    } else if !c.rule.is_empty() {
+        c.rule.as_str()
+    } else {
+        "final"
+    };
+    let outbound = if c.outbound_name.is_empty() || c.outbound_name == c.outbound {
+        c.outbound.clone()
+    } else {
+        format!("{} ({})", c.outbound_name, c.outbound)
+    };
+    if !c.rule.is_empty() && c.rule != matched {
+        format!("Matched: {matched} → {outbound}\nRule: {}", c.rule)
+    } else {
+        format!("Matched: {matched} → {outbound}")
     }
 }
 
@@ -229,15 +251,22 @@ pub fn connection_row(
             display_protocol(&c.network, &c.protocol),
             fg,
         ))
-        .child(col_fixed(
-            COL_OUT,
-            if c.outbound_name.is_empty() {
-                c.outbound.clone()
-            } else {
-                c.outbound_name.clone()
-            },
-            fg,
-        ))
+        .child({
+            let tooltip = matched_rule_tooltip(c);
+            div()
+                .id(SharedString::from(format!("conn-route-{}", c.id)))
+                .flex_shrink_0()
+                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                .child(col_fixed(
+                    COL_OUT,
+                    if c.outbound_name.is_empty() {
+                        c.outbound.clone()
+                    } else {
+                        c.outbound_name.clone()
+                    },
+                    fg,
+                ))
+        })
         .child(col_fixed(
             COL_TRAFFIC,
             display_traffic(c.upload, c.download),
@@ -330,6 +359,28 @@ pub fn connections_panel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matched_rule_details_preserve_item_rule_name_and_final_fallback() {
+        let mut row = ConnectionRow {
+            outbound: "route-7".into(),
+            outbound_name: "My server".into(),
+            rule: "domain_suffix=example.com,example.org".into(),
+            rule_item: "domain_suffix=example.com".into(),
+            ..Default::default()
+        };
+        assert_eq!(matched_rule_tooltip(&row), "Matched: domain_suffix=example.com → My server (route-7)\nRule: domain_suffix=example.com,example.org");
+        row.rule_item.clear();
+        assert_eq!(
+            matched_rule_tooltip(&row),
+            "Matched: domain_suffix=example.com,example.org → My server (route-7)"
+        );
+        row.rule.clear();
+        row.outbound_name.clear();
+        assert_eq!(matched_rule_tooltip(&row), "Matched: final → route-7");
+        row.outbound_name = row.outbound.clone();
+        assert_eq!(matched_rule_tooltip(&row), "Matched: final → route-7");
+    }
 
     #[test]
     fn display_dest_matches_upstream() {

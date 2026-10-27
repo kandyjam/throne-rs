@@ -234,10 +234,11 @@ fn decode_url_test_item(data: &[u8]) -> Result<UrlTestResult, CoreError> {
     Ok(r)
 }
 
+/// Per-outbound upload and download counters, in that order.
+pub type QueryStatsMaps = (HashMap<String, i64>, HashMap<String, i64>);
+
 /// Decode `QueryStatsResp` maps `ups` / `downs`.
-pub fn decode_query_stats_resp(
-    data: &[u8],
-) -> Result<(HashMap<String, i64>, HashMap<String, i64>), CoreError> {
+pub fn decode_query_stats_resp(data: &[u8]) -> Result<QueryStatsMaps, CoreError> {
     let mut ups = HashMap::new();
     let mut downs = HashMap::new();
     let mut i = 0;
@@ -312,6 +313,10 @@ pub struct ConnectionRow {
     pub closed_at: i64,
     /// Client address `ip:port` (proto field 14, 1.3.0-beta.2). Empty when unknown.
     pub source: String,
+    /// Matched route rule (proto field 15, 1.4.0-beta.4); empty for final routing.
+    pub rule: String,
+    /// Entries in the matched rule that applied (proto field 16); empty when unknown.
+    pub rule_item: String,
 }
 
 /// Decode `QueryConnectionsResp` (`active` field 1, `closed` field 2).
@@ -328,14 +333,9 @@ pub fn decode_query_connections_resp(
         let wire = (key & 0x7) as u8;
         match (field, wire) {
             (1, 2) | (2, 2) => {
-                let (len, ni) = read_varint(data, i)?;
-                i = ni;
-                let len = len as usize;
-                if i + len > data.len() {
-                    return Err(CoreError::Rpc("truncated ConnectionMetaData".into()));
-                }
-                let row = decode_connection_meta(&data[i..i + len])?;
-                i += len;
+                let (bytes, next) = read_bytes(data, i)?;
+                let row = decode_connection_meta(bytes)?;
+                i = next;
                 if field == 1 {
                     active.push(row);
                 } else {
@@ -455,10 +455,95 @@ fn decode_connection_meta(data: &[u8]) -> Result<ConnectionRow, CoreError> {
                 r.source = s;
                 i = ni;
             }
+            (15, 2) => {
+                let (s, ni) = read_string(data, i)?;
+                r.rule = s;
+                i = ni;
+            }
+            (16, 2) => {
+                let (s, ni) = read_string(data, i)?;
+                r.rule_item = s;
+                i = ni;
+            }
             _ => i = skip_field(data, i, wire)?,
         }
     }
     Ok(r)
+}
+
+/// Domains resolved through the core's `dns-direct` transport, never the OS resolver.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolveDomainsRequest {
+    /// Input order, duplicates and empty entries are retained for per-domain results.
+    pub domains: Vec<String>,
+    /// Probe config used only when the running instance has no `dns-direct` transport.
+    pub config: String,
+}
+
+/// A DNS lookup result. A failed domain does not discard other successful lookups.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedDomain {
+    pub domain: String,
+    pub addresses: Vec<String>,
+    pub error: String,
+}
+
+/// Results in the same order as [`ResolveDomainsRequest::domains`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolveDomainsResponse {
+    pub results: Vec<ResolvedDomain>,
+}
+
+pub fn encode_resolve_domains_req(request: &ResolveDomainsRequest) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for domain in &request.domains {
+        write_string(&mut buf, 1, domain);
+    }
+    if !request.config.is_empty() {
+        write_string(&mut buf, 2, &request.config);
+    }
+    buf
+}
+
+pub fn decode_resolve_domains_resp(data: &[u8]) -> Result<ResolveDomainsResponse, CoreError> {
+    let mut response = ResolveDomainsResponse::default();
+    let mut i = 0;
+    while i < data.len() {
+        let (key, next) = read_varint(data, i)?;
+        i = next;
+        match ((key >> 3) as u32, (key & 7) as u8) {
+            (1, 2) => {
+                let (bytes, next) = read_bytes(data, i)?;
+                response.results.push(decode_resolved_domain(bytes)?);
+                i = next;
+            }
+            (_, wire) => i = skip_field(data, i, wire)?,
+        }
+    }
+    Ok(response)
+}
+
+fn decode_resolved_domain(data: &[u8]) -> Result<ResolvedDomain, CoreError> {
+    let mut result = ResolvedDomain::default();
+    let mut i = 0;
+    while i < data.len() {
+        let (key, next) = read_varint(data, i)?;
+        i = next;
+        match ((key >> 3) as u32, (key & 7) as u8) {
+            (field @ 1..=3, 2) => {
+                let (value, next) = read_string(data, i)?;
+                match field {
+                    1 => result.domain = value,
+                    2 => result.addresses.push(value),
+                    3 => result.error = value,
+                    _ => unreachable!(),
+                }
+                i = next;
+            }
+            (_, wire) => i = skip_field(data, i, wire)?,
+        }
+    }
+    Ok(result)
 }
 
 /// Encode `IPTestRequest`. All bool/int fields Go dereferences must be set.
@@ -912,7 +997,7 @@ fn write_string(buf: &mut Vec<u8>, field: u32, s: &str) {
 }
 
 fn write_varint_field(buf: &mut Vec<u8>, field: u32, value: u64) {
-    write_varint(buf, ((field as u64) << 3) | 0);
+    write_varint(buf, (field as u64) << 3);
     write_varint(buf, value);
 }
 
@@ -950,14 +1035,19 @@ fn read_varint(data: &[u8], mut i: usize) -> Result<(u64, usize), CoreError> {
     }
 }
 
+fn read_bytes(data: &[u8], i: usize) -> Result<(&[u8], usize), CoreError> {
+    let (len, start) = read_varint(data, i)?;
+    let end = usize::try_from(len)
+        .ok()
+        .and_then(|len| start.checked_add(len))
+        .filter(|end| *end <= data.len())
+        .ok_or_else(|| CoreError::Rpc("truncated length-delimited field".into()))?;
+    Ok((&data[start..end], end))
+}
+
 fn read_string(data: &[u8], i: usize) -> Result<(String, usize), CoreError> {
-    let (len, ni) = read_varint(data, i)?;
-    let len = len as usize;
-    if ni + len > data.len() {
-        return Err(CoreError::Rpc("truncated string".into()));
-    }
-    let s = String::from_utf8_lossy(&data[ni..ni + len]).into_owned();
-    Ok((s, ni + len))
+    let (bytes, next) = read_bytes(data, i)?;
+    Ok((String::from_utf8_lossy(bytes).into_owned(), next))
 }
 
 fn skip_field(data: &[u8], i: usize, wire: u8) -> Result<usize, CoreError> {
@@ -972,14 +1062,7 @@ fn skip_field(data: &[u8], i: usize, wire: u8) -> Result<usize, CoreError> {
             }
             Ok(i + 8)
         }
-        2 => {
-            let (len, ni) = read_varint(data, i)?;
-            let end = ni + len as usize;
-            if end > data.len() {
-                return Err(CoreError::Rpc("truncated length-delimited".into()));
-            }
-            Ok(end)
-        }
+        2 => read_bytes(data, i).map(|(_, next)| next),
         5 => {
             if i + 4 > data.len() {
                 return Err(CoreError::Rpc("truncated fixed32".into()));
@@ -1146,5 +1229,110 @@ mod beta3_contracts {
         );
         assert_eq!(encode_quic_signature_req("a"), vec![10, 1, b'a']);
         assert!(decode_quic_signature_resp(&[18, 3, b'x']).is_err());
+    }
+}
+
+#[cfg(test)]
+mod beta4_contracts {
+    use super::*;
+
+    fn nested(buf: &mut Vec<u8>, field: u32, bytes: &[u8]) {
+        write_varint(buf, ((field as u64) << 3) | 2);
+        write_varint(buf, bytes.len() as u64);
+        buf.extend_from_slice(bytes);
+    }
+
+    #[test]
+    fn resolver_request_preserves_order_duplicates_empty_names_and_probe_config() {
+        let encoded = encode_resolve_domains_req(&ResolveDomainsRequest {
+            domains: vec!["a".into(), "".into(), "a".into()],
+            config: "{}".into(),
+        });
+        assert_eq!(
+            encoded,
+            [10, 1, b'a', 10, 0, 10, 1, b'a', 18, 2, b'{', b'}']
+        );
+        assert!(encode_resolve_domains_req(&ResolveDomainsRequest::default()).is_empty());
+    }
+
+    #[test]
+    fn resolver_keeps_ipv4_ipv6_per_domain_errors_and_result_order() {
+        let mut success = Vec::new();
+        write_string(&mut success, 1, "same.example");
+        write_string(&mut success, 2, "192.0.2.1");
+        write_string(&mut success, 2, "2001:db8::1");
+        write_string(&mut success, 99, "future field");
+        let mut failed = Vec::new();
+        write_string(&mut failed, 1, "same.example");
+        write_string(&mut failed, 3, "lookup timed out");
+        let mut bytes = Vec::new();
+        nested(&mut bytes, 1, &success);
+        write_varint_field(&mut bytes, 22, 42);
+        nested(&mut bytes, 1, &failed);
+        let decoded = decode_resolve_domains_resp(&bytes).unwrap();
+        assert_eq!(
+            decoded.results,
+            [
+                ResolvedDomain {
+                    domain: "same.example".into(),
+                    addresses: vec!["192.0.2.1".into(), "2001:db8::1".into()],
+                    error: String::new()
+                },
+                ResolvedDomain {
+                    domain: "same.example".into(),
+                    addresses: vec![],
+                    error: "lookup timed out".into()
+                },
+            ]
+        );
+        assert_eq!(
+            decode_resolve_domains_resp(&[]).unwrap(),
+            ResolveDomainsResponse::default()
+        );
+    }
+
+    #[test]
+    fn resolver_rejects_truncated_and_overflowed_nested_lengths() {
+        for bytes in [
+            vec![10, 2, 10],
+            vec![10, 2, 10, 1],
+            vec![10, 255, 255, 255, 255, 255, 255, 255, 255, 255, 1],
+            vec![10, 11, 10, 255, 255, 255, 255, 255, 255, 255, 255, 255, 1],
+        ] {
+            assert!(decode_resolve_domains_resp(&bytes).is_err(), "{bytes:?}");
+        }
+    }
+
+    #[test]
+    fn connection_decodes_matched_rule_and_item_for_active_and_closed_rows() {
+        let mut metadata = Vec::new();
+        write_string(&mut metadata, 1, "connection-1");
+        write_string(&mut metadata, 5, "route-7");
+        write_string(&mut metadata, 14, "192.0.2.20:1234");
+        write_string(&mut metadata, 15, "domain_suffix=example.com,example.org");
+        write_string(&mut metadata, 16, "domain_suffix=example.com");
+        write_string(&mut metadata, 77, "future metadata");
+        let mut bytes = Vec::new();
+        nested(&mut bytes, 1, &metadata);
+        nested(&mut bytes, 2, &metadata);
+        let (active, closed) = decode_query_connections_resp(&bytes).unwrap();
+        for rows in [active, closed] {
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row.id, "connection-1");
+            assert_eq!(row.outbound, "route-7");
+            assert_eq!(row.source, "192.0.2.20:1234");
+            assert_eq!(row.rule, "domain_suffix=example.com,example.org");
+            assert_eq!(row.rule_item, "domain_suffix=example.com");
+        }
+    }
+
+    #[test]
+    fn connections_from_older_cores_keep_rule_metadata_empty() {
+        let (active, closed) = decode_query_connections_resp(&[10, 3, 10, 1, b'a']).unwrap();
+        assert!(closed.is_empty());
+        assert_eq!(active[0].id, "a");
+        assert!(active[0].rule.is_empty());
+        assert!(active[0].rule_item.is_empty());
     }
 }

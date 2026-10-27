@@ -12,7 +12,19 @@ description: >-
 Keep **throne-rs** (`rewrite/rust-gpui`) behaviorally aligned with
 [throneproj/Throne](https://github.com/throneproj/Throne) without reintroducing Qt.
 
-## 1.4.0-beta.3 feature notes (current pin)
+## 1.4.0-beta.4 feature notes (current pin)
+
+Target `dd748826` (2026-10-22); audited 2026-10-27. All 32 commits since beta.3 are triaged in `docs/UPSTREAM_TRACKING.md`. `upstream/dev` is `1.4.0-beta.4-15-g1f30af24`; later commits are excluded. This release pin does not assert complete product parity.
+
+- Route-specific DNS and disabled rules persist through compatible DB/share/edit/remote refresh; Start/probe generation respects effective DNS and skips disabled rules before rule-set fetches.
+- Core and additive ResolveDomains/connection-rule RPCs match beta.4. Native selected/group domain resolution preserves identity; matched rules appear in Connections tooltips.
+- Native Ctrl/⌘K Command Palette and Core Options expose existing actions, mux presets, mixed-inbound disable and opt-in Xray system CA. Explicit trust choices and REALITY are retained.
+- XDrive JSON is losslessly bridged to Xray; unsupported XDrive share links fail visibly. Specialized form/validation/export remains.
+- Rebuild with `./script/build-core`; preserve the private source-guarded REALITY ML-KEM patch, Darwin physical-interface handling and managed local-resolver protection. Never overwrite legacy `core/server/` or assume installed privileged binaries refreshed automatically.
+- WebDAV, connection-to-specific-server routing, complete field search, full mux/XDrive forms and historical headless/API/scanner/Kill Switch/hotkey gaps remain explicit. See the matrix for executed checks and runtime limits.
+- Executed on 2026-10-27: 387 Rust workspace tests, strict production Clippy, desktop compilation, formatting, final host core rebuild with Darwin DNS patch race tests, and 13 actual-core smoke groups. Independent ECH review passed 18 extra config cases. All-target lint remains blocked by pre-existing test-only lints; native GUI, privileged DNS/TUN and cross-platform runtime remain untested.
+
+## 1.4.0-beta.3 feature notes (historical pin)
 
 Verification on 2026-10-18: 310 workspace tests, desktop check, host core rebuild, 10 actual-core smoke groups and Go targeted/race tests passed. Strict Clippy remains blocked by 18 pre-existing domain lints; native desktop and privileged/cross-platform runtime remain untested.
 
@@ -32,8 +44,8 @@ All **16 commits** since beta.2 are triaged in `docs/UPSTREAM_TRACKING.md`; the 
 | Item | Value |
 |------|--------|
 | Upstream remote | `upstream` → `https://github.com/throneproj/Throne.git` |
-| **Pin** | tag **`1.4.0-beta.3`** (`01086027`, 2026-10-17) |
-| `upstream/dev` at last audit | `1.4.0-beta.3-6-gcb26b89e` on 2026-10-18 — later commits excluded |
+| **Pin** | tag **`1.4.0-beta.4`** (`dd748826`, 2026-10-22) |
+| `upstream/dev` at last audit | `1.4.0-beta.4-15-g1f30af24` on 2026-10-27 — later commits excluded |
 | Product version | root `VERSION` + workspace `Cargo.toml` `version` |
 | Matrix | [`docs/UPSTREAM_TRACKING.md`](../../docs/UPSTREAM_TRACKING.md) |
 | Audit command | `./script/upstream-audit [tag]` |
@@ -81,7 +93,7 @@ Proto lives at `core/gen/libcore.proto`. New contracts since 1.3.0-beta.3 includ
 | Main window / dialogs | `crates/throne/src/ui/` |
 | Import / deeplink | `throne-import` |
 
-## 1.4.0-beta.2 contracts and remaining gaps (current pin)
+## 1.4.0-beta.2 contracts and remaining gaps (historical pin)
 
 All 14 release commits are triaged in `docs/UPSTREAM_TRACKING.md`.
 

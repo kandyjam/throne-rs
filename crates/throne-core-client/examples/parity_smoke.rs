@@ -119,6 +119,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     check_websocket_endpoints(&mut core, &settings)?;
     check_beta2_imports(&mut core)?;
     check_beta3_contracts(&mut core)?;
+    check_beta4_contracts(&mut core)?;
 
     let session = format!("parity-smoke-{}", std::process::id());
     let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -282,5 +283,85 @@ fn check_beta3_contracts(core: &mut CoreSession) -> Result<(), Box<dyn Error>> {
     println!(
         "PASS: privilege capabilities and offline QUIC signature RPCs respond; IP input rejected"
     );
+    Ok(())
+}
+
+fn check_beta4_contracts(core: &mut CoreSession) -> Result<(), Box<dyn Error>> {
+    use serde_json::json;
+    use throne_core_client::ResolveDomainsRequest;
+    use throne_domain::{RouteDns, RouteProfile, RouteRule};
+    let mut p = Profile::new(50, 1, "beta4", ProfileType::Vless);
+    p.outbound_json=json!({"type":"vless","server":"proxy.example","server_port":443,"uuid":"11111111-1111-1111-1111-111111111111","multiplex":{"enabled":true}}).to_string();
+    let s = AppSettings {
+        mux_protocol: "yamux".into(),
+        mux_mode: "max_connections".into(),
+        mux_max_connections: 3,
+        mux_min_streams: 2,
+        ..Default::default()
+    };
+    let mut route = RouteProfile::new(1, "own DNS");
+    route.custom_dns = true;
+    route.dns = Some(RouteDns {
+        direct_dns: "9.9.9.9".into(),
+        fake_dns: true,
+        ..Default::default()
+    });
+    route.rules.push(RouteRule {
+        domain: vec!["direct.example".into()],
+        outbound_id: -2,
+        ..Default::default()
+    });
+    route.rules.push(RouteRule {
+        disabled: true,
+        domain: vec!["off.example".into()],
+        rule_set: vec!["not-a-real-ruleset".into()],
+        ..Default::default()
+    });
+    for tun in [false, true] {
+        let mut s = s.clone();
+        s.tun_mode_enabled = tun;
+        let cfg = build_load_config(&p, &s, Some(&route))?;
+        core.check_config_json(&cfg.core_config_json)?;
+        assert!(!cfg.core_config_json.contains("off.example"));
+    }
+    println!("PASS: beta4 route DNS, disabled rules, multiplex preset and Darwin TUN DNS schema validate without starting TUN");
+    for custom in [false, true] {
+        let mut p = Profile::new(51, 1, "raw DNS ECH", ProfileType::Trojan);
+        let mut ech = json!({"enabled":true,"query_server_name":"public.example"});
+        if custom {
+            ech["resolver"] = json!("https://1.1.1.1/dns-query");
+        }
+        p.outbound_json=json!({"type":"trojan","server":"edge.example","server_port":443,"password":"pw","tls":{"enabled":true,"ech":ech}}).to_string();
+        for dns in [
+            json!({"servers":[{"type":"local","tag":"global"},{"type":"local","tag":"dns-ech-0"}],"final":"global"}),
+            json!({"servers":[{"type":"local","tag":"bootstrap"},{"type":"https","tag":"remote","server":"1.1.1.1","detour":"proxy","domain_resolver":"bootstrap"}],"final":"remote"}),
+        ] {
+            let settings = AppSettings {
+                use_dns_object: true,
+                dns_object: dns.to_string(),
+                ..Default::default()
+            };
+            let cfg = build_load_config(&p, &settings, None)?;
+            core.check_config_json(&cfg.core_config_json)?;
+        }
+    }
+    println!("PASS: custom raw DNS tags and ECH bootstrap references validate without collisions");
+    let config=json!({"dns":{"servers":[{"type":"hosts","tag":"dns-direct","predefined":{"beta4.example":["192.0.2.44","2001:db8::44"]}}],"final":"dns-direct"},"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct","default_domain_resolver":"dns-direct"}}).to_string();
+    let result = core.resolve_domains(&ResolveDomainsRequest {
+        domains: vec![
+            "beta4.example".into(),
+            "missing.invalid".into(),
+            "beta4.example".into(),
+        ],
+        config,
+    })?;
+    assert_eq!(result.results.len(), 3);
+    assert_eq!(result.results[0].domain, "beta4.example");
+    assert!(result.results[0]
+        .addresses
+        .contains(&"192.0.2.44".to_string()));
+    assert!(!result.results[1].error.is_empty());
+    assert_eq!(result.results[0].addresses, result.results[2].addresses);
+    println!("PASS: beta4 ResolveDomains uses deterministic core hosts transport, preserves request order and per-domain errors");
     Ok(())
 }

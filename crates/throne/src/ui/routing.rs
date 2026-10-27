@@ -10,7 +10,7 @@ use std::rc::Rc;
 use gpui::{div, prelude::*, px, AnyElement, App, SharedString, Window};
 
 use throne_domain::{
-    AppSettings, AppState, DefaultOutbound, RouteProfile, RouteRule, SimpleAction,
+    AppSettings, AppState, DefaultOutbound, RouteDns, RouteProfile, RouteRule, SimpleAction,
 };
 
 use crate::theme::Theme;
@@ -141,6 +141,9 @@ pub struct RawEditorDraft {
     pub name: String,
     pub raw_route: String,
     pub prevent_modifications: bool,
+    pub custom_dns: bool,
+    pub dns: RouteDns,
+    original: RouteProfile,
     pub focus: ReFocus,
 }
 
@@ -155,12 +158,19 @@ impl RawEditorDraft {
                 p.raw_route.clone()
             },
             prevent_modifications: p.prevent_modifications,
+            custom_dns: p.custom_dns,
+            dns: p.dns.clone().unwrap_or_default(),
+            original: p.clone(),
             focus: ReFocus::Name,
         }
     }
 
     pub fn into_profile(self, id: i64) -> RouteProfile {
-        let mut p = RouteProfile::new(id, self.name);
+        let mut p = self.original;
+        p.id = id;
+        p.name = self.name;
+        p.custom_dns = self.custom_dns;
+        p.dns = Some(self.dns);
         p.is_raw = true;
         p.raw_route = self.raw_route;
         p.prevent_modifications = self.prevent_modifications;
@@ -422,6 +432,7 @@ fn strategy_label(s: &str) -> String {
 // ── UI builders ─────────────────────────────────────────────────────────────
 
 type ClickFn = Rc<dyn Fn(&mut Window, &mut App)>;
+type RoutingCallback = Rc<dyn Fn(RoutingEvent, &mut Window, &mut App)>;
 
 /// Real Input + optional ▼ preset cycle (DNS remote/direct rows).
 fn dns_input_with_preset(
@@ -604,7 +615,7 @@ pub enum RoutingEvent {
     ReToggle(&'static str),
 }
 
-fn emit(on_event: &Rc<dyn Fn(RoutingEvent, &mut Window, &mut App)>, ev: RoutingEvent) -> ClickFn {
+fn emit(on_event: &RoutingCallback, ev: RoutingEvent) -> ClickFn {
     let on_event = on_event.clone();
     Rc::new(move |w, cx| on_event(ev.clone(), w, cx))
 }
@@ -612,7 +623,7 @@ fn emit(on_event: &Rc<dyn Fn(RoutingEvent, &mut Window, &mut App)>, ev: RoutingE
 fn build_main(
     draft: &RoutingDraft,
     inputs: Option<&RoutingInputs>,
-    on_event: Rc<dyn Fn(RoutingEvent, &mut Window, &mut App)>,
+    on_event: RoutingCallback,
 ) -> impl IntoElement {
     let selected_index = RoutingTab::ALL
         .iter()
@@ -676,10 +687,7 @@ fn build_main(
         )
 }
 
-fn tab_common(
-    draft: &RoutingDraft,
-    on_event: &Rc<dyn Fn(RoutingEvent, &mut Window, &mut App)>,
-) -> impl IntoElement {
+fn tab_common(draft: &RoutingDraft, on_event: &RoutingCallback) -> impl IntoElement {
     let s = &draft.settings;
     let f = draft.focus;
 
@@ -797,7 +805,7 @@ fn tab_common(
 fn tab_warp(
     draft: &RoutingDraft,
     inputs: Option<&RoutingInputs>,
-    on_event: &Rc<dyn Fn(RoutingEvent, &mut Window, &mut App)>,
+    on_event: &RoutingCallback,
 ) -> impl IntoElement {
     let s = &draft.settings;
     let f = draft.focus;
@@ -881,7 +889,7 @@ fn tab_warp(
 fn tab_dns(
     draft: &RoutingDraft,
     inputs: Option<&RoutingInputs>,
-    on_event: &Rc<dyn Fn(RoutingEvent, &mut Window, &mut App)>,
+    on_event: &RoutingCallback,
 ) -> impl IntoElement {
     // Layout mirrors upstream DialogManageRoutes DNS tab.
     // When `inputs` is present, single-line fields use real gpui-component Input.
@@ -984,6 +992,24 @@ fn tab_dns(
                         emit(on_event, RoutingEvent::Cycle("direct_dns_strategy")),
                     )),
             )
+            .child(settings_switch_row(
+                "global-remote-ipv6",
+                "Remote DNS: IPv4 only",
+                s.remote_dns_disable_ipv6 || s.remote_dns_strategy == "ipv4_only",
+                {
+                    let on = emit(on_event, RoutingEvent::Toggle("remote_dns_disable_ipv6"));
+                    move |_, w, cx| on(w, cx)
+                },
+            ))
+            .child(settings_switch_row(
+                "global-direct-ipv6",
+                "Direct DNS: IPv4 only",
+                s.direct_dns_disable_ipv6 || s.direct_dns_strategy == "ipv4_only",
+                {
+                    let on = emit(on_event, RoutingEvent::Toggle("direct_dns_disable_ipv6"));
+                    move |_, w, cx| on(w, cx)
+                },
+            ))
             .child(
                 div()
                     .flex()
@@ -1156,10 +1182,7 @@ fn tab_dns(
         })
 }
 
-fn tab_route(
-    draft: &RoutingDraft,
-    on_event: &Rc<dyn Fn(RoutingEvent, &mut Window, &mut App)>,
-) -> impl IntoElement {
+fn tab_route(draft: &RoutingDraft, on_event: &RoutingCallback) -> impl IntoElement {
     // Upstream Route tab: QGroupBox "Routing Profiles" → QListWidget + button row.
     let mut list = div()
         .id("rt-profiles")
@@ -1239,7 +1262,7 @@ fn tab_route(
 fn build_nested(
     draft: &RoutingDraft,
     nested_inputs: Option<&NestedInputs>,
-    on_event: Rc<dyn Fn(RoutingEvent, &mut Window, &mut App)>,
+    on_event: RoutingCallback,
 ) -> Option<impl IntoElement> {
     match &draft.nested {
         RoutingNested::None => None,
@@ -1367,7 +1390,7 @@ fn build_nested(
 fn popup_menu(
     _title: &'static str,
     items: &[(&str, &str)],
-    on_event: Rc<dyn Fn(RoutingEvent, &mut Window, &mut App)>,
+    on_event: RoutingCallback,
 ) -> impl IntoElement {
     // Body only — title comes from the independent open_dialog layer.
     let mut col = div().flex().flex_col().gap_1();
@@ -1416,7 +1439,7 @@ fn popup_menu(
 fn route_editor_view(
     ed: &RouteEditorDraft,
     nested_inputs: Option<&NestedInputs>,
-    on_event: Rc<dyn Fn(RoutingEvent, &mut Window, &mut App)>,
+    on_event: RoutingCallback,
 ) -> impl IntoElement {
     // Layout tracks upstream RouteItem.ui: General · Remote · Basic/Advanced tabs · OK/Cancel.
     let f = ed.focus;
@@ -1673,8 +1696,9 @@ fn route_editor_view(
                 let sel = ed.selected_rule == Some(i);
                 let on = emit(&on_event, RoutingEvent::ReSelectRule(i));
                 let label = format!(
-                    "{} {} → {}",
+                    "{} {}{} → {}",
                     if sel { "●" } else { "○" },
+                    if r.disabled { "[disabled] " } else { "" },
                     if r.name.is_empty() {
                         format!("rule_{i}")
                     } else {
@@ -1739,6 +1763,16 @@ fn route_editor_view(
                             .flex_1()
                             .min_w(px(0.))
                             .child(input_field_row("Name", &re.rule_name, 70.))
+                            .child(settings_switch_row(
+                                "route-rule-enabled",
+                                "Rule enabled",
+                                !r.disabled,
+                                {
+                                    let on =
+                                        emit(&on_event, RoutingEvent::ReToggle("rule_enabled"));
+                                    move |_, w, cx| on(w, cx)
+                                },
+                            ))
                             .child(
                                 div()
                                     .flex()
@@ -1842,6 +1876,14 @@ fn route_editor_view(
         .w_full()
         .child(general)
         .child(remote)
+        .child(route_dns_editor(
+            ed.profile.custom_dns,
+            ed.profile.dns.as_ref(),
+            nested_inputs
+                .and_then(|n| n.as_route_editor())
+                .map(|i| &i.dns),
+            &on_event,
+        ))
         .child(div().mb_2().child(tabs))
         .child(body)
         .child(
@@ -1867,7 +1909,7 @@ fn route_editor_view(
 fn raw_editor_view(
     ed: &RawEditorDraft,
     nested_inputs: Option<&NestedInputs>,
-    on_event: Rc<dyn Fn(RoutingEvent, &mut Window, &mut App)>,
+    on_event: RoutingCallback,
 ) -> impl IntoElement {
     let f = ed.focus;
     let name_row = if let Some(raw) = nested_inputs.and_then(|n| n.as_raw_editor()) {
@@ -1912,6 +1954,14 @@ fn raw_editor_view(
                 move |_, w, cx| on(w, cx)
             },
         )))
+        .child(route_dns_editor(
+            ed.custom_dns,
+            Some(&ed.dns),
+            nested_inputs
+                .and_then(|n| n.as_raw_editor())
+                .map(|i| &i.dns),
+            &on_event,
+        ))
         .child(json_field)
         .child(
             div()
@@ -2064,7 +2114,31 @@ impl RoutingDraft {
                 RoutingSideEffect::None
             }
             RoutingEvent::ReToggle(name) => {
+                if name.starts_with("dns_") {
+                    match &mut self.nested {
+                        RoutingNested::RouteEditor(ed) => {
+                            let dns = ed
+                                .profile
+                                .dns
+                                .get_or_insert_with(|| RouteDns::from_settings(&self.settings));
+                            toggle_route_dns(name, &mut ed.profile.custom_dns, dns);
+                        }
+                        RoutingNested::RawEditor(ed) => {
+                            toggle_route_dns(name, &mut ed.custom_dns, &mut ed.dns)
+                        }
+                        _ => {}
+                    }
+                }
                 match name {
+                    "rule_enabled" => {
+                        if let RoutingNested::RouteEditor(ed) = &mut self.nested {
+                            if let Some(rule) =
+                                ed.selected_rule.and_then(|i| ed.profile.rules.get_mut(i))
+                            {
+                                rule.disabled = !rule.disabled;
+                            }
+                        }
+                    }
                     "auto_update" => {
                         if let RoutingNested::RouteEditor(ed) = &mut self.nested {
                             ed.profile.auto_update = !ed.profile.auto_update;
@@ -2088,6 +2162,20 @@ impl RoutingDraft {
             "warp" => s.enable_warp = !s.enable_warp,
             "fake_dns" => s.fake_dns = !s.fake_dns,
             "dns_routing" => s.enable_dns_routing = !s.enable_dns_routing,
+            "remote_dns_disable_ipv6" => {
+                s.remote_dns_disable_ipv6 =
+                    !(s.remote_dns_disable_ipv6 || s.remote_dns_strategy == "ipv4_only");
+                if s.remote_dns_strategy == "ipv4_only" {
+                    s.remote_dns_strategy.clear();
+                }
+            }
+            "direct_dns_disable_ipv6" => {
+                s.direct_dns_disable_ipv6 =
+                    !(s.direct_dns_disable_ipv6 || s.direct_dns_strategy == "ipv4_only");
+                if s.direct_dns_strategy == "ipv4_only" {
+                    s.direct_dns_strategy.clear();
+                }
+            }
             "dns_disable_cache" => s.dns_disable_cache = !s.dns_disable_cache,
             "dns_disable_expire" => s.dns_disable_expire = !s.dns_disable_expire,
             "dns_reverse_mapping" => s.dns_reverse_mapping = !s.dns_reverse_mapping,
@@ -2108,9 +2196,11 @@ impl RoutingDraft {
             "mirror" => s.ruleset_mirror = s.ruleset_mirror.cycle(),
             "remote_dns_strategy" => {
                 s.remote_dns_strategy = cycle_strategy(&s.remote_dns_strategy);
+                s.remote_dns_disable_ipv6 = false;
             }
             "direct_dns_strategy" => {
                 s.direct_dns_strategy = cycle_strategy(&s.direct_dns_strategy);
+                s.direct_dns_disable_ipv6 = false;
             }
             // Upstream editable combo presets (▼)
             "remote_dns_preset" => {
@@ -2155,7 +2245,10 @@ impl RoutingDraft {
             }
             "import" => return RoutingSideEffect::TryClipboardImport,
             "edit" => {
-                if let Some(r) = self.selected().cloned() {
+                if let Some(mut r) = self.selected().cloned() {
+                    if r.dns.is_none() {
+                        r.dns = Some(RouteDns::from_settings(&self.settings));
+                    }
                     let idx = self.selected_idx;
                     if r.is_raw {
                         self.nested =
@@ -2214,18 +2307,21 @@ impl RoutingDraft {
         match a {
             "new-structured" => {
                 let mut p = RouteProfile::new(-1, "New profile");
+                p.dns = Some(RouteDns::from_settings(&self.settings));
                 p.ensure_default_dns_hijack();
                 self.nested = RoutingNested::RouteEditor(RouteEditorDraft::from_profile(None, p));
             }
             "new-raw" => {
                 let p = RouteProfile {
                     is_raw: true,
+                    dns: Some(RouteDns::from_settings(&self.settings)),
                     ..RouteProfile::new(-1, "New raw profile")
                 };
                 self.nested = RoutingNested::RawEditor(RawEditorDraft::from_profile(None, &p));
             }
             "new-remote" => {
                 let mut p = RouteProfile::new(-1, "New remote");
+                p.dns = Some(RouteDns::from_settings(&self.settings));
                 p.is_remote = true;
                 p.ensure_default_dns_hijack();
                 self.nested = RoutingNested::RouteEditor(RouteEditorDraft::from_profile(None, p));
@@ -2272,6 +2368,13 @@ impl RoutingDraft {
                             return RoutingSideEffect::None;
                         }
                     }
+                    if let Some(dns) = ed.profile.active_dns() {
+                        if let Err(error) = dns.validate() {
+                            self.notice = error;
+                            self.nested = RoutingNested::RouteEditor(ed);
+                            return RoutingSideEffect::None;
+                        }
+                    }
                     let mut p = ed.profile;
                     if p.is_remote {
                         p.is_remote = true;
@@ -2296,6 +2399,13 @@ impl RoutingDraft {
             }
             "raw-ok" => {
                 if let RoutingNested::RawEditor(ed) = std::mem::take(&mut self.nested) {
+                    if ed.custom_dns {
+                        if let Err(error) = ed.dns.validate() {
+                            self.notice = error;
+                            self.nested = RoutingNested::RawEditor(ed);
+                            return RoutingSideEffect::None;
+                        }
+                    }
                     // validate JSON
                     if serde_json::from_str::<serde_json::Value>(&ed.raw_route).is_err() {
                         self.nested = RoutingNested::RawEditor(ed);
@@ -2401,17 +2511,10 @@ impl RoutingDraft {
     pub fn apply_remote_fetch_to_editor(&mut self, incoming: RouteProfile, apply: bool) {
         if let RoutingNested::RouteEditor(ed) = &mut self.nested {
             if apply {
-                let name = ed.profile.name.clone();
-                let url = ed.profile.remote_url.clone();
-                let auto = ed.profile.auto_update;
-                ed.profile.rules = incoming.rules;
-                ed.profile.is_raw = incoming.is_raw;
-                ed.profile.raw_route = incoming.raw_route;
-                if ed.profile.name.is_empty() {
-                    ed.profile.name = name;
+                if let Err(error) = ed.profile.apply_remote_content(incoming) {
+                    self.notice = error;
+                    return;
                 }
-                ed.profile.remote_url = url;
-                ed.profile.auto_update = auto;
                 ed.profile.is_remote = true;
                 ed.reload_simple_from_profile();
                 self.notice = "Remote rules applied".into();
@@ -2435,17 +2538,10 @@ impl RoutingDraft {
                     .find(|r| r.is_remote && r.remote_url == url_key)
             };
             if let Some(slot) = slot {
-                let name = slot.name.clone();
-                let url = slot.remote_url.clone();
-                let auto = slot.auto_update;
-                let keep_id = slot.id;
-                *slot = incoming;
-                slot.id = keep_id;
-                if slot.name.is_empty() {
-                    slot.name = name;
+                if let Err(error) = slot.apply_remote_content(incoming) {
+                    self.notice = error;
+                    continue;
                 }
-                slot.remote_url = url;
-                slot.auto_update = auto;
                 slot.is_remote = true;
             }
         }
@@ -2478,9 +2574,96 @@ impl Default for RawEditorDraft {
             name: String::new(),
             raw_route: String::new(),
             prevent_modifications: false,
+            custom_dns: false,
+            dns: RouteDns::default(),
+            original: RouteProfile::new(-1, ""),
             focus: ReFocus::Name,
         }
     }
+}
+
+fn toggle_route_dns(name: &str, enabled: &mut bool, dns: &mut RouteDns) {
+    match name {
+        "dns_own" => *enabled = !*enabled,
+        "dns_remote_ipv6" => dns.remote_dns_disable_ipv6 = !dns.remote_dns_disable_ipv6,
+        "dns_direct_ipv6" => dns.direct_dns_disable_ipv6 = !dns.direct_dns_disable_ipv6,
+        "dns_routing" => dns.enable_dns_routing = !dns.enable_dns_routing,
+        "dns_fake" => dns.fake_dns = !dns.fake_dns,
+        "dns_fake_ipv6" => dns.fakeip_disable_ipv6 = !dns.fakeip_disable_ipv6,
+        "dns_final" => dns.dns_final_out = cycle_dns_final(&dns.dns_final_out),
+        _ => {}
+    }
+}
+
+fn route_dns_editor(
+    enabled: bool,
+    dns: Option<&RouteDns>,
+    inputs: Option<&crate::ui::dialog_inputs::RouteDnsInputs>,
+    on_event: &RoutingCallback,
+) -> impl IntoElement {
+    let mut body = div().flex().flex_col().child(settings_switch_row(
+        "route-dns-own",
+        "Use this profile's DNS",
+        enabled,
+        {
+            let on = emit(on_event, RoutingEvent::ReToggle("dns_own"));
+            move |_, w, cx| on(w, cx)
+        },
+    ));
+    if enabled {
+        let dns = dns.cloned().unwrap_or_default();
+        if let Some(inputs) = inputs {
+            body = body
+                .child(input_field_row("Remote DNS", &inputs.remote, 120.))
+                .child(input_field_row("Direct DNS", &inputs.direct, 120.));
+        }
+        for (id, label, value, key) in [
+            (
+                "route-dns-remote-ipv6",
+                "Remote DNS: IPv4 only",
+                dns.remote_dns_disable_ipv6,
+                "dns_remote_ipv6",
+            ),
+            (
+                "route-dns-direct-ipv6",
+                "Direct DNS: IPv4 only",
+                dns.direct_dns_disable_ipv6,
+                "dns_direct_ipv6",
+            ),
+            (
+                "route-dns-routing",
+                "Follow routing rules",
+                dns.enable_dns_routing,
+                "dns_routing",
+            ),
+            ("route-dns-fake", "FakeIP", dns.fake_dns, "dns_fake"),
+            (
+                "route-dns-fake-ipv6",
+                "FakeIP: IPv4 only",
+                dns.fakeip_disable_ipv6,
+                "dns_fake_ipv6",
+            ),
+        ] {
+            let on = emit(on_event, RoutingEvent::ReToggle(key));
+            body = body.child(settings_switch_row(id, label, value, move |_, w, cx| {
+                on(w, cx)
+            }));
+        }
+        body = body
+            .child(cycle_btn(
+                "route-dns-final",
+                format!("Default DNS: {}", dns.dns_final_out),
+                emit(on_event, RoutingEvent::ReToggle("dns_final")),
+            ))
+            .child(section_hint(
+                "Local resolver overrides, hosts and cache settings remain global.",
+            ));
+    } else {
+        body = body.child(section_hint(
+            "Uses global DNS. Saved profile DNS is retained when this is off.",
+        ));
+    }
+    group_panel("DNS", body)
 }
 
 #[cfg(test)]
@@ -2552,5 +2735,113 @@ mod tests {
         assert_eq!(d.settings.dns_final_out, "direct");
         d.cycle("dns_final_out");
         assert_eq!(d.settings.dns_final_out, "remote");
+    }
+}
+
+#[cfg(test)]
+mod beta4_tests {
+    use super::*;
+
+    #[test]
+    fn rule_disable_survives_advanced_basic_save() {
+        let mut d = RoutingDraft::from_state(&AppState::default());
+        let mut profile = RouteProfile::new(-1, "disabled");
+        profile
+            .append_simple_rule("suffix:example.com", SimpleAction::Bypass)
+            .unwrap();
+        d.nested = RoutingNested::RouteEditor(RouteEditorDraft::from_profile(None, profile));
+        d.apply_event(RoutingEvent::ReTab(RouteEditorTab::Advanced));
+        d.apply_event(RoutingEvent::ReSelectRule(0));
+        d.apply_event(RoutingEvent::ReToggle("rule_enabled"));
+        d.apply_event(RoutingEvent::ReTab(RouteEditorTab::Basic));
+        d.apply_event(RoutingEvent::NestedAction("editor-ok"));
+        let saved = d.routes.last().unwrap();
+        assert!(saved.rules[0].disabled);
+        assert_eq!(saved.rules[0].domain_suffix, ["example.com"]);
+    }
+
+    #[test]
+    fn profile_dns_toggle_retains_values_and_cancel_discards_draft() {
+        let mut d = RoutingDraft::from_state(&AppState::default());
+        d.settings.remote_dns = "https://global.example/dns-query".into();
+        d.apply_event(RoutingEvent::NestedAction("new-structured"));
+        d.apply_event(RoutingEvent::ReToggle("dns_own"));
+        d.apply_event(RoutingEvent::ReToggle("dns_fake"));
+        d.apply_event(RoutingEvent::ReToggle("dns_own"));
+        let RoutingNested::RouteEditor(ed) = &d.nested else {
+            panic!("missing editor")
+        };
+        assert!(ed.profile.active_dns().is_none());
+        assert!(ed.profile.dns.as_ref().unwrap().fake_dns);
+        assert_eq!(
+            ed.profile.dns.as_ref().unwrap().remote_dns,
+            "https://global.example/dns-query"
+        );
+        let count = d.routes.len();
+        d.apply_event(RoutingEvent::NestedClose);
+        assert_eq!(d.routes.len(), count);
+        assert!(!d.settings.fake_dns);
+    }
+
+    #[test]
+    fn invalid_profile_dns_keeps_editor_open_and_does_not_save() {
+        let mut d = RoutingDraft::from_state(&AppState::default());
+        let count = d.routes.len();
+        d.apply_event(RoutingEvent::NestedAction("new-structured"));
+        d.apply_event(RoutingEvent::ReToggle("dns_own"));
+        if let RoutingNested::RouteEditor(ed) = &mut d.nested {
+            ed.profile.dns.as_mut().unwrap().remote_dns = "https://:0/bad".into();
+        }
+        d.apply_event(RoutingEvent::NestedAction("editor-ok"));
+        assert!(matches!(d.nested, RoutingNested::RouteEditor(_)));
+        assert_eq!(d.routes.len(), count);
+        assert!(d.notice.contains("DNS"));
+    }
+
+    #[test]
+    fn raw_editor_preserves_local_metadata_and_dns_when_saved() {
+        let mut original = RouteProfile::new(42, "raw");
+        original.is_raw = true;
+        original.raw_route = "{\"rules\":[]}".into();
+        original.endpoint_profile_ids = vec![7];
+        original.inner_hop_endpoint_ids = vec![7];
+        original.custom_dns = true;
+        original.dns = Some(RouteDns::default());
+        let mut ed = RawEditorDraft::from_profile(Some(0), &original);
+        ed.name = "renamed".into();
+        ed.dns.fake_dns = true;
+        let saved = ed.into_profile(42);
+        assert_eq!(saved.name, "renamed");
+        assert_eq!(saved.endpoint_profile_ids, [7]);
+        assert_eq!(saved.inner_hop_endpoint_ids, [7]);
+        assert!(saved.active_dns().unwrap().fake_dns);
+    }
+
+    #[test]
+    fn remote_editor_refresh_preserves_dns_and_disabled_rules() {
+        let mut d = RoutingDraft::from_state(&AppState::default());
+        let mut profile = RouteProfile::new(12, "local");
+        profile.custom_dns = true;
+        profile.dns = Some(RouteDns::default());
+        profile.rules.push(RouteRule {
+            name: "off".into(),
+            disabled: true,
+            domain: vec!["old.example".into()],
+            ..Default::default()
+        });
+        d.nested = RoutingNested::RouteEditor(RouteEditorDraft::from_profile(Some(0), profile));
+        let mut incoming = RouteProfile::new(0, "download");
+        incoming.rules.push(RouteRule {
+            name: "off".into(),
+            domain: vec!["new.example".into()],
+            ..Default::default()
+        });
+        d.apply_remote_fetch_to_editor(incoming, true);
+        let RoutingNested::RouteEditor(ed) = &d.nested else {
+            panic!("missing editor")
+        };
+        assert!(ed.profile.rules[0].disabled);
+        assert!(ed.profile.active_dns().is_some());
+        assert_eq!(ed.profile.rules[0].domain, ["new.example"]);
     }
 }

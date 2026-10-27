@@ -99,8 +99,6 @@ pub struct AppState {
     next_route_id: i64,
 }
 
-/// Ring buffer for Logs panel. Sized for core traffic (inbound/outbound) lines.
-
 impl Default for AppState {
     fn default() -> Self {
         Self::with_demo_data()
@@ -487,6 +485,10 @@ impl AppState {
     }
 
     /// Apply full group edit fields (upstream DialogEditGroup::accept).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preserve the existing group-edit API and its explicit form fields."
+    )]
     pub fn apply_group_edit(
         &mut self,
         id: GroupId,
@@ -569,6 +571,10 @@ impl AppState {
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preserve the existing settings API and its explicit form fields."
+    )]
     pub fn apply_basic_settings(
         &mut self,
         inbound_address: String,
@@ -582,7 +588,7 @@ impl AppState {
         subscription: crate::models::BasicSubscriptionSettings,
     ) {
         self.settings.inbound_address = inbound_address;
-        self.settings.inbound_socks_port = inbound_socks_port.max(1).min(65535);
+        self.settings.inbound_socks_port = inbound_socks_port.clamp(1, 65535);
         self.settings.test_latency_url = test_url;
         self.settings.remote_dns = remote_dns;
         self.settings.direct_dns = direct_dns;
@@ -754,6 +760,27 @@ impl AppState {
         p.outbound_json = outbound_json.clone();
         p.outbound.raw_json = Some(outbound_json);
         self.resort_profile_group(profile_id);
+        Ok(())
+    }
+
+    /// Atomically replace edited configuration while keeping current runtime metadata.
+    pub fn replace_edited_profile(&mut self, edited: Profile) -> Result<(), StoreError> {
+        let current = self
+            .profiles
+            .get(&edited.id)
+            .ok_or(StoreError::ProfileNotFound(edited.id))?;
+        if current.profile_type != edited.profile_type || current.group_id != edited.group_id {
+            return Err(StoreError::Msg(
+                "Profile type and group cannot change while editing".into(),
+            ));
+        }
+        let mut draft = crate::ProfileEditDraft::from_profile(current)
+            .and_then(|draft| draft.with_json(edited.outbound_json))
+            .map_err(StoreError::Msg)?;
+        draft.name = edited.name;
+        let validated = draft.build().map_err(StoreError::Msg)?;
+        self.profiles.insert(validated.id, validated);
+        self.resort_profile_group(edited.id);
         Ok(())
     }
 
@@ -1232,21 +1259,8 @@ impl AppState {
                 .routes
                 .get_mut(&id)
                 .ok_or_else(|| StoreError::Msg(format!("route {id} not found")))?;
-            let name = r.name.clone();
-            let remote_url = r.remote_url.clone();
-            let auto_update = r.auto_update;
-            *r = incoming;
-            r.id = id;
-            if r.name.is_empty() {
-                r.name = name;
-            }
-            r.remote_url = remote_url;
-            r.auto_update = auto_update;
+            r.apply_remote_content(incoming).map_err(StoreError::Msg)?;
             r.is_remote = !r.remote_url.is_empty();
-            r.remote_last_update = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
             r.name.clone()
         };
         self.push_log(format!("Route «{label}» content updated"));
@@ -1347,9 +1361,12 @@ impl AppState {
         cur.direct_dns = s.direct_dns;
         cur.current_route_id = s.current_route_id;
         cur.ruleset_mirror = s.ruleset_mirror;
+        cur.remote_dns_disable_ipv6 = s.remote_dns_disable_ipv6;
+        cur.direct_dns_disable_ipv6 = s.direct_dns_disable_ipv6;
         cur.remote_dns_strategy = s.remote_dns_strategy;
         cur.direct_dns_strategy = s.direct_dns_strategy;
         cur.dns_cache_capacity = s.dns_cache_capacity;
+        cur.dns_persist_cache = s.dns_persist_cache;
         cur.dns_disable_cache = s.dns_disable_cache;
         cur.dns_disable_expire = s.dns_disable_expire;
         cur.dns_reverse_mapping = s.dns_reverse_mapping;
@@ -1361,6 +1378,7 @@ impl AppState {
         cur.default_domain_strategy = s.default_domain_strategy;
         cur.core_box_underlying_dns = s.core_box_underlying_dns;
         cur.fake_dns = s.fake_dns;
+        cur.fakeip_disable_ipv6 = s.fakeip_disable_ipv6;
         cur.enable_dns_server = s.enable_dns_server;
         cur.dns_server_listen_port = s.dns_server_listen_port;
         cur.dns_v4_resp = s.dns_v4_resp;
