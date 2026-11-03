@@ -34,7 +34,10 @@ use throne_domain::{
     connection_route_targets, AppSettings, AppState, CoreStatus, Group, GroupId, Profile,
     ProfileId, ProfileSortColumn, ProfileType, SimpleAction, TrafficSnapshot,
 };
-use throne_import::{fetch_url_with_options, import_subscription_response, FetchOptions};
+use throne_import::{
+    fetch_url_with_options, import_subscription_response, parse_subscription_route,
+    subscription_routing_value, FetchOptions,
+};
 
 use crate::theme::{self, latency_color, Theme};
 use crate::ui::connections::{connections_panel, ConnectionSpeedTracker};
@@ -3584,8 +3587,9 @@ impl MainWindow {
         cx.notify();
 
         // Snapshot settings at kickoff; re-read proxy/tun flags after Start for apply.
+        // Upstream 1.4.0-beta.5: a group route replaces the global route for this start.
         let settings = self.state.settings().clone();
-        let route = self.state.active_route().cloned();
+        let route = self.state.route_for_group(profile.group_id).cloned();
         let core = Arc::clone(&self.core);
         let profile_name = profile.name.clone();
         let profile_id = profile.id;
@@ -3979,9 +3983,14 @@ impl MainWindow {
             cx.notify();
             return;
         }
+        let route_group = if whole_group {
+            group
+        } else {
+            pending[0].group_id
+        };
         let config = match throne_core_client::build_resolve_config(
             self.state.settings(),
-            self.state.active_route(),
+            self.state.route_for_group(route_group),
         ) {
             Ok(config) => config,
             Err(error) => {
@@ -4566,6 +4575,7 @@ impl MainWindow {
         }
         let name = group.name.clone();
         let url = group.url.clone();
+        let import_route = group.import_sub_route;
         let options =
             match subscription_fetch_options(self.state.settings(), self.state.core_status()) {
                 Ok(options) => options,
@@ -4595,14 +4605,20 @@ impl MainWindow {
                         std::time::Duration::from_secs(30),
                         &options,
                     )?;
-                    import_subscription_response(response)
+                    let routing = if import_route {
+                        subscription_routing_value(response.header("routing"), &response.body)
+                    } else {
+                        None
+                    };
+                    let imported = import_subscription_response(response)?;
+                    Ok::<_, String>((imported, routing))
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.background_busy = false;
                 let mut succeeded = false;
                 match result {
-                    Ok(imported) => {
+                    Ok((imported, routing)) => {
                         this.state.push_log(format!(
                             "<<<<<<<< Subscription request finished: {name}"
                         ));
@@ -4665,6 +4681,19 @@ impl MainWindow {
                                             this.dialog_inputs = None;
                                             this.request_gpui_dialog();
                                         }
+                                        let reconnect = report.reconnect_profile_id;
+                                        let running = this.state.core_status().clone();
+                                        let route_changed = this.apply_imported_subscription_route(
+                                            group_id,
+                                            routing.as_deref(),
+                                        );
+                                        this.follow_subscription_core(
+                                            group_id,
+                                            reconnect,
+                                            route_changed,
+                                            &running,
+                                            cx,
+                                        );
                                     }
                                     Err(error) => {
                                         this.state = previous_state;
@@ -4699,6 +4728,89 @@ impl MainWindow {
             .ok();
         })
         .detach();
+    }
+
+    /// Apply a subscription routing document after the profile snapshot is saved.
+    /// A parse error is logged and leaves the current route in place. A persist
+    /// failure rolls the route change back. Returns whether the saved route changed.
+    fn apply_imported_subscription_route(
+        &mut self,
+        group_id: GroupId,
+        routing: Option<&str>,
+    ) -> bool {
+        let Some(text) = routing.map(str::trim).filter(|text| !text.is_empty()) else {
+            return false;
+        };
+        let parsed = match parse_subscription_route(text) {
+            Ok(Some(parsed)) => parsed,
+            Ok(None) => return false,
+            Err(error) => {
+                self.state
+                    .push_log(format!("[Routing] subscription route ignored: {error}"));
+                return false;
+            }
+        };
+        let before = self.state.clone();
+        match self
+            .state
+            .apply_owned_subscription_route(group_id, parsed.profile)
+        {
+            Ok(apply) => {
+                if !apply.log.is_empty() {
+                    self.state.push_log(apply.log);
+                }
+                if !apply.changed {
+                    return false;
+                }
+                if let Err(error) = self.persist_db() {
+                    self.state = before;
+                    self.state.push_log(format!(
+                        "[Routing] subscription route was not saved: {error}"
+                    ));
+                    return false;
+                }
+                true
+            }
+            Err(error) => {
+                self.state.push_log(format!(
+                    "[Routing] subscription route was not applied: {error}"
+                ));
+                false
+            }
+        }
+    }
+
+    /// Reconnect or stop only while the core captured before the route apply is running.
+    fn follow_subscription_core(
+        &mut self,
+        group_id: GroupId,
+        reconnect: Option<ProfileId>,
+        route_changed: bool,
+        running: &CoreStatus,
+        cx: &mut Context<Self>,
+    ) {
+        let CoreStatus::Running { profile_id, .. } = running else {
+            return;
+        };
+        let profile_id = *profile_id;
+        if let Some(id) = reconnect {
+            self.switch_profile(id, cx);
+            return;
+        }
+        if self.state.profile(profile_id).is_none() {
+            self.pending_profile_switch.clear();
+            self.restart_when_idle = false;
+            self.stop_proxy(cx);
+            return;
+        }
+        if route_changed
+            && self
+                .state
+                .profile(profile_id)
+                .is_some_and(|profile| profile.group_id == group_id)
+        {
+            self.switch_profile(profile_id, cx);
+        }
     }
 
     /// Move buffered ThroneCore stdout/stderr lines into the Logs panel.
@@ -6869,6 +6981,15 @@ impl MainWindow {
 
     fn render_status_bar(&self) -> impl IntoElement {
         let running = self.state.core_status().is_running();
+        let db_name = if self.db_path_label.is_empty() {
+            String::new()
+        } else {
+            std::path::Path::new(&self.db_path_label)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("throne.db")
+                .to_string()
+        };
         div()
             .flex()
             .items_center()
@@ -6883,33 +7004,119 @@ impl MainWindow {
             .child(
                 div()
                     .flex_1()
+                    .min_w(px(0.))
+                    .overflow_hidden()
                     .child(status_tag(running, self.state.running_label())),
             )
             .child(
                 div()
                     .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .justify_center()
+                    .overflow_hidden()
                     .text_color(Theme::text_muted())
-                    .child(self.state.inbound_label()),
+                    .child(
+                        div()
+                            .max_w_full()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(self.state.inbound_label()),
+                    ),
             )
+            .child(status_speed(running, self.state.traffic()))
+            .when(!db_name.is_empty(), |bar| {
+                bar.child(
+                    div()
+                        .flex_shrink_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_color(Theme::text_muted())
+                        .child(db_name),
+                )
+            })
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
+                    .flex_shrink_0()
+                    .whitespace_nowrap()
                     .text_color(Theme::text_muted())
-                    .child(self.state.speed_label())
-                    .child(if self.db_path_label.is_empty() {
-                        String::new()
-                    } else {
-                        std::path::Path::new(&self.db_path_label)
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("throne.db")
-                            .to_string()
-                    })
                     .child(throne_domain::NKR_VERSION),
             )
     }
+}
+
+/// Fixed slots so a rate change cannot shove the status bar.
+/// The number column is only as wide as `1023.9`; the unit sits against it,
+/// so `77B` and `71.3KB` do not leave a wide hole before the arrow.
+const SPEED_LABEL_W: f32 = 48.;
+const SPEED_AMOUNT_W: f32 = 42.;
+const SPEED_UNIT_W: f32 = 28.;
+
+fn status_speed(running: bool, traffic: &throne_domain::TrafficSnapshot) -> gpui::Div {
+    if !running {
+        return div();
+    }
+    div()
+        .flex_shrink_0()
+        .flex()
+        .flex_col()
+        .text_color(Theme::text_muted())
+        .child(speed_line(
+            "Proxy:",
+            throne_domain::format_traffic_rate(traffic.proxy_up),
+            throne_domain::format_traffic_rate(traffic.proxy_down),
+        ))
+        .child(speed_line(
+            "Direct:",
+            throne_domain::format_traffic_rate(traffic.direct_up),
+            throne_domain::format_traffic_rate(traffic.direct_down),
+        ))
+}
+
+fn speed_line(label: &str, up: String, down: String) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .child(speed_cell(SPEED_LABEL_W, label.into(), true))
+        .child(speed_rate(up, "↑"))
+        .child(speed_rate(down, "↓"))
+}
+
+fn speed_rate(rate: String, arrow: &str) -> gpui::Div {
+    let (amount, unit) = split_rate(&rate);
+    div()
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .child(speed_cell(SPEED_AMOUNT_W, amount.to_string().into(), true))
+        .child(speed_cell(
+            SPEED_UNIT_W,
+            format!("{unit}{arrow}").into(),
+            false,
+        ))
+}
+
+fn split_rate(rate: &str) -> (&str, &str) {
+    let unit_at = rate
+        .find(|c: char| c.is_ascii_alphabetic())
+        .unwrap_or(rate.len());
+    (&rate[..unit_at], &rate[unit_at..])
+}
+
+fn speed_cell(width: f32, text: SharedString, align_end: bool) -> gpui::Div {
+    div()
+        .w(px(width))
+        .min_w(px(width))
+        .max_w(px(width))
+        .flex_shrink_0()
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .flex()
+        .items_center()
+        .when(align_end, |cell| cell.justify_end())
+        .child(text)
 }
 
 // Profile table columns (header + rows must stay in lockstep).

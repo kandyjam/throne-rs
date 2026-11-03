@@ -41,7 +41,7 @@ pub use route_dns::RouteDns;
 pub use route_simple::{connection_route_targets, ConnectionRouteTarget, SimpleAction};
 pub use security::{is_private_host, profile_security, SecurityInfo, SecurityLevel};
 pub use store::{
-    AppState, ProfileSortColumn, StoreError, SubUpdateSummary, SubscriptionChange,
-    SubscriptionUpdateReport,
+    format_traffic_rate, AppState, ProfileSortColumn, StoreError, SubUpdateSummary,
+    SubscriptionChange, SubscriptionRouteApply, SubscriptionUpdateReport,
 };
 pub use version::{display_name, user_agent, NKR_VERSION};

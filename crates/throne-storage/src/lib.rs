@@ -131,8 +131,9 @@ impl Database {
                     sub_last_update, front_proxy_id, landing_proxy_id,
                     column_width_json, profiles_json, scroll_last_profile,
                     test_sort_by, traffic_sort_by, test_items_to_show, type_sort_by,
-                    endpoint_json, sub_options_json, sub_metadata_json, sort_method, sort_descending
-                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)"#,
+                    endpoint_json, sub_options_json, sub_metadata_json, sort_method, sort_descending,
+                    route_id, import_sub_route
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)"#,
                 params![
                     g.id,
                     g.archive as i32,
@@ -156,6 +157,8 @@ impl Database {
                     serde_json::to_string(&g.sub_metadata)?,
                     g.sort_method,
                     g.sort_descending as i32,
+                    g.route_id,
+                    g.import_sub_route as i32,
                 ],
             )?;
         }
@@ -218,8 +221,9 @@ impl Database {
                 r#"INSERT INTO route_profiles (
                     id, name, default_outbound_id, is_raw, raw_route,
                     prevent_modifications, is_remote, remote_url, auto_update,
-                    remote_last_update, endpoint_profile_ids, inner_hop_endpoint_ids, dns_json, custom_dns
-                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)"#,
+                    remote_last_update, endpoint_profile_ids, inner_hop_endpoint_ids, dns_json, custom_dns,
+                    source_gid
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)"#,
                 params![
                     r.id,
                     r.name,
@@ -235,6 +239,7 @@ impl Database {
                     to_json_i64_array(&r.inner_hop_endpoint_ids),
                     r.dns.as_ref().map(serde_json::to_string).transpose()?.unwrap_or_default(),
                     r.custom_dns as i32,
+                    r.source_gid,
                 ],
             )?;
             for (order, rule) in r.rules.iter().enumerate() {
@@ -271,7 +276,8 @@ impl Database {
                       sub_last_update, front_proxy_id, landing_proxy_id,
                       column_width_json, profiles_json, scroll_last_profile,
                       test_sort_by, traffic_sort_by, test_items_to_show, type_sort_by,
-                      endpoint_json, sub_options_json, sub_metadata_json, sort_method, sort_descending
+                      endpoint_json, sub_options_json, sub_metadata_json, sort_method, sort_descending,
+                      route_id, import_sub_route
                FROM groups"#,
         )?;
         let rows = stmt.query_map([], |row| {
@@ -300,6 +306,8 @@ impl Database {
                 type_sort_by: row.get::<_, Option<i32>>(16)?.unwrap_or(0),
                 sort_method: row.get::<_, Option<i32>>(20)?.unwrap_or(0),
                 sort_descending: row.get::<_, Option<i32>>(21)?.unwrap_or(0) != 0,
+                route_id: row.get::<_, Option<i64>>(22)?.unwrap_or(-1),
+                import_sub_route: row.get::<_, Option<i32>>(23)?.unwrap_or(0) != 0,
                 endpoint: serde_json::from_str(&row.get::<_, String>(17)?).unwrap_or_default(),
                 sub_options: serde_json::from_str(&row.get::<_, String>(18)?)
                     .unwrap_or_else(|_| serde_json::json!({})),
@@ -380,7 +388,8 @@ impl Database {
         let mut stmt = self.conn.prepare(
             r#"SELECT id, name, default_outbound_id, is_raw, raw_route,
                       prevent_modifications, is_remote, remote_url, auto_update,
-                      remote_last_update, endpoint_profile_ids, inner_hop_endpoint_ids, dns_json, custom_dns
+                      remote_last_update, endpoint_profile_ids, inner_hop_endpoint_ids, dns_json, custom_dns,
+                      source_gid
                FROM route_profiles ORDER BY id ASC"#,
         )?;
         let mut profiles = Vec::new();
@@ -408,6 +417,7 @@ impl Database {
                     ),
                     dns: serde_json::from_str(&row.get::<_, String>(12)?).ok(),
                     custom_dns: row.get::<_, i32>(13)? != 0,
+                    source_gid: row.get::<_, Option<i64>>(14)?.unwrap_or(-1),
                 })
             })?;
             for r in rows {
@@ -807,6 +817,8 @@ fn merge_settings_tx(tx: &rusqlite::Transaction<'_>, s: &AppSettings) -> Result<
         ("dns_v6_resp", s.dns_v6_resp.clone()),
         ("dns_server_rules", to_json_array(&s.dns_server_rules)),
         ("dns_server_listen_lan", bool_str(s.dns_server_listen_lan)),
+        ("core_dns_in_lan", bool_str(s.core_dns_in_lan)),
+        ("core_dns_in_port", s.core_dns_in_port.to_string()),
         ("enable_redirect", bool_str(s.enable_redirect)),
         ("redirect_listen_address", s.redirect_listen_address.clone()),
         ("redirect_listen_port", s.redirect_listen_port.to_string()),
@@ -1016,6 +1028,12 @@ fn apply_setting(s: &mut AppSettings, key: &str, value: &str) {
         "dns_v6_resp" => s.dns_v6_resp = value.to_string(),
         "dns_server_rules" => s.dns_server_rules = json_str_list(Some(value.to_string())),
         "dns_server_listen_lan" => s.dns_server_listen_lan = parse_bool(value),
+        "core_dns_in_lan" => s.core_dns_in_lan = parse_bool(value),
+        "core_dns_in_port" => {
+            if let Ok(n) = value.parse() {
+                s.core_dns_in_port = n;
+            }
+        }
         "enable_redirect" => s.enable_redirect = parse_bool(value),
         "redirect_listen_address" => s.redirect_listen_address = value.to_string(),
         "redirect_listen_port" => {

@@ -171,6 +171,14 @@ pub struct ParsedOutbound {
     pub plugin: Option<String>,
     pub plugin_opts: Option<String>,
     pub obfs: Option<String>,
+    /// Hysteria obfuscation type. `None` is the upstream default, salamander.
+    /// Empty, `none`, and `plain` keep the password and turn obfuscation off.
+    #[serde(default)]
+    pub obfs_type: Option<String>,
+    #[serde(default)]
+    pub obfs_min_packet_size: Option<u32>,
+    #[serde(default)]
+    pub obfs_max_packet_size: Option<u32>,
     pub up_mbps: Option<u32>,
     pub down_mbps: Option<u32>,
     pub congestion_control: Option<String>,
@@ -228,6 +236,41 @@ impl ParsedOutbound {
                     )
                 })
             });
+    }
+
+    /// Hysteria2 `obfs` object. `None` means obfuscation is off.
+    ///
+    /// An unset type is salamander. Empty, `none`, and `plain` stay off even
+    /// when a password is still stored. Any other type falls back to salamander.
+    pub fn hysteria2_obfs_value(&self) -> Option<serde_json::Value> {
+        let password = self
+            .obfs
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        let kind = match self.obfs_type.as_deref() {
+            None => "salamander".to_string(),
+            Some(raw) => {
+                let kind = raw.trim().to_ascii_lowercase();
+                if kind.is_empty() || kind == "none" || kind == "plain" {
+                    return None;
+                }
+                kind
+            }
+        };
+        if kind == "gecko" {
+            Some(serde_json::json!({
+                "type": "gecko",
+                "password": password,
+                "min_packet_size": self.obfs_min_packet_size.unwrap_or(0),
+                "max_packet_size": self.obfs_max_packet_size.unwrap_or(0),
+            }))
+        } else {
+            Some(serde_json::json!({
+                "type": "salamander",
+                "password": password,
+            }))
+        }
     }
 
     /// Wire-compatible `outbound_json` for SQLite (upstream `ExportToJson` shape).
@@ -516,21 +559,12 @@ fn synthesize_upstream_outbound(
         map.insert("packet_encoding".into(), Value::String(pe.clone()));
     }
 
-    if let Some(obfs) = o.obfs.as_ref().filter(|s| !s.is_empty()) {
-        match profile_type {
-            ProfileType::Hysteria2 => {
-                map.insert(
-                    "obfs".into(),
-                    json!({
-                        "type": "salamander",
-                        "password": obfs,
-                    }),
-                );
-            }
-            _ => {
-                map.insert("obfs".into(), Value::String(obfs.clone()));
-            }
+    if profile_type == ProfileType::Hysteria2 {
+        if let Some(obfs) = o.hysteria2_obfs_value() {
+            map.insert("obfs".into(), obfs);
         }
+    } else if let Some(obfs) = o.obfs.as_ref().filter(|s| !s.is_empty()) {
+        map.insert("obfs".into(), Value::String(obfs.clone()));
     }
 
     let needs_tls = matches!(
@@ -956,6 +990,12 @@ pub struct Group {
     pub sort_method: i32,
     #[serde(default)]
     pub sort_descending: bool,
+    /// Routing profile this group uses. `-1` means the global active route.
+    #[serde(default = "default_unset_id")]
+    pub route_id: i64,
+    /// Import a `routing` header, or a shipped `://routing/` line, on update.
+    #[serde(default)]
+    pub import_sub_route: bool,
     #[serde(default)]
     pub endpoint: crate::EndpointSource,
     /// Preserve upstream subscription extension keys without narrowing them.
@@ -987,6 +1027,8 @@ impl Group {
             type_sort_by: 0,
             sort_method: 0,
             sort_descending: false,
+            route_id: -1,
+            import_sub_route: false,
             endpoint: crate::EndpointSource::default(),
             sub_options: serde_json::json!({}),
             sub_metadata: serde_json::json!({}),
@@ -1382,6 +1424,12 @@ pub struct AppSettings {
     pub dns_server_rules: Vec<String>,
     #[serde(default)]
     pub dns_server_listen_lan: bool,
+    /// Serve the core `dns-in` inbound on every interface. Default is loopback only.
+    #[serde(default)]
+    pub core_dns_in_lan: bool,
+    /// Listen port of the `dns-in` direct inbound.
+    #[serde(default = "default_core_dns_in_port")]
+    pub core_dns_in_port: i32,
     /// Legacy transparent redirect settings: retained for loading old databases only.
     #[serde(default)]
     pub enable_redirect: bool,
@@ -1416,6 +1464,14 @@ fn default_dns_cache_capacity() -> i32 {
 fn default_dns_final_out() -> String {
     "remote".into()
 }
+fn default_unset_id() -> i64 {
+    -1
+}
+
+fn default_core_dns_in_port() -> i32 {
+    5533
+}
+
 fn default_dns_listen_port() -> i32 {
     53
 }
@@ -1567,6 +1623,8 @@ impl Default for AppSettings {
             dns_v6_resp: default_dns_v6_resp(),
             dns_server_rules: Vec::new(),
             dns_server_listen_lan: false,
+            core_dns_in_lan: false,
+            core_dns_in_port: default_core_dns_in_port(),
             enable_redirect: false,
             redirect_listen_address: default_redirect_addr(),
             redirect_listen_port: default_redirect_port(),
@@ -1895,6 +1953,9 @@ pub struct RouteProfile {
     pub custom_dns: bool,
     #[serde(default)]
     pub dns: Option<crate::RouteDns>,
+    /// Subscription group whose updates overwrite this profile. `-1` means none.
+    #[serde(default = "default_unset_id")]
+    pub source_gid: i64,
 }
 
 impl RouteProfile {
@@ -1915,6 +1976,7 @@ impl RouteProfile {
             inner_hop_endpoint_ids: Vec::new(),
             custom_dns: false,
             dns: None,
+            source_gid: -1,
         }
     }
 

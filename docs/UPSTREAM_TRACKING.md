@@ -2,9 +2,9 @@
 
 Remote: `upstream` → `https://github.com/throneproj/Throne.git`  
 Baseline branch: `upstream/dev`  
-**Target release (this audit):** tag **`1.4.0-beta.4`** (`dd748826`, 2026-10-22).
-**Last audited tip:** `upstream/dev` describe **`1.4.0-beta.4-15-g1f30af24`** on 2026-10-27 (15 commits past the pin; not absorbed).
-**Product version:** `1.4.0-beta.4` (root [`VERSION`](../VERSION) + workspace Cargo version = this pin).
+**Target release (this audit):** tag **`1.4.0-beta.5`** (`ec2420df`, 2026-11-02).
+**Last audited tip:** `upstream/dev` describe **`1.4.0-beta.5-2-ga76f33cf`** on 2026-11-03 (2 commits past the pin; not absorbed).
+**Product version:** `1.4.0-beta.5` (root [`VERSION`](../VERSION) + workspace Cargo version = this pin).
 
 This pin identifies the audited release baseline; it does not claim complete product parity. The new remote control API, full scanner, Kill Switch, global hotkeys, OS proxy refactor, and historical gaps below remain partial or unported.
 
@@ -14,16 +14,77 @@ Agent skill for ongoing parity work: [`skills/throne-upstream-parity/SKILL.md`](
 
 ```bash
 ./script/upstream-audit            # current VERSION → newest 1.* tag
-./script/upstream-audit 1.4.0-beta.4 # explicit release tag
+./script/upstream-audit 1.4.0-beta.5 # explicit release tag
 ```
 
 Manual equivalent:
 
 ```bash
 git fetch upstream --prune --tags
-git log --oneline 1.4.0-beta.3..1.4.0-beta.4
-git diff --dirstat=files,0 1.4.0-beta.3 1.4.0-beta.4
+git log --oneline 1.4.0-beta.4..1.4.0-beta.5
+git diff --dirstat=files,0 1.4.0-beta.4 1.4.0-beta.5
 ```
+
+## 1.4.0-beta.5 audit (2026-11-03)
+
+**Pinned release:** `ec2420df924fcb80793b29704156d2934b856567` (2026-11-02), **40 commits** after beta.4 (`dd748826`). `upstream/dev` is `1.4.0-beta.5-2-ga76f33cf`; `a76f33cf` (remove custom fund address) and `4c5b1e0a` (shorter README) are excluded. This audit does not claim complete product parity.
+
+| Commit | Upstream change | Disposition in this rewrite |
+|--------|-----------------|-----------------------------|
+| `83438b6d` | macOS minimum version | N/A Qt/CMake deployment target |
+| `86c9f825` | Donation info | ⏳ About/donation UI not ported |
+| `993ba8ee` | About page; check-for-update moved | ⏳ |
+| `e65de361` | Changelog method | ⏳ |
+| `43eb0b69` | Command palette with other windows (#2031) | N/A single native window |
+| `8e201ea6` | Proxy table sort indicator | ⏳ |
+| `97099f72` | Extend Xray mux | 🧩 Core dependency synced. Rust multiplex remains sing-box presets, not the Xray mux form |
+| `38f7e830` | Simple interface mode | ⏳ |
+| `68be8768` | Web UI | ⏳ |
+| `e30fc1a6` | Menu changes | ⏳ Qt menus |
+| `dc4c7d11` | API reference bump | N/A C++ reference |
+| `3cf5d622` | Simple interface follow-up | ⏳ |
+| `01567519` | Update sing-box | ✅ Pin `af51a7460ccd`; `ConnectionManager` takes `ctx` |
+| `cd41d2f6` | Android utils | N/A desktop. `core/mobile` sources are in the synced tree |
+| `1f30af24` | Android log and CA | N/A desktop. Mobile sources synced |
+| `a0e22d53` | Skip identical tray text | ⏳ |
+| `e1251769` | Xray xhttp leak | ✅ Xray pin `1c6eb7771c4d` |
+| `c852fe31` | macOS DNS `underlying` (#2045) | ✅ Darwin Tun and URL tests use `underlying`. Mixed mode and ResolveDomains stay `local`. ECH accepts `underlying` as a direct bootstrap. This is not the local sysdns patch |
+| `8b6445b6` | Do not set DF on WireGuard | ✅ `wireguard-go` pin `e11787583013` only. No Rust DF flag |
+| `bf44c995` | Qt cold-start freeze (#2036) | N/A Qt popup measurement |
+| `2c68c283` | Subscription remaining-time precision | ⏳ Native card still shows a fixed expiry |
+| `911deaf4` | WARP Amnezia camouflage | ⏳ No WARP generator. `jc`/`jmin`/`jmax` and `GenerateWarpCamouflage` are not ported. Proto unchanged |
+| `605641a4` | Tun link replaced by core restart | ⏳ Qt page control |
+| `51274c94` | Relax import checks; Hysteria v1 defaults | 🧩 Clash bandwidth units and v1 `up_mbps`/`down_mbps` defaults 10/50. Other protocol import relaxations not ported. Hy2 `user:pass` concatenation not re-ported |
+| `01b96d49` | Auto Selector name-filter tooltip | ⏳ |
+| `1af312fb` | Exclude countries in Auto Selector | 🧩 Include/exclude helpers skip unknown countries. Native Start does not call them |
+| `6891043a` | Start Auto Selector once enough profiles work | 🧩 `start_quorum` / `member_works` / `selector_build_changed` / `unmeasured_candidates` are tested helpers. Native Start does not wait for a quorum |
+| `617f8baa` | Serve DNS to other devices | 🧩 `core_dns_in_lan` and `core_dns_in_port` (default 5533) emit direct `dns-in` plus a reject rule on the real Start config. URL tests and ResolveDomains do not. No settings control |
+| `f6d42fa7` | Reconnect after subscription replaces the running profile | ✅ Exact same-type, same-name successor only. No successor stops the core and leaves it stopped. A route change restarts that group's running profile. A stopped core is not started |
+| `8e1644ee` | Data view two lines and tooltip | ⏳ |
+| `3c7cab39` | Per-group routing and subscription route import | 🧩 `route_id`, `import_sub_route`, and `source_gid` persist. Start and domain resolve use the group's route without changing the global active route. Subscription apply preserves type-13 endpoint rules and disabled-by-name. Happ `geoip:private` survives empty-rule filtering. No group-route editor. Chain inner hops are not expanded |
+| `c99415c4` | API reference bump | N/A C++ reference |
+| `0aefa6cf` | Reset Xray on network changes | ✅ Go Xray gate and mobile sources synced. Rust does not own the gate |
+| `851d9386` | Forward Xray logs to the mobile sink | ✅ `core/mobile/log.go` synced. Desktop has no mobile sink |
+| `36b6bc4a` | WireGuard GSO | ✅ Dependency pin only |
+| `4512278c` | Deeplink stuck on start args | N/A Qt restart argv. The Rust deeplink parser is unchanged |
+| `32ee312f` | Update Xray | ✅ Core pin synced. Qt Xray stream form not ported |
+| `591bb264` | Allow empty Hysteria 2 obfs | ✅ Obfs is omitted when type is empty/`none`/`plain` or the password is empty. Gecko sizes pass through. Unknown types fall back to salamander |
+| `ecd1f1d9` | Changelogs for beta.5 | ⏳ Not a product surface in this rewrite |
+| `ec2420df` | Lint | N/A Qt lint. This commit is the tag |
+
+### Core baseline and verification boundaries
+
+Active `core/` matches beta.5 except retained local files: `core/internal/sysdns/*`, `core/internal/boxmain/context.go`, and `core/patches/`. Upstream did not touch those Darwin sysdns sources. Dependency pins: sing-box `af51a7460ccd`, Xray `1c6eb7771c4d`, WireGuard `e11787583013`. `libcore.proto` is unchanged. `ResolveDomains` still answers through `dns-direct`; the Go implementation moved to `core/internal/resolve`. Legacy untracked `core/server/` is not a build input.
+
+`reality_client.go` changed only in fallback HTTP host formatting (IPv6 brackets). The ML-KEM patch still applies with zero fuzz. Upstream moved Darwin dnsinfo into `sing-tun/dnsinfo`, so `sing-box-darwin-system-dns.patch` was rebased onto the new `Configuration()` path. `replaceManagedDNS` is the same filter. The unpatched source SHA256 is `72d4037c73ef1a71d0e56d25cbed3ba7eb79b3785b316eececbae6dc86ad2248`.
+
+The host audit binary is `target/parity-beta5/ThroneCore`. Packaging must rebuild through `script/build-core`. Schema acceptance does not prove privileged macOS DNS restoration, TUN/L3/Kill Switch protection, or Windows/Linux runtime.
+
+### Verification evidence
+
+- **Executed:** 312 tests across throne-domain, throne-import, throne-core-client, and throne-storage (19 suites), plus `cargo check -p throne` and `cargo fmt` of those five crates. Contracts covered include Darwin `underlying` DNS, ECH bootstrap of `underlying`, Happ private-IP rules, `dns-in` listen/reject, URL-test inbounds staying empty, and Hysteria v1 defaults / obfs-active.
+- **Not re-run:** the previous 387-test workspace bar, strict production Clippy, and the 13 actual-core smoke groups. All-target lint remains blocked by pre-existing test-only lints. Native GUI, privileged DNS/TUN, and cross-platform runtime remain untested.
+- **Executed:** `THRONE_CORE_VERIFY_PATCHES=1 ./script/build-core target/parity-beta5` exited 0. The patched sing-box `systemconfig` race test and the local `sysdns` race test passed. `boxmain` has no test files. The audit binary is `target/parity-beta5/ThroneCore` (77M). That build does not refresh an installed or setuid copy, and it does not repeat the 13 configuration/RPC smoke groups.
 
 ## 1.4.0-beta.4 audit (2026-10-27)
 
@@ -190,7 +251,13 @@ Status legend: ✅ implemented for the stated contract · 🧩 partial · ⏳ pl
 | Profile editor tab order (1.2.4) | `33777e27` | ⏳ GPUI focus order later | `throne` |
 | Linux CLI installer | `89f3ec1d` | ⏳ | `script/` / xtask |
 | Windows unwritable config dir (1.2.4) | `d8e663cc` | ⏳ NSI; macOS package already uses AppConfig | `script/`, `throne` |
-| Core: sing-box / xray / TUN / DNS | Go `core/` (moved out of `core/server` in 1.3.0-beta.4) | ❌ Rust data-plane rewrite remains out of scope; shipping `ThroneCore` **synced to 1.4.0-beta.4** (sing-box `a29d468286bc`, Xray `ace47b20f7fe`, WireGuard `de3e4a28dbfe`; ResolveDomains and rule metadata) with retained local Darwin/REALITY hardening | `core/` |
+| Core: sing-box / xray / TUN / DNS | Go `core/` (moved out of `core/server` in 1.3.0-beta.4) | ❌ Rust data-plane rewrite remains out of scope; shipping `ThroneCore` **synced to 1.4.0-beta.5** (sing-box `af51a7460ccd`, Xray `1c6eb7771c4d`, WireGuard `e11787583013`; ResolveDomains and rule metadata) with retained local Darwin/REALITY hardening | `core/` |
+| **Per-group routing (1.4.0-beta.5)** | `3c7cab39` | 🧩 `route_id` / `import_sub_route` / `source_gid`; Start and domain resolve use the group route; subscription route import. No editor. Chain inner hops remain | `throne-domain`, `throne-storage`, `throne-import`, `throne` |
+| **DNS for other devices (1.4.0-beta.5)** | `617f8baa` | 🧩 direct `dns-in` on Start, loopback unless `core_dns_in_lan`, port default 5533, reject rule. No settings control. URL tests stay without it | `throne-domain`, `throne-core-client` |
+| **Hysteria obfs and v1 bandwidth (1.4.0-beta.5)** | `591bb264`, `51274c94` | ✅ empty/none/plain obfs off; v1 defaults 10/50 at config build; Clash unit parser. Hy2 `user:pass` not re-ported | `throne-import`, `throne-core-client` |
+| **Subscription successor reconnect (1.4.0-beta.5)** | `f6d42fa7` | ✅ one same-type same-name successor; otherwise stop and stay stopped | `throne-domain`, `throne` |
+| **Auto Selector country and quorum (1.4.0-beta.5)** | `1af312fb`, `6891043a` | 🧩 pure helpers only; Start does not wait for a quorum | `throne-domain` |
+| **macOS DNS underlying (1.4.0-beta.5)** | `c852fe31` #2045 | ✅ Tun and URL tests use `underlying` on Darwin. Mixed and ResolveDomains stay `local` | `throne-core-client` |
 | Core IPC Start/Stop | `dispatch.go` + Qt framing | 🧩 Start/Stop/Test/QueryStats/QueryConnections/**CloseConnections**, AutoSelector, scanner/egress RPCs; API service keeps trackers available; Xray strategy reserved field 12 and connection source field 14 retained | `throne-core-client`, `core/` |
 | **IP lists and scanner (1.4.0-beta.1)** | `86f196d4` | 🧩 native manual lists and bounded TCP scanning only: 4,096 targets, 256 hosts per CIDR, concurrency 16, batches 64; scan models/storage/RPCs exist, but full probes, resume UI, remote updates and default list seeds are not ported | `throne-domain`, `throne-storage`, `throne-core-client`, `throne` |
 | **Profile/group endpoint sources** | `1809cb0e` | 🧩 group/profile inheritance and DB round-trip; profile list assignment and Own/Inherit restoration; Start and stored-profile tests clone server overrides while retaining identity; group/fixed-address editor remains | `throne-domain`, `throne-storage`, `throne` |

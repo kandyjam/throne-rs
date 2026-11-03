@@ -2,7 +2,7 @@
 
 `script/build-core` applies `sing-box-reality-mlkem.patch` and
 `sing-box-darwin-system-dns.patch` to a private copy of
-`github.com/throneproj/sing-box` at `v1.11.16-0.20261019002151-a29d468286bc`.
+`github.com/throneproj/sing-box` at `v1.11.16-0.20261031212642-af51a7460ccd`.
 It verifies the replacement module version and original source SHA256 before
 patching, uses a temporary modfile with `-mod=readonly`, and removes the copy
 after the build. Committed lockfiles and the shared Go module cache are untouched.
@@ -28,11 +28,13 @@ failed REALITY verification for Firefox, Chrome and Safari. The patched core
 completed an HTTPS URL test with Chrome (873 ms); Firefox and Safari remained
 negative controls. No node credentials are stored in this repository.
 
-Re-audited for Throne 1.4.0-beta.4 on 2026-10-27: the new sing-box pin
-`a29d468286bc` retains exactly the same `reality_client.go` SHA256
-(`cb4fcbd0f76347282cd31e630271c02bb3c5273205b005f47987804e2adc4742`).
-The existing patch applies with zero fuzz. The source-hash guard remains
-unchanged; the dependency-version guard now names the beta.4 pin.
+Re-audited for Throne 1.4.0-beta.5 on 2026-11-03: sing-box pin
+`af51a7460ccd` changes `reality_client.go` only in the fallback HTTP request,
+which now brackets IPv6 hosts. The ML-KEM share strip and the Ecdhe /
+MlkemEcdhe authentication-key order are unchanged. The existing patch applies
+with zero fuzz. The source-hash guard is now
+`38a5d553fffd108afca51bde0b0888512d2f4633daa608e03767838b8fdcdbc0`.
+The dependency-version guard names the beta.5 pin.
 
 ## Darwin system DNS loop prevention
 
@@ -56,9 +58,14 @@ remains. Missing or invalid interface indices use the same conservative
 exclusion. A genuinely absent record with no local owner leaves unmanaged DNS
 unchanged. Record permissions are not relaxed.
 
-The build requires the original `source_darwin.go` SHA256
-`9a272357e282eb48d9d1e80a589fe0729c422c7d96cb792d3c2049a30704e104`
-and applies the patch with zero fuzz. Set `THRONE_CORE_VERIFY_PATCHES=1` when
+Upstream beta.5 moved the private dnsinfo reader into `sing-tun/dnsinfo`.
+The previous patch context (inline CGO and notify tokens) is gone.
+`sing-box-darwin-system-dns.patch` is rebased onto that file: `Source` still
+asks the `boxmain` override service for the saved per-service snapshot, and
+`replaceManagedDNS` is unchanged. The hook stays immediately before
+`replaceOwnTunServers`. The unpatched `source_darwin.go` SHA256 is
+`72d4037c73ef1a71d0e56d25cbed3ba7eb79b3785b316eececbae6dc86ad2248`.
+The patch applies with zero fuzz. Set `THRONE_CORE_VERIFY_PATCHES=1` when
 running `script/build-core` to run the patched systemconfig and core DNS tests
 with the race detector before compiling the shipping binary.
 
@@ -66,6 +73,10 @@ Executed on 2026-10-27: the final shipping-path build with
 `THRONE_CORE_VERIFY_PATCHES=1` passed the patched systemconfig and sysdns race
 tests, including unreadable records and unknown-state filtering. The resulting
 core passed all 13 configuration/RPC smoke groups.
+
+Executed on 2026-11-03 against pin `af51a7460ccd`: the same verify flag passed
+the rebased systemconfig and sysdns race tests and wrote
+`target/parity-beta5/ThroneCore`. The 13 smoke groups were not repeated.
 
 These deterministic tests do not mutate system DNS. Privileged alias setup,
 restoration, network-service failover and resolver notification timing still

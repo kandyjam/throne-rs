@@ -187,6 +187,8 @@ impl RouteRule {
             && self.network.is_empty()
             && self.port.is_empty()
             && self.source_port.is_empty()
+            && !self.ip_is_private
+            && !self.source_ip_is_private
             && !(matches!(self.action.as_str(), "route" | "route-options")
                 && (self.tls_fragment
                     || self.tls_record_fragment

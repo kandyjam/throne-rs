@@ -19,8 +19,8 @@ Keep **throne-rs** (`rewrite/rust-gpui`) behaviorally aligned with
 |------|--------|
 | Upstream remote | `upstream` → `https://github.com/throneproj/Throne.git` |
 | Baseline branch | `upstream/dev` (or a release tag e.g. `1.2.4`) |
-| **Current pin** | tag **`1.4.0-beta.4`** (`dd748826`, 2026-10-22) |
-| **Tip tracked** | `upstream/dev` describe `1.4.0-beta.4-15-g1f30af24` on 2026-10-27; 15 later commits excluded |
+| **Current pin** | tag **`1.4.0-beta.5`** (`ec2420df`, 2026-11-02) |
+| **Tip tracked** | `upstream/dev` describe `1.4.0-beta.5-2-ga76f33cf` on 2026-11-03; 2 later commits excluded |
 | **1.2.5** | Never tagged; line jumped to **1.3.0-beta.1**. |
 | Product version | root [`VERSION`](../../VERSION) + workspace `Cargo.toml` `version` (= requested audited release tag / `NKR_VERSION`) |
 | Parity matrix | [`docs/UPSTREAM_TRACKING.md`](../../docs/UPSTREAM_TRACKING.md) |
@@ -101,7 +101,22 @@ Packaging scripts already read root `VERSION`.
 
 When **1.2.5** is tagged: `git log --oneline 1.2.4..1.2.5` → triage → bump `VERSION` + skill pin + matrix.
 
-## 1.4.0-beta.4 feature notes (current pin)
+## 1.4.0-beta.5 feature notes (current pin)
+
+Target `ec2420df` (2026-11-02); audited 2026-11-03. All 40 commits since beta.4 are triaged in `docs/UPSTREAM_TRACKING.md`. `upstream/dev` is `1.4.0-beta.5-2-ga76f33cf`; later commits (`a76f33cf` remove custom fund address, `4c5b1e0a` shorter README) are excluded. This release pin does not assert complete product parity.
+
+- Per-group `route_id` and `import_sub_route` persist. Start and domain resolve use that group's route and do not change the global active route. Subscription routing creates or updates the `source_gid`-owned route, including Happ private-IP rules. There is no group-route editor, and chain inner hops are not expanded.
+- A running profile deleted by a subscription update reconnects only when exactly one same-type, same-name successor remains. A route change restarts that group's running profile. No successor stops the core and leaves it stopped.
+- `core_dns_in_lan` and `core_dns_in_port` (default 5533) add direct `dns-in` and a reject rule on the real Start config. URL tests and ResolveDomains do not. There is no settings control yet.
+- macOS Tun and URL tests emit DNS type `underlying` instead of `local` (#2045). Mixed mode and ResolveDomains stay `local`. ECH treats `underlying` as a direct bootstrap.
+- Hysteria 2 omits obfs when the type is empty, `none`, or `plain`, or the password is empty. Hysteria 1 writes `up_mbps`/`down_mbps` of 10/50 when unset. Clash bandwidth units match upstream. Hy2 `user:pass` concatenation was not re-ported.
+- Auto Selector country exclusion, freshness, start quorum, and unmeasured candidates are pure helpers. Native Start does not call them.
+- Core pins: sing-box `af51a7460ccd`, Xray `1c6eb7771c4d`, WireGuard `e11787583013`. Xray reset-on-network and mobile log forwarding are in the Go core. WireGuard DF and GSO are dependency pins only. Xray mux widgets and WARP Amnezia camouflage are not ported.
+- Darwin physical-interface hardening and the REALITY ML-KEM patch stay. The Darwin sing-box patch was rebased onto `sing-tun/dnsinfo`; `replaceManagedDNS` is unchanged.
+- Simple interface, web UI, About/donation, and historical headless/API/scanner/Kill Switch/hotkey gaps remain explicit.
+- Executed on 2026-11-03: 312 tests in throne-domain, throne-import, throne-core-client, and throne-storage; `cargo check -p throne`; formatting of those crates. `THRONE_CORE_VERIFY_PATCHES=1 ./script/build-core target/parity-beta5` exited 0 (systemconfig and sysdns race tests, 77M audit binary). Full workspace tests, strict production Clippy, and the 13 actual-core smoke groups were not re-run. Native GUI, privileged DNS/TUN, and cross-platform runtime remain untested.
+
+## 1.4.0-beta.4 feature notes (historical pin)
 
 Target `dd748826` (2026-10-22); audited 2026-10-27. All 32 commits since beta.3 are triaged in `docs/UPSTREAM_TRACKING.md`. `upstream/dev` is `1.4.0-beta.4-15-g1f30af24`; later commits are excluded. This release pin does not assert complete product parity.
 

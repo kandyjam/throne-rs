@@ -753,6 +753,10 @@ pub fn dialog_actions(
 /// Status-bar profile label — plain tinted text (no outline chip).
 pub fn status_tag(running: bool, label: impl Into<SharedString>) -> impl IntoElement {
     div()
+        .w_full()
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_ellipsis()
         .text_xs()
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(if running {

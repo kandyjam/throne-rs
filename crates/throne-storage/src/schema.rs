@@ -159,6 +159,13 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), StorageError> {
         "sort_descending",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    add_column_if_missing(conn, "groups", "route_id", "INTEGER NOT NULL DEFAULT -1")?;
+    add_column_if_missing(
+        conn,
+        "groups",
+        "import_sub_route",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     add_column_if_missing(
         conn,
         "groups",
@@ -249,6 +256,12 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), StorageError> {
         "route_profiles",
         "custom_dns",
         "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        conn,
+        "route_profiles",
+        "source_gid",
+        "INTEGER NOT NULL DEFAULT -1",
     )?;
     add_column_if_missing(conn, "route_rules", "wifi_ssid_json", "TEXT")?;
     add_column_if_missing(conn, "route_rules", "wifi_bssid_json", "TEXT")?;

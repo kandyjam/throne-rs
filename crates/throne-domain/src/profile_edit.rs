@@ -741,6 +741,15 @@ pub(crate) fn hydrate_outbound(value: &Value, raw: &str) -> ParsedOutbound {
         plugin: text("/plugin"),
         plugin_opts: text("/plugin_opts"),
         obfs: text("/obfs/password").or_else(|| text("/obfs")),
+        obfs_type: text("/obfs/type"),
+        obfs_min_packet_size: value
+            .pointer("/obfs/min_packet_size")
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok()),
+        obfs_max_packet_size: value
+            .pointer("/obfs/max_packet_size")
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok()),
         up_mbps: value["up_mbps"]
             .as_u64()
             .and_then(|n| u32::try_from(n).ok()),

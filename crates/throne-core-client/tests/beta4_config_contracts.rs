@@ -115,10 +115,12 @@ fn disabled_mixed_inbound_is_not_recreated_by_config_generation() {
         disable_mixed_inbound: true,
         ..Default::default()
     };
-    assert!(config(&profile(Value::Null), &s, None)["inbounds"]
+    let inbounds = config(&profile(Value::Null), &s, None)["inbounds"]
         .as_array()
         .unwrap()
-        .is_empty());
+        .clone();
+    assert!(inbounds.iter().all(|inbound| inbound["type"] != "mixed"));
+    assert!(inbounds.iter().any(|inbound| inbound["tag"] == "dns-in"));
 }
 #[cfg(target_os = "macos")]
 #[test]

@@ -117,14 +117,26 @@ pub fn build_load_config_ex(
 
     // Proven-working DNS for mixed+system-proxy on restricted networks (bisected):
     // default_domain_resolver MUST be `local` (OS resolver).
+    // Upstream `dnsIn`: always present on a real start. LAN listens on `::`.
+    // This is not the retired 1.4 port-53 `enable_dns_server`.
+    let dns_in_port = if (1..=65535).contains(&settings.core_dns_in_port) {
+        settings.core_dns_in_port
+    } else {
+        5533
+    };
     let mut inbounds = vec![json!({
-        "type": "mixed",
-        "tag": "mixed-in",
-        "listen": listen,
-        "listen_port": port
+        "type": "direct",
+        "tag": "dns-in",
+        "listen": if settings.core_dns_in_lan { "::" } else { "127.0.0.1" },
+        "listen_port": dns_in_port
     })];
-    if settings.disable_mixed_inbound {
-        inbounds.clear();
+    if !settings.disable_mixed_inbound {
+        inbounds.push(json!({
+            "type": "mixed",
+            "tag": "mixed-in",
+            "listen": listen,
+            "listen_port": port
+        }));
     }
     // TUN inbound when toolbar Tun is on (needs privileges on macOS/Linux).
     // Mirrors upstream `buildInboundSection` (generate.cpp).
@@ -183,12 +195,24 @@ pub fn build_load_config_ex(
         }
         inbounds.push(tun);
         if cfg!(target_os = "macos") {
-            inbounds.push(json!({"type":"direct","tag":"dns-system","listen":"127.0.0.53","listen_port":53,"reuse_addr":true}));
+            // dns-system stays ahead of dns-in, mixed, and tun.
+            inbounds.insert(
+                0,
+                json!({"type":"direct","tag":"dns-system","listen":"127.0.0.53","listen_port":53,"reuse_addr":true}),
+            );
         }
     }
 
     let (mut route_rules, mut rule_sets, route_final) =
         compile_route_section(route_profile, settings.ruleset_mirror);
+    // dns-in is a direct listener. Reject it after sniff and hijack-dns so the
+    // port cannot be used as an open proxy. URL-test and resolve configs do not
+    // pass through this start path.
+    if route_rules.len() >= 2 {
+        route_rules.insert(2, json!({"inbound":"dns-in","action":"reject"}));
+    } else {
+        route_rules.push(json!({"inbound":"dns-in","action":"reject"}));
+    }
     if cfg!(target_os = "macos") && settings.tun_mode_enabled {
         route_rules.insert(0, json!({"inbound":"dns-system","action":"hijack-dns"}));
     }
@@ -321,6 +345,7 @@ pub fn build_load_config_ex(
 fn direct_dns_for_mixed(settings: &AppSettings) -> Value {
     let mut dns = build_dns_obj(
         &settings.direct_dns,
+        false,
         false,
         &settings.core_box_underlying_dns,
     );
@@ -964,11 +989,13 @@ pub fn build_resolve_config(
             &effective.core_box_underlying_dns
         },
         false,
+        false,
         "",
     );
     local["tag"] = json!("dns-local");
     let mut direct = build_dns_obj(
         &effective.direct_dns,
+        false,
         false,
         &effective.core_box_underlying_dns,
     );
@@ -1023,7 +1050,7 @@ pub fn build_url_test_config(
         "log": { "level": log_level, "timestamp": true },
         "dns": {
             "servers": [
-                { "type": "local", "tag": "dns-local" },
+                { "type": system_resolver_type(false, true), "tag": "dns-local" },
                 {
                     "type": "udp",
                     "tag": "dns-direct",
@@ -1049,6 +1076,7 @@ pub fn build_url_test_config(
     let mut direct = build_dns_obj(
         &settings.direct_dns,
         false,
+        true,
         &settings.core_box_underlying_dns,
     );
     direct["tag"] = json!("dns-direct");
@@ -1555,20 +1583,158 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Value, CoreError> {
         ));
     }
     // Prefer a ready-made sing-box outbound object when outbound_json already has type.
+    let mut out = None;
     if let Ok(v) = serde_json::from_str::<Value>(&profile.outbound_json) {
-        if let Some(out) = take_singbox_outbound(v) {
-            return Ok(out);
+        if let Some(ready) = take_singbox_outbound(v) {
+            out = Some(ready);
         }
     }
-    if let Some(raw) = &profile.outbound.raw_json {
-        if let Ok(v) = serde_json::from_str::<Value>(raw) {
-            if let Some(out) = take_singbox_outbound(v) {
-                return Ok(out);
+    if out.is_none() {
+        if let Some(raw) = &profile.outbound.raw_json {
+            if let Ok(v) = serde_json::from_str::<Value>(raw) {
+                if let Some(ready) = take_singbox_outbound(v) {
+                    out = Some(ready);
+                }
             }
         }
     }
+    let mut out = match out {
+        Some(out) => out,
+        None => from_parsed(profile.profile_type, &profile.outbound)?,
+    };
+    finalize_hysteria_outbound(&mut out);
+    Ok(out)
+}
 
-    from_parsed(profile.profile_type, &profile.outbound)
+/// Apply upstream Hysteria `Build` rules to a stored or synthesized outbound.
+///
+/// Hysteria v1 always has upload/download speeds (10 / 50 Mbps when unset) and
+/// speaks `auth_str`, not `password`. Hysteria2 drops a non-positive speed and
+/// drops obfuscation when the type is off or the password is empty.
+fn finalize_hysteria_outbound(out: &mut Value) {
+    let Some(obj) = out.as_object_mut() else {
+        return;
+    };
+    match obj.get("type").and_then(Value::as_str) {
+        Some("hysteria") => {
+            let up = stored_positive_mbps(obj.get("up_mbps")).unwrap_or(10);
+            let down = stored_positive_mbps(obj.get("down_mbps")).unwrap_or(50);
+            obj.insert("up_mbps".into(), json!(up));
+            obj.insert("down_mbps".into(), json!(down));
+            let has_auth =
+                json_nonempty_string(obj.get("auth")) || json_nonempty_string(obj.get("auth_str"));
+            if !has_auth {
+                if let Some(password) = obj
+                    .get("password")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
+                    let password = password.to_string();
+                    obj.insert("auth_str".into(), json!(password));
+                }
+            }
+            obj.remove("password");
+        }
+        Some("hysteria2") => {
+            for key in ["up_mbps", "down_mbps"] {
+                if obj
+                    .get(key)
+                    .is_some_and(|value| stored_positive_mbps(Some(value)).is_none())
+                {
+                    obj.remove(key);
+                }
+            }
+            let obfs = obj.get("obfs").cloned();
+            match obfs {
+                None => {}
+                Some(Value::String(password)) => {
+                    let password = password.trim();
+                    if password.is_empty() {
+                        obj.remove("obfs");
+                    } else {
+                        obj.insert(
+                            "obfs".into(),
+                            json!({"type": "salamander", "password": password}),
+                        );
+                    }
+                }
+                Some(Value::Object(obfs)) => {
+                    let password = obfs
+                        .get("password")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .trim();
+                    let kind = obfs
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .trim()
+                        .to_ascii_lowercase();
+                    if password.is_empty() || kind.is_empty() || kind == "none" || kind == "plain" {
+                        obj.remove("obfs");
+                    } else if kind == "gecko" {
+                        obj.insert(
+                            "obfs".into(),
+                            json!({
+                                "type": "gecko",
+                                "password": password,
+                                "min_packet_size": json_u32(obfs.get("min_packet_size")),
+                                "max_packet_size": json_u32(obfs.get("max_packet_size")),
+                            }),
+                        );
+                    } else {
+                        obj.insert(
+                            "obfs".into(),
+                            json!({"type": "salamander", "password": password}),
+                        );
+                    }
+                }
+                Some(_) => {
+                    obj.remove("obfs");
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn stored_positive_mbps(value: Option<&Value>) -> Option<u32> {
+    let value = value?;
+    if let Some(number) = value.as_u64() {
+        return u32::try_from(number).ok().filter(|number| *number > 0);
+    }
+    if let Some(number) = value.as_i64() {
+        return u32::try_from(number).ok().filter(|number| *number > 0);
+    }
+    let number = value.as_f64()?;
+    if !number.is_finite() || number <= 0.0 {
+        return None;
+    }
+    let rounded = number.round();
+    if rounded < 1.0 || rounded > u32::MAX as f64 {
+        None
+    } else {
+        Some(rounded as u32)
+    }
+}
+
+fn json_nonempty_string(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_str)
+        .is_some_and(|text| !text.is_empty())
+}
+
+fn json_u32(value: Option<&Value>) -> u32 {
+    let Some(value) = value else {
+        return 0;
+    };
+    if let Some(number) = value.as_u64() {
+        return u32::try_from(number).unwrap_or(0);
+    }
+    if let Some(number) = value.as_i64().filter(|number| *number >= 0) {
+        return u32::try_from(number).unwrap_or(0);
+    }
+    0
 }
 
 /// Accept a JSON object as a sing-box outbound if it has a known `type`, force
@@ -1782,6 +1948,27 @@ fn from_parsed(ty: ProfileType, o: &ParsedOutbound) -> Result<Value, CoreError> 
             apply_tls(&mut v, o, true);
             v
         }
+        ProfileType::Hysteria => {
+            let mut v = json!({
+                "type": "hysteria",
+                "server": server,
+                "server_port": port,
+                "up_mbps": o.up_mbps.filter(|n| *n > 0).unwrap_or(10),
+                "down_mbps": o.down_mbps.filter(|n| *n > 0).unwrap_or(50),
+            });
+            if let Some(auth) = o.password.as_ref().filter(|s| !s.is_empty()) {
+                v.as_object_mut()
+                    .unwrap()
+                    .insert("auth_str".into(), json!(auth));
+            }
+            if let Some(obfs) = o.obfs.as_ref().filter(|s| !s.is_empty()) {
+                v.as_object_mut()
+                    .unwrap()
+                    .insert("obfs".into(), json!(obfs));
+            }
+            apply_tls(&mut v, o, true);
+            v
+        }
         ProfileType::Hysteria2 => {
             let password = o
                 .password
@@ -1794,23 +1981,18 @@ fn from_parsed(ty: ProfileType, o: &ParsedOutbound) -> Result<Value, CoreError> 
                 "server_port": port,
                 "password": password
             });
-            if let Some(up) = o.up_mbps {
+            if let Some(up) = o.up_mbps.filter(|n| *n > 0) {
                 v.as_object_mut()
                     .unwrap()
                     .insert("up_mbps".into(), json!(up));
             }
-            if let Some(down) = o.down_mbps {
+            if let Some(down) = o.down_mbps.filter(|n| *n > 0) {
                 v.as_object_mut()
                     .unwrap()
                     .insert("down_mbps".into(), json!(down));
             }
-            if let Some(obfs) = &o.obfs {
-                if !obfs.is_empty() {
-                    v.as_object_mut().unwrap().insert(
-                        "obfs".into(),
-                        json!({ "type": "salamander", "password": obfs }),
-                    );
-                }
+            if let Some(obfs) = o.hysteria2_obfs_value() {
+                v.as_object_mut().unwrap().insert("obfs".into(), obfs);
             }
             apply_tls(&mut v, o, true);
             v
@@ -2110,7 +2292,7 @@ fn build_dns_section(
     let underlying = underlying_dns_address(settings)?;
 
     // remote — upstream: only dns-remote gets detour=proxy
-    let mut remote = build_dns_obj(&settings.remote_dns, tun_enabled, &underlying);
+    let mut remote = build_dns_obj(&settings.remote_dns, tun_enabled, false, &underlying);
     if let Some(obj) = remote.as_object_mut() {
         obj.insert("tag".into(), json!("dns-remote"));
         obj.insert("detour".into(), json!("proxy"));
@@ -2118,7 +2300,7 @@ fn build_dns_section(
     }
 
     // direct — upstream: buildDnsObj(direct_dns); no detour
-    let mut direct = build_dns_obj(&settings.direct_dns, tun_enabled, &underlying);
+    let mut direct = build_dns_obj(&settings.direct_dns, tun_enabled, false, &underlying);
     if let Some(obj) = direct.as_object_mut() {
         obj.insert("tag".into(), json!("dns-direct"));
         obj.insert("domain_resolver".into(), json!("dns-local"));
@@ -2130,7 +2312,7 @@ fn build_dns_section(
     } else {
         settings.core_box_underlying_dns.trim().to_string()
     };
-    let mut local = build_dns_obj(&dns_local_address, tun_enabled, &underlying);
+    let mut local = build_dns_obj(&dns_local_address, tun_enabled, false, &underlying);
     if let Some(obj) = local.as_object_mut() {
         obj.insert("tag".into(), json!("dns-local"));
     }
@@ -2365,7 +2547,9 @@ fn apply_ech_dns(
             return false;
         }
         let kind = server["type"].as_str().unwrap_or("");
-        if matches!(kind, "local" | "dhcp") {
+        // `underlying` is the macOS Tun replacement for `local` (#2045). It reads
+        // the OS resolver directly and does not depend on the proxy.
+        if matches!(kind, "local" | "dhcp" | "underlying") {
             return true;
         }
         if !matches!(kind, "udp" | "tcp" | "tls" | "https" | "h3" | "quic") {
@@ -2401,7 +2585,7 @@ fn apply_ech_dns(
             while servers.iter().any(|server| server["tag"] == tag) {
                 tag.push('-');
             }
-            let mut server = build_dns_obj(&address, false, "");
+            let mut server = build_dns_obj(&address, false, false, "");
             server["tag"] = json!(tag);
             server["domain_resolver"] = json!(local_tag);
             servers.push(server);
@@ -2478,11 +2662,25 @@ fn underlying_dns_address(settings: &AppSettings) -> Result<String, CoreError> {
     Ok(String::new())
 }
 
+/// macOS Tun and URL tests must not use sing-box `local`. The system resolver
+/// points at `dns-system`, and `local` loops through it (#2045).
+fn system_resolver_type(tun_enabled: bool, for_test: bool) -> &'static str {
+    #[cfg(target_os = "macos")]
+    if tun_enabled || for_test {
+        return "underlying";
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (tun_enabled, for_test);
+    }
+    "local"
+}
+
 /// Upstream `buildDnsObj(address, ctx)`.
 ///
-/// `local` / `localhost` stays type `local` on every OS, including Darwin Tun (1.3.0).
-fn build_dns_obj(address: &str, tun_enabled: bool, underlying: &str) -> Value {
-    let _ = (tun_enabled, underlying);
+/// `local` / `localhost` stays type `local` except on macOS Tun and URL tests.
+fn build_dns_obj(address: &str, tun_enabled: bool, for_test: bool, underlying: &str) -> Value {
+    let _ = underlying;
     let address = address.trim();
     // Normalize only the scheme; resolver paths and interface names retain case.
     let normalized = address
@@ -2490,7 +2688,7 @@ fn build_dns_obj(address: &str, tun_enabled: bool, underlying: &str) -> Value {
         .map(|(scheme, rest)| format!("{}://{rest}", scheme.to_ascii_lowercase()));
     let address = normalized.as_deref().unwrap_or(address);
     if address.is_empty() || address.to_ascii_lowercase().starts_with("local") {
-        return json!({ "type": "local" });
+        return json!({ "type": system_resolver_type(tun_enabled, for_test) });
     }
 
     if let Some(ifc) = address.strip_prefix("dhcp://") {
@@ -2563,7 +2761,7 @@ fn build_dns_obj(address: &str, tun_enabled: bool, underlying: &str) -> Value {
 /// Back-compat alias used by unit tests that still call the old name.
 #[cfg(test)]
 fn build_dns_server_obj(address: &str) -> Value {
-    build_dns_obj(address, false, "")
+    build_dns_obj(address, false, false, "")
 }
 
 #[cfg(test)]
@@ -2859,8 +3057,24 @@ mod tests {
         };
         let built = build_load_config(&p, &settings, None).unwrap();
         let config: Value = serde_json::from_str(&built.core_config_json).unwrap();
-        assert_eq!(config["inbounds"].as_array().unwrap().len(), 1);
-        assert_eq!(config["inbounds"][0]["type"], "mixed");
+        let inbounds = config["inbounds"].as_array().unwrap();
+        assert_eq!(inbounds.len(), 2);
+        let mixed = inbounds
+            .iter()
+            .find(|inbound| inbound["tag"] == "mixed-in")
+            .unwrap();
+        assert_eq!(mixed["type"], "mixed");
+        let dns_in = inbounds
+            .iter()
+            .find(|inbound| inbound["tag"] == "dns-in")
+            .unwrap();
+        assert_eq!(dns_in["type"], "direct");
+        assert_eq!(dns_in["listen"], "127.0.0.1");
+        assert_eq!(dns_in["listen_port"], 5533);
+        assert!(inbounds.iter().all(|inbound| {
+            let kind = inbound["type"].as_str().unwrap_or("");
+            kind != "redirect" && kind != "tproxy"
+        }));
         assert!(config["dns"]["rules"]
             .as_array()
             .into_iter()
@@ -3083,10 +3297,20 @@ mod tests {
             .iter()
             .find(|s| s["tag"] == "dns-local")
             .unwrap();
+        // macOS Tun uses `underlying` so `local` does not loop through dns-system (#2045).
+        #[cfg(target_os = "macos")]
+        assert_eq!(local["type"], "underlying");
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(local["type"], "local");
         assert_eq!(v["experimental"]["cache_file"]["store_dns"], false);
         assert_eq!(v["experimental"]["cache_file"]["store_fakeip"], false);
-        assert!(v["inbounds"][1]["route_exclude_address"]
+        let tun = v["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|inbound| inbound["type"] == "tun")
+            .unwrap();
+        assert!(tun["route_exclude_address"]
             .as_array()
             .unwrap()
             .iter()
@@ -3161,11 +3385,17 @@ mod tests {
         let settings = AppSettings::default(); // inbound 127.0.0.1
         let built = build_load_config(&p, &settings, None).unwrap();
         let v: Value = serde_json::from_str(&built.core_config_json).unwrap();
-        assert_eq!(v["inbounds"][0]["listen_port"], 2080);
-        assert_eq!(v["inbounds"][0]["listen"], "127.0.0.1");
+        let mixed = v["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|inbound| inbound["tag"] == "mixed-in")
+            .unwrap();
+        assert_eq!(mixed["listen_port"], 2080);
+        assert_eq!(mixed["listen"], "127.0.0.1");
         // Legacy inbound sniff fields must not appear (sing-box ≥1.11 decode fails).
-        assert!(v["inbounds"][0].get("sniff").is_none());
-        assert!(v["inbounds"][0].get("sniff_override_destination").is_none());
+        assert!(mixed.get("sniff").is_none());
+        assert!(mixed.get("sniff_override_destination").is_none());
         assert_eq!(v["outbounds"][0]["type"], "vless");
         assert_eq!(v["outbounds"][0]["tag"], "proxy");
         // No legacy block outbound.
@@ -3206,19 +3436,19 @@ mod tests {
         settings.inbound_address = "::".into();
         let config = build_load_config(&profile, &settings, None).unwrap();
         let value: Value = serde_json::from_str(&config.core_config_json).unwrap();
-        assert_eq!(value["inbounds"][0]["listen"], "::");
+        assert_eq!(mixed_listen(&value), "::");
 
         // Manual Basic Settings / older Allow LAN → `0.0.0.0`.
         settings.inbound_address = "0.0.0.0".into();
         let config = build_load_config(&profile, &settings, None).unwrap();
         let value: Value = serde_json::from_str(&config.core_config_json).unwrap();
-        assert_eq!(value["inbounds"][0]["listen"], "0.0.0.0");
+        assert_eq!(mixed_listen(&value), "0.0.0.0");
 
         // Bracketed IPv6 form also accepted.
         settings.inbound_address = "[::]".into();
         let config = build_load_config(&profile, &settings, None).unwrap();
         let value: Value = serde_json::from_str(&config.core_config_json).unwrap();
-        assert_eq!(value["inbounds"][0]["listen"], "::");
+        assert_eq!(mixed_listen(&value), "::");
     }
 
     #[test]
@@ -3428,7 +3658,128 @@ mod tests {
         assert_eq!(v["outbounds"][0]["type"], "hysteria2");
         assert_eq!(v["outbounds"][0]["tag"], "proxy");
         assert_eq!(v["outbounds"][0]["tls"]["server_name"], "localhost");
-        assert!(v["inbounds"][0].get("sniff").is_none());
+        let mixed = v["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|inbound| inbound["tag"] == "mixed-in")
+            .unwrap();
+        assert!(mixed.get("sniff").is_none());
+    }
+
+    fn mixed_listen(value: &Value) -> String {
+        value["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|inbound| inbound["tag"] == "mixed-in")
+            .unwrap()["listen"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn dns_in_rejects_the_direct_listener_and_stays_off_url_tests() {
+        let mut profile = Profile::new(1, 1, "socks", ProfileType::Socks);
+        profile.outbound_json =
+            json!({"type":"socks","server":"example.com","server_port":1080}).to_string();
+        let built = build_load_config(&profile, &AppSettings::default(), None).unwrap();
+        let value: Value = serde_json::from_str(&built.core_config_json).unwrap();
+        let dns_in = value["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|inbound| inbound["tag"] == "dns-in")
+            .unwrap();
+        assert_eq!(dns_in["type"], "direct");
+        assert_eq!(dns_in["listen"], "127.0.0.1");
+        assert_eq!(dns_in["listen_port"], 5533);
+        let rules = value["route"]["rules"].as_array().unwrap();
+        assert_eq!(rules[0]["action"], "sniff");
+        assert_eq!(rules[1]["action"], "hijack-dns");
+        assert_eq!(rules[2], json!({"inbound":"dns-in","action":"reject"}));
+
+        let settings = AppSettings {
+            core_dns_in_lan: true,
+            core_dns_in_port: 5353,
+            ..AppSettings::default()
+        };
+        let built = build_load_config(&profile, &settings, None).unwrap();
+        let value: Value = serde_json::from_str(&built.core_config_json).unwrap();
+        let dns_in = value["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|inbound| inbound["tag"] == "dns-in")
+            .unwrap();
+        assert_eq!(dns_in["listen"], "::");
+        assert_eq!(dns_in["listen_port"], 5353);
+
+        let (url_test, _) = build_url_test_config(&[&profile], &AppSettings::default()).unwrap();
+        let url_test: Value = serde_json::from_str(&url_test).unwrap();
+        assert!(url_test["inbounds"].as_array().unwrap().is_empty());
+        assert!(!url_test.to_string().contains("dns-in"));
+    }
+
+    #[test]
+    fn hysteria_build_uses_v1_defaults_and_obfs_active() {
+        let mut v1 = Profile::new(1, 1, "hy1", ProfileType::Hysteria);
+        v1.outbound = ParsedOutbound {
+            server: Some("h.example".into()),
+            server_port: Some(443),
+            password: Some("tok".into()),
+            obfs: Some("obfs-secret".into()),
+            ..Default::default()
+        };
+        let built = build_load_config(&v1, &AppSettings::default(), None).unwrap();
+        let value: Value = serde_json::from_str(&built.core_config_json).unwrap();
+        assert_eq!(value["outbounds"][0]["type"], "hysteria");
+        assert_eq!(value["outbounds"][0]["up_mbps"], 10);
+        assert_eq!(value["outbounds"][0]["down_mbps"], 50);
+        assert_eq!(value["outbounds"][0]["auth_str"], "tok");
+        assert_eq!(value["outbounds"][0]["obfs"], "obfs-secret");
+        assert!(value["outbounds"][0].get("password").is_none());
+
+        let mut off = Profile::new(2, 1, "hy2-off", ProfileType::Hysteria2);
+        off.outbound = ParsedOutbound {
+            server: Some("h.example".into()),
+            password: Some("pw".into()),
+            obfs: Some("keep".into()),
+            obfs_type: Some(String::new()),
+            ..Default::default()
+        };
+        let built = build_load_config(&off, &AppSettings::default(), None).unwrap();
+        let value: Value = serde_json::from_str(&built.core_config_json).unwrap();
+        assert!(value["outbounds"][0].get("obfs").is_none());
+
+        let mut salamander = Profile::new(3, 1, "hy2", ProfileType::Hysteria2);
+        salamander.outbound = ParsedOutbound {
+            server: Some("h.example".into()),
+            password: Some("pw".into()),
+            obfs: Some("keep".into()),
+            ..Default::default()
+        };
+        let built = build_load_config(&salamander, &AppSettings::default(), None).unwrap();
+        let value: Value = serde_json::from_str(&built.core_config_json).unwrap();
+        assert_eq!(value["outbounds"][0]["obfs"]["type"], "salamander");
+        assert_eq!(value["outbounds"][0]["obfs"]["password"], "keep");
+
+        let mut dropped = Profile::new(4, 1, "hy2-json", ProfileType::Hysteria2);
+        dropped.outbound_json = r#"{"type":"hysteria2","server":"h.example","server_port":443,"password":"pw","obfs":{"type":"none","password":"keep"}}"#.into();
+        let built = build_load_config(&dropped, &AppSettings::default(), None).unwrap();
+        let value: Value = serde_json::from_str(&built.core_config_json).unwrap();
+        assert!(value["outbounds"][0].get("obfs").is_none());
+
+        let mut speeds = Profile::new(5, 1, "hy1-json", ProfileType::Hysteria);
+        speeds.outbound_json =
+            r#"{"type":"hysteria","server":"h.example","server_port":443,"password":"tok"}"#.into();
+        let built = build_load_config(&speeds, &AppSettings::default(), None).unwrap();
+        let value: Value = serde_json::from_str(&built.core_config_json).unwrap();
+        assert_eq!(value["outbounds"][0]["up_mbps"], 10);
+        assert_eq!(value["outbounds"][0]["down_mbps"], 50);
+        assert_eq!(value["outbounds"][0]["auth_str"], "tok");
+        assert!(value["outbounds"][0].get("password").is_none());
     }
 
     #[test]

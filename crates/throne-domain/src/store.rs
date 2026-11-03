@@ -8,7 +8,7 @@ use crate::auto_selector::{
 };
 use crate::models::{
     AppSettings, CoreStatus, Group, GroupId, ParsedOutbound, Profile, ProfileId, ProfileType,
-    RouteProfile, SystemMode, TrafficSnapshot,
+    RouteProfile, RouteRule, SystemMode, TrafficSnapshot,
 };
 
 #[derive(Debug, Error)]
@@ -54,6 +54,18 @@ pub struct SubscriptionUpdateReport {
     /// Upstream 1.3.1: a body with zero profiles is treated as a broken response.
     /// The group is left unchanged.
     pub rejected_empty: bool,
+    /// The running profile was removed and exactly one remaining profile shares
+    /// its type and non-empty name. The store does not start it.
+    pub reconnect_profile_id: Option<ProfileId>,
+}
+
+/// Result of applying a subscription-owned routing profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionRouteApply {
+    pub route_id: i64,
+    pub created: bool,
+    pub changed: bool,
+    pub log: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -956,10 +968,10 @@ impl AppState {
         }
         format!(
             "Proxy: {}↑ {}↓\nDirect: {}↑ {}↓",
-            human_rate(self.traffic.proxy_up),
-            human_rate(self.traffic.proxy_down),
-            human_rate(self.traffic.direct_up),
-            human_rate(self.traffic.direct_down),
+            format_traffic_rate(self.traffic.proxy_up),
+            format_traffic_rate(self.traffic.proxy_down),
+            format_traffic_rate(self.traffic.direct_up),
+            format_traffic_rate(self.traffic.direct_down),
         )
     }
 
@@ -1186,6 +1198,106 @@ impl AppState {
 
     pub fn active_route(&self) -> Option<&RouteProfile> {
         self.active_route_id.and_then(|id| self.routes.get(&id))
+    }
+
+    /// Upstream `RouteIdFor`: the group's route when it exists, otherwise the
+    /// global active route. A missing group uses the global route.
+    pub fn route_for_group(&self, group_id: GroupId) -> Option<&RouteProfile> {
+        let requested = if group_id < 0 {
+            -1
+        } else {
+            self.groups
+                .get(&group_id)
+                .map(|group| group.route_id)
+                .unwrap_or(-1)
+        };
+        self.resolve_route(requested)
+    }
+
+    fn resolve_route(&self, route_id: i64) -> Option<&RouteProfile> {
+        if route_id >= 0 {
+            if let Some(route) = self.routes.get(&route_id) {
+                return Some(route);
+            }
+        }
+        self.active_route()
+    }
+
+    /// Create or refresh the route owned by `source_gid`. Does nothing unless
+    /// the group imports subscription routing. Does not start the core.
+    pub fn apply_owned_subscription_route(
+        &mut self,
+        group_id: GroupId,
+        fetched: RouteProfile,
+    ) -> Result<SubscriptionRouteApply, StoreError> {
+        let group = self
+            .groups
+            .get(&group_id)
+            .ok_or(StoreError::GroupNotFound(group_id))?;
+        if !group.import_sub_route {
+            return Ok(SubscriptionRouteApply {
+                route_id: -1,
+                created: false,
+                changed: false,
+                log: String::new(),
+            });
+        }
+        let group_name = group.name.clone();
+        let owned_id = self
+            .routes
+            .values()
+            .find(|route| route.source_gid == group_id)
+            .map(|route| route.id);
+        if let Some(id) = owned_id {
+            let current = self
+                .routes
+                .get(&id)
+                .ok_or_else(|| StoreError::Msg(format!("route {id} not found")))?;
+            let updated = replace_subscription_rules(current, &fetched);
+            if route_fingerprint(current) == route_fingerprint(&updated) {
+                return Ok(SubscriptionRouteApply {
+                    route_id: id,
+                    created: false,
+                    changed: false,
+                    log: String::new(),
+                });
+            }
+            let name = updated.name.clone();
+            self.routes.insert(id, updated);
+            return Ok(SubscriptionRouteApply {
+                route_id: id,
+                created: false,
+                changed: true,
+                log: format!(
+                    "[Routing] {group_name}: updated the routing profile \"{name}\" from the subscription"
+                ),
+            });
+        }
+        let mut created = fetched;
+        created.id = -1;
+        created.source_gid = group_id;
+        if created.name.trim().is_empty() {
+            created.name = format!("{group_name} routing");
+        }
+        let name = created.name.clone();
+        let id = self.add_route(created);
+        let assign = self
+            .groups
+            .get(&group_id)
+            .is_some_and(|group| group.route_id < 0 || !self.routes.contains_key(&group.route_id));
+        if assign {
+            if let Some(group) = self.groups.get_mut(&group_id) {
+                group.route_id = id;
+            }
+        }
+        Ok(SubscriptionRouteApply {
+            route_id: id,
+            created: true,
+            changed: true,
+            log: format!(
+                "[Routing] {group_name}: created the routing profile \"{name}\" from the subscription"
+            ),
+        })
     }
 
     pub fn set_active_route(&mut self, id: i64) -> Result<(), StoreError> {
@@ -1965,6 +2077,20 @@ impl AppState {
             }
         }
 
+        let stopped = if self.settings.allow_stopping_active_profile {
+            match &self.core_status {
+                CoreStatus::Running { profile_id, .. }
+                    if old_ids.contains(profile_id) && !retained.contains(profile_id) =>
+                {
+                    self.profiles
+                        .get(profile_id)
+                        .map(|profile| (profile.profile_type, profile.name.clone()))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         for id in old_ids {
             if !retained.contains(&id) {
                 if let Some(profile) = self.profiles.remove(&id) {
@@ -1996,6 +2122,25 @@ impl AppState {
         }
         self.resort_group(group_id);
         report.result_order = self.groups[&group_id].profile_ids.clone();
+        if let Some((profile_type, name)) = stopped {
+            if !name.trim().is_empty() {
+                let matches: Vec<ProfileId> = report
+                    .result_order
+                    .iter()
+                    .copied()
+                    .filter(|id| {
+                        self.profiles.get(id).is_some_and(|profile| {
+                            profile.profile_type != ProfileType::AutoSelector
+                                && profile.profile_type == profile_type
+                                && profile.name == name
+                        })
+                    })
+                    .collect();
+                if matches.len() == 1 {
+                    report.reconnect_profile_id = Some(matches[0]);
+                }
+            }
+        }
         Ok(report)
     }
 
@@ -2015,6 +2160,95 @@ impl AppState {
         self.resort_group(group_id);
         self.push_log("Test results cleared");
     }
+}
+
+const ENDPOINT_PREFERRED_BY: i32 = 13;
+
+fn replace_subscription_rules(current: &RouteProfile, fetched: &RouteProfile) -> RouteProfile {
+    let endpoint: Vec<(usize, RouteRule)> = current
+        .rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| rule.rule_type == ENDPOINT_PREFERRED_BY)
+        .map(|(index, rule)| (index, rule.clone()))
+        .collect();
+    let disabled: HashSet<String> = current
+        .rules
+        .iter()
+        .filter(|rule| rule.disabled && rule.rule_type != ENDPOINT_PREFERRED_BY)
+        .map(|rule| rule.name.clone())
+        .collect();
+    let mut rules = Vec::new();
+    for mut rule in fetched.rules.clone() {
+        if rule.rule_type == ENDPOINT_PREFERRED_BY {
+            continue;
+        }
+        if disabled.contains(&rule.name) {
+            rule.disabled = true;
+        }
+        rules.push(rule);
+    }
+    for (index, rule) in endpoint {
+        let at = index.min(rules.len());
+        rules.insert(at, rule);
+    }
+    let mut updated = current.clone();
+    updated.is_raw = false;
+    updated.raw_route.clear();
+    updated.rules = rules;
+    updated.default_outbound = fetched.default_outbound;
+    sync_endpoint_rules(&mut updated);
+    updated
+}
+
+fn sync_endpoint_rules(profile: &mut RouteProfile) {
+    if profile.is_raw {
+        return;
+    }
+    let mut targets = Vec::new();
+    for id in profile
+        .endpoint_profile_ids
+        .iter()
+        .chain(profile.inner_hop_endpoint_ids.iter())
+    {
+        if !targets.contains(id) {
+            targets.push(*id);
+        }
+    }
+    let mut kept = Vec::new();
+    let mut paired = HashSet::new();
+    for rule in std::mem::take(&mut profile.rules) {
+        if rule.rule_type == ENDPOINT_PREFERRED_BY
+            && (!targets.contains(&rule.outbound_id) || !paired.insert(rule.outbound_id))
+        {
+            continue;
+        }
+        kept.push(rule);
+    }
+    for id in targets {
+        if paired.contains(&id) {
+            continue;
+        }
+        kept.push(RouteRule {
+            rule_type: ENDPOINT_PREFERRED_BY,
+            rule_type_token: "endpoint_preferred_by".into(),
+            outbound_id: id,
+            name: "endpoint route prefer".into(),
+            action: "route".into(),
+            ..RouteRule::default()
+        });
+    }
+    profile.rules = kept;
+}
+
+fn route_fingerprint(profile: &RouteProfile) -> String {
+    let rules = serde_json::to_string(&profile.rules).unwrap_or_default();
+    format!(
+        "{}|{}|{}|{rules}",
+        profile.default_outbound.as_id(),
+        profile.is_raw,
+        profile.raw_route
+    )
 }
 
 fn profile_dedupe_key(p: &Profile) -> String {
@@ -2130,7 +2364,9 @@ fn upstream_latency_sort_key(ms: i32) -> i32 {
     }
 }
 
-fn human_rate(bytes: i64) -> String {
+/// Status-bar rate. `0`–`1023` stay in bytes; larger values use one decimal
+/// through GB. The status bar reserves a fixed column for this string.
+pub fn format_traffic_rate(bytes: i64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut v = bytes.max(0) as f64;
     let mut i = 0usize;

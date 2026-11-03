@@ -366,15 +366,36 @@ fn parse_hysteria(link: &str) -> Option<ImportedProfile> {
         .or_else(|| qget(&q, "auth").map(|s| s.to_string()))
         .or_else(|| qget(&q, "password").map(|s| s.to_string()));
 
+    let obfs = qget(&q, "obfs-password")
+        .or_else(|| qget(&q, "obfsParam"))
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
+    let (obfs_type, obfs_min_packet_size, obfs_max_packet_size) = if is_v1 {
+        (None, None, None)
+    } else {
+        let obfs_type = if let Some(raw) = qget(&q, "obfs") {
+            Some(hysteria_obfs_type_token(raw))
+        } else if qget(&q, "min_packet_size").is_some() || qget(&q, "max_packet_size").is_some() {
+            Some("gecko".into())
+        } else {
+            None
+        };
+        (
+            obfs_type,
+            query_packet_size(&q, "min_packet_size"),
+            query_packet_size(&q, "max_packet_size"),
+        )
+    };
     let outbound = ParsedOutbound {
         server: Some(host),
         server_port: port.or(Some(443)),
         password: auth,
-        obfs: qget(&q, "obfs-password")
-            .or_else(|| qget(&q, "obfsParam"))
-            .map(|s| s.to_string()),
-        up_mbps: qget(&q, "upmbps").and_then(|s| s.parse().ok()),
-        down_mbps: qget(&q, "downmbps").and_then(|s| s.parse().ok()),
+        obfs,
+        obfs_type,
+        obfs_min_packet_size,
+        obfs_max_packet_size,
+        up_mbps: qget(&q, "upmbps").and_then(positive_bandwidth),
+        down_mbps: qget(&q, "downmbps").and_then(positive_bandwidth),
         tls: Some(true),
         sni: qget(&q, "sni").map(|s| s.to_string()),
         insecure: qget(&q, "insecure").map(|s| s == "1" || s.eq_ignore_ascii_case("true")),
@@ -578,5 +599,149 @@ fn finish(
         profile_type,
         outbound,
         source: source.to_string(),
+    }
+}
+
+fn positive_bandwidth(text: &str) -> Option<u32> {
+    let mbps = clash_bandwidth_to_mbps(text);
+    (mbps > 0).then_some(mbps)
+}
+
+/// Upstream `hysteriaObfsType`: `none`, `plain`, and blank turn obfuscation off.
+fn hysteria_obfs_type_token(raw: &str) -> String {
+    let kind = raw.trim().to_ascii_lowercase();
+    if kind.is_empty() || kind == "none" || kind == "plain" {
+        String::new()
+    } else {
+        kind
+    }
+}
+
+fn query_packet_size(q: &[(String, String)], key: &str) -> Option<u32> {
+    let text = qget(q, key)?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// Upstream `clashBandwidthToMbps`.
+///
+/// A bare number is already Mbps. A prefix or a `b`/`B` unit scales it:
+/// an empty prefix is 1e-6, `K` 1e-3, `M` 1, `G` 1e3, `T` 1e6, and `B` multiplies
+/// by 8. The trailing `ps` alternative is not a unit, so `100ps` stays 100.
+/// Positive results are rounded and at least 1. Anything else is 0.
+fn clash_bandwidth_to_mbps(text: &str) -> u32 {
+    let bytes = text.trim().as_bytes();
+    let mut index = 0;
+    if index >= bytes.len() || !bytes[index].is_ascii_digit() {
+        return 0;
+    }
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        index += 1;
+    }
+    if index < bytes.len() && bytes[index] == b'.' {
+        let fraction = index + 1;
+        if fraction < bytes.len() && bytes[fraction].is_ascii_digit() {
+            index = fraction + 1;
+            while index < bytes.len() && bytes[index].is_ascii_digit() {
+                index += 1;
+            }
+        }
+    }
+    let Ok(number_text) = std::str::from_utf8(&bytes[..index]) else {
+        return 0;
+    };
+    let Ok(number) = number_text.parse::<f64>() else {
+        return 0;
+    };
+    if !number.is_finite() {
+        return 0;
+    }
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    let mut prefix = None;
+    if index < bytes.len() && matches!(bytes[index].to_ascii_lowercase(), b'k' | b'm' | b'g' | b't')
+    {
+        prefix = Some(bytes[index].to_ascii_lowercase());
+        index += 1;
+    }
+    let mut unit_is_byte = false;
+    let mut saw_unit = false;
+    if bytes.get(index) == Some(&b'b') || bytes.get(index) == Some(&b'B') {
+        saw_unit = true;
+        unit_is_byte = bytes[index] == b'B';
+        index += 1;
+        if bytes.get(index..index + 2) == Some(b"ps") || bytes.get(index..index + 2) == Some(b"/s")
+        {
+            index += 2;
+        }
+    } else if bytes.get(index..index + 2) == Some(b"ps") {
+        index += 2;
+    }
+    if index != bytes.len() {
+        return 0;
+    }
+    let mut mbps = number;
+    if prefix.is_some() || saw_unit {
+        let scale = match prefix {
+            None => 1e-6,
+            Some(b'k') => 1e-3,
+            Some(b'm') => 1.0,
+            Some(b'g') => 1e3,
+            Some(b't') => 1e6,
+            Some(_) => return 0,
+        };
+        let scale = if unit_is_byte { scale * 8.0 } else { scale };
+        mbps = number * scale;
+    }
+    if !(mbps > 0.0) || !mbps.is_finite() {
+        return 0;
+    }
+    let rounded = mbps.min(i32::MAX as f64).round();
+    if rounded < 1.0 {
+        1
+    } else {
+        rounded as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clash_bandwidth_matches_upstream_units() {
+        assert_eq!(clash_bandwidth_to_mbps("100"), 100);
+        assert_eq!(clash_bandwidth_to_mbps("100 Mbps"), 100);
+        assert_eq!(clash_bandwidth_to_mbps("50 MB/s"), 400);
+        assert_eq!(clash_bandwidth_to_mbps("1 Gbps"), 1000);
+        assert_eq!(clash_bandwidth_to_mbps("nope"), 0);
+        assert_eq!(clash_bandwidth_to_mbps("100kbps"), 1);
+        assert_eq!(clash_bandwidth_to_mbps("100ps"), 100);
+    }
+
+    #[test]
+    fn hysteria2_none_keeps_password_and_disables_obfs() {
+        let profile =
+            parse_share_link("hysteria2://pw@h.example:443?obfs=none&obfs-password=keep#n")
+                .expect("hysteria2 link");
+        assert_eq!(profile.profile_type, ProfileType::Hysteria2);
+        assert_eq!(profile.outbound.obfs.as_deref(), Some("keep"));
+        assert_eq!(profile.outbound.obfs_type.as_deref(), Some(""));
+        assert!(profile.outbound.hysteria2_obfs_value().is_none());
+    }
+
+    #[test]
+    fn hysteria_v1_parses_bandwidth_strings() {
+        let profile = parse_share_link(
+            "hysteria://h.example:443?auth=tok&upmbps=100%20Mbps&downmbps=50%20MB%2Fs",
+        )
+        .expect("hysteria link");
+        assert_eq!(profile.profile_type, ProfileType::Hysteria);
+        assert_eq!(profile.outbound.password.as_deref(), Some("tok"));
+        assert_eq!(profile.outbound.up_mbps, Some(100));
+        assert_eq!(profile.outbound.down_mbps, Some(400));
     }
 }

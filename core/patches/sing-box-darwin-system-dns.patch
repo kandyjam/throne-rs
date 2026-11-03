@@ -1,20 +1,19 @@
 --- a/dns/transport/local/systemconfig/source_darwin.go
 +++ b/dns/transport/local/systemconfig/source_darwin.go
-@@ -117,6 +117,7 @@
+@@ -4,6 +4,8 @@
+ 
  import (
  	"context"
- 	"encoding/binary"
 +	"net"
- 	"net/netip"
- 	"strconv"
++	"net/netip"
  	"sync"
-@@ -134,16 +135,22 @@
+ 	"time"
+ 
+@@ -19,14 +21,20 @@
  
  type Source struct {
  	interfaceMonitor tun.DefaultInterfaceMonitor
 -	access           sync.Mutex
--	notifyToken      C.int
--	notifyValid      bool
 -	stale            bool
 -	interfaceIndex   int
 -	config           *Config
@@ -22,22 +21,20 @@
 +		SystemDNSOverride(string) (string, []string, bool)
 +	}
 +	access         sync.Mutex
-+	notifyToken    C.int
-+	notifyValid    bool
 +	stale          bool
 +	interfaceIndex int
 +	config         *Config
  }
  
  func NewSource(ctx context.Context) *Source {
- 	source := &Source{
+ 	return &Source{
 +		dnsOverride: service.FromContext[interface {
 +			SystemDNSOverride(string) (string, []string, bool)
 +		}](ctx),
  		interfaceMonitor: service.FromContext[adapter.NetworkManager](ctx).InterfaceMonitor(),
  	}
- 	if C.box_dnsinfo_load() != 0 {
-@@ -179,7 +186,9 @@
+ }
+@@ -53,7 +61,9 @@
  	if s.interfaceMonitor != nil {
  		myInterfaces = s.interfaceMonitor.MyInterfaces()
  	}
@@ -48,9 +45,9 @@
  	if s.config != nil && config.Equal(s.config) {
  		return s.config
  	}
-@@ -367,3 +376,65 @@
+@@ -108,3 +118,65 @@
  	}
- 	return port
+ 	return config
  }
 +
 +// The owner retains static DNS before redirecting the system resolver. DHCP is

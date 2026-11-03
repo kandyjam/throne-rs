@@ -404,21 +404,93 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-fn has_fresh_result(member: &Profile, selector: &AutoSelectorConfig) -> bool {
-    if member.latency_ms == 0 {
+fn has_fresh_result(member: &Profile, selector: &AutoSelectorConfig, now: i64) -> bool {
+    if member.latency_ms == 0 || selector.result_validity_mins <= 0 {
         return false;
     }
-    // Without a dedicated latency_at column, any non-zero result is treated as
-    // fresh when the validity window is enabled.
-    selector.result_validity_mins > 0
+    // Rows written before the timestamp column existed carry 0: expired, not fresh.
+    if member.latency_at <= 0 {
+        return false;
+    }
+    (now - member.latency_at) <= i64::from(selector.result_validity_mins) * 60
 }
 
-fn effective_latency(member: &Profile, selector: &AutoSelectorConfig) -> i32 {
-    if has_fresh_result(member, selector) {
+fn effective_latency(member: &Profile, selector: &AutoSelectorConfig, now: i64) -> i32 {
+    if has_fresh_result(member, selector, now) {
         member.latency_ms
     } else {
         0
     }
+}
+
+/// Upstream `AutoSelectorStartQuorum` after `Normalize`.
+///
+/// The native Start path still builds from stored results; this value is the
+/// count of working members upstream waits for before the first start.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn start_quorum(selector: &AutoSelectorConfig) -> i32 {
+    let mut cfg = selector.clone();
+    cfg.normalize();
+    cfg.expected.max(cfg.active_size).min(cfg.build_limit)
+}
+
+/// A member works when its effective latency is a positive fresh measurement.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn member_works(selector: &AutoSelectorConfig, member: &Profile, now: i64) -> bool {
+    effective_latency(member, selector, now) > 0
+}
+
+/// Upstream `AutoSelectorBuildChanged`.
+///
+/// An errored plan is unchanged. A missing previously built id changes the
+/// build. A newly built id changes it only when that member is known to work;
+/// an unmeasured addition does not.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn selector_build_changed(
+    last_built: &[ProfileId],
+    next_build: &[ProfileId],
+    plan_error: bool,
+    works: impl Fn(ProfileId) -> bool,
+) -> bool {
+    if plan_error {
+        return false;
+    }
+    let next: std::collections::HashSet<_> = next_build.iter().copied().collect();
+    if last_built.iter().any(|id| !next.contains(id)) {
+        return true;
+    }
+    let built: std::collections::HashSet<_> = last_built.iter().copied().collect();
+    next_build
+        .iter()
+        .any(|id| !built.contains(id) && works(*id))
+}
+
+/// Upstream `AutoSelectorUnmeasuredCandidates`.
+///
+/// Stale ids and zero effective latency are still needed. A positive latency
+/// increments the working count. A fresh failure is neither.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn unmeasured_candidates(
+    eligible: &[ProfileId],
+    stale: &[ProfileId],
+    effective_latency_of: impl Fn(ProfileId) -> i32,
+) -> (Vec<ProfileId>, i32) {
+    let stale_set: std::collections::HashSet<_> = stale.iter().copied().collect();
+    let mut needed = Vec::new();
+    let mut working = 0i32;
+    for &id in eligible {
+        if stale_set.contains(&id) {
+            needed.push(id);
+            continue;
+        }
+        let latency = effective_latency_of(id);
+        if latency == 0 {
+            needed.push(id);
+        } else if latency > 0 {
+            working += 1;
+        }
+    }
+    (needed, working)
 }
 
 fn latency_rank(latency: i32) -> i32 {
@@ -431,12 +503,42 @@ fn latency_rank(latency: i32) -> i32 {
     }
 }
 
-fn country_set(filter: &str) -> Vec<String> {
-    filter
-        .split(',')
-        .map(|s| s.trim().to_ascii_uppercase())
-        .filter(|s| !s.is_empty())
-        .collect()
+struct CountryFilter {
+    includes: Vec<String>,
+    excludes: Vec<String>,
+}
+
+/// Split `country_filter` the way upstream `buildFilters` does.
+///
+/// A `!` prefix is an exclusion. Tokens are trimmed, then uppercased. An empty
+/// token, including a bare `!`, is skipped. `Qt::SkipEmptyParts` drops empty
+/// split pieces before that trim.
+fn country_filter(filter: &str) -> CountryFilter {
+    let mut includes = Vec::new();
+    let mut excludes = Vec::new();
+    for item in filter.split(',') {
+        if item.is_empty() {
+            continue;
+        }
+        let mut code = item.trim().to_string();
+        if code.is_empty() {
+            continue;
+        }
+        let exclude = code.starts_with('!');
+        if exclude {
+            code = code[1..].trim().to_string();
+        }
+        if code.is_empty() {
+            continue;
+        }
+        let code = code.to_ascii_uppercase();
+        if exclude {
+            excludes.push(code);
+        } else {
+            includes.push(code);
+        }
+    }
+    CountryFilter { includes, excludes }
 }
 
 /// Case-insensitive substring match; `*` wildcards expand to "contains segments".
@@ -576,6 +678,7 @@ fn member_skip(
     member: Option<&Profile>,
     selector: &AutoSelectorConfig,
     group: Option<&Group>,
+    now: i64,
 ) -> Option<AutoSelectorSkip> {
     let Some(member) = member else {
         return Some(AutoSelectorSkip::Missing);
@@ -605,15 +708,22 @@ fn member_skip(
     if !name_filter_matches(&selector.name_filter, &member.name) {
         return Some(AutoSelectorSkip::NameFilter);
     }
-    let countries = country_set(&selector.country_filter);
-    if !countries.is_empty()
-        && !countries
-            .iter()
-            .any(|c| c.eq_ignore_ascii_case(member.test_country.trim()))
-    {
-        return Some(AutoSelectorSkip::CountryFilter);
+    let countries = country_filter(&selector.country_filter);
+    if !countries.includes.is_empty() || !countries.excludes.is_empty() {
+        // An exclusion cannot vouch for a profile that was never IP-tested.
+        let country = member.test_country.trim().to_ascii_uppercase();
+        if country.is_empty()
+            || countries.excludes.iter().any(|code| code == &country)
+            || (!countries.includes.is_empty()
+                && !countries.includes.iter().any(|code| code == &country))
+        {
+            return Some(AutoSelectorSkip::CountryFilter);
+        }
     }
-    if selector.exclude_unavailable && member.latency_ms < 0 && has_fresh_result(member, selector) {
+    if selector.exclude_unavailable
+        && member.latency_ms < 0
+        && has_fresh_result(member, selector, now)
+    {
         return Some(AutoSelectorSkip::Unavailable);
     }
     None
@@ -655,6 +765,7 @@ pub fn plan_auto_selector_groups(
         .iter()
         .filter_map(|id| groups.iter().copied().find(|g| g.id == *id))
         .collect();
+    let now = now_secs();
     let mut plan = AutoSelectorPlan {
         missing_groups: selector.gids.len().saturating_sub(groups.len()),
         pool_cap_used: selector.pool_cap,
@@ -693,7 +804,7 @@ pub fn plan_auto_selector_groups(
             }
             plan.members_in_group += 1;
             let member = lookup(id);
-            if let Some(skip) = member_skip(member.as_ref(), selector, Some(group)) {
+            if let Some(skip) = member_skip(member.as_ref(), selector, Some(group), now) {
                 if skip == AutoSelectorSkip::Unavailable {
                     unavailable.push(id);
                 }
@@ -701,7 +812,7 @@ pub fn plan_auto_selector_groups(
                 continue;
             }
             if let Some(m) = member.as_ref() {
-                if effective_latency(m, selector) > 0 {
+                if effective_latency(m, selector, now) > 0 {
                     plan.ranked_by_test += 1;
                 }
             }
@@ -737,10 +848,10 @@ pub fn plan_auto_selector_groups(
         .collect();
     newcomers.sort_by(|&a, &b| {
         let la = lookup(a)
-            .map(|m| effective_latency(&m, selector))
+            .map(|m| effective_latency(&m, selector, now))
             .unwrap_or(0);
         let lb = lookup(b)
-            .map(|m| effective_latency(&m, selector))
+            .map(|m| effective_latency(&m, selector, now))
             .unwrap_or(0);
         let ra = latency_rank(la);
         let rb = latency_rank(lb);
@@ -768,7 +879,7 @@ pub fn plan_auto_selector_groups(
             .iter()
             .filter(|&&id| {
                 lookup(id)
-                    .map(|m| effective_latency(&m, selector) == 0)
+                    .map(|m| effective_latency(&m, selector, now) == 0)
                     .unwrap_or(true)
             })
             .count();
@@ -796,6 +907,7 @@ pub fn rerank_auto_selector_groups(
     groups: &[&Group],
     lookup: impl Fn(ProfileId) -> Option<Profile>,
 ) -> Vec<ProfileId> {
+    let now = now_secs();
     let dummy = Profile::new(
         selector_profile_id,
         selector.gid,
@@ -809,10 +921,10 @@ pub fn rerank_auto_selector_groups(
     let mut members = plan.pool;
     members.sort_by(|&a, &b| {
         let la = lookup(a)
-            .map(|m| effective_latency(&m, selector))
+            .map(|m| effective_latency(&m, selector, now))
             .unwrap_or(0);
         let lb = lookup(b)
-            .map(|m| effective_latency(&m, selector))
+            .map(|m| effective_latency(&m, selector, now))
             .unwrap_or(0);
         let ra = latency_rank(la);
         let rb = latency_rank(lb);
@@ -846,6 +958,10 @@ mod tests {
     fn make_node(id: ProfileId, gid: GroupId, name: &str, latency: i32) -> Profile {
         let mut p = Profile::new(id, gid, name, ProfileType::Vless);
         p.latency_ms = latency;
+        // A non-zero result is fresh only when latency_at falls inside the window.
+        if latency != 0 {
+            p.latency_at = now_secs();
+        }
         p.outbound.server = Some(format!("{name}.example.com"));
         p.outbound.server_port = Some(443);
         p
@@ -1041,5 +1157,112 @@ mod tests {
             .skipped
             .iter()
             .any(|(s, _)| *s == AutoSelectorSkip::Unavailable));
+    }
+
+    fn plan_countries(filter: &str, nodes: Vec<Profile>) -> AutoSelectorPlan {
+        let mut map = HashMap::new();
+        let ids: Vec<_> = nodes.iter().map(|p| p.id).collect();
+        for node in nodes {
+            map.insert(node.id, node);
+        }
+        let selector_profile = Profile::new(99, 10, "auto", ProfileType::AutoSelector);
+        let mut cfg = AutoSelectorConfig::new_for_group(10, "auto");
+        cfg.country_filter = filter.into();
+        let group = make_group(10, &ids);
+        plan_auto_selector(&selector_profile, &cfg, Some(&group), |id| {
+            map.get(&id).cloned()
+        })
+    }
+
+    #[test]
+    fn country_exclusion_skips_named_codes_and_unknowns() {
+        let mut us = make_node(1, 10, "us", 40);
+        us.test_country = "us".into();
+        let mut jp = make_node(2, 10, "jp", 50);
+        jp.test_country = " jp ".into();
+        let mut unknown = make_node(3, 10, "unknown", 30);
+        unknown.test_country = "  ".into();
+        let plan = plan_countries("US, !JP, !, ,", vec![us, jp, unknown]);
+        assert_eq!(plan.build, vec![1], "{:?}", plan.skipped);
+        assert!(plan
+            .skipped
+            .iter()
+            .any(|(s, n)| *s == AutoSelectorSkip::CountryFilter && *n == 2));
+    }
+
+    #[test]
+    fn exclusion_only_keeps_a_known_country() {
+        let mut de = make_node(1, 10, "de", 40);
+        de.test_country = "de".into();
+        let mut ru = make_node(2, 10, "ru", 20);
+        ru.test_country = "RU".into();
+        let plan = plan_countries("!ru", vec![de, ru]);
+        assert_eq!(plan.build, vec![1]);
+    }
+
+    #[test]
+    fn stale_latency_does_not_rank_or_exclude() {
+        let mut fresh = make_node(1, 10, "fresh", 80);
+        fresh.latency_at = now_secs();
+        let mut expired = make_node(2, 10, "expired", 10);
+        expired.latency_at =
+            now_secs() - i64::from(AutoSelectorConfig::default().result_validity_mins) * 60 - 5;
+        let mut failed_old = make_node(3, 10, "old-fail", -1);
+        failed_old.latency_at = 0;
+        let selector_profile = Profile::new(99, 10, "auto", ProfileType::AutoSelector);
+        let mut cfg = AutoSelectorConfig::new_for_group(10, "auto");
+        cfg.exclude_unavailable = true;
+        let group = make_group(10, &[1, 2, 3]);
+        let map = HashMap::from([(1, fresh), (2, expired.clone()), (3, failed_old)]);
+        let plan = plan_auto_selector(&selector_profile, &cfg, Some(&group), |id| {
+            map.get(&id).cloned()
+        });
+        assert_eq!(plan.build[0], 1);
+        assert!(plan.build.contains(&2) && plan.build.contains(&3));
+        assert!(!member_works(&cfg, &expired, now_secs()));
+        assert!(!plan
+            .skipped
+            .iter()
+            .any(|(s, _)| *s == AutoSelectorSkip::Unavailable));
+    }
+
+    #[test]
+    fn start_quorum_follows_normalized_active_size() {
+        let mut cfg = AutoSelectorConfig::default();
+        cfg.expected = 10;
+        cfg.active_size = 4;
+        cfg.build_limit = 300;
+        assert_eq!(start_quorum(&cfg), 10);
+
+        cfg.expected = 20;
+        cfg.active_size = 8;
+        cfg.build_limit = 5;
+        assert_eq!(start_quorum(&cfg), 5);
+
+        cfg.expected = 0;
+        cfg.active_size = 0;
+        cfg.build_limit = 300;
+        assert_eq!(start_quorum(&cfg), 1);
+    }
+
+    #[test]
+    fn build_changed_ignores_unmeasured_additions() {
+        assert!(!selector_build_changed(&[1], &[1, 2], true, |_| true));
+        assert!(selector_build_changed(&[1, 2], &[1], false, |_| false));
+        assert!(selector_build_changed(&[1], &[1, 2], false, |id| id == 2));
+        assert!(!selector_build_changed(&[1], &[1, 2], false, |_| false));
+        assert!(!selector_build_changed(&[1, 2], &[2, 1], false, |_| true));
+    }
+
+    #[test]
+    fn unmeasured_candidates_count_stale_and_working() {
+        let (needed, working) = unmeasured_candidates(&[1, 2, 3, 4], &[2], |id| match id {
+            1 => 40,
+            2 => 40,
+            3 => 0,
+            _ => -1,
+        });
+        assert_eq!(needed, vec![2, 3]);
+        assert_eq!(working, 1);
     }
 }
