@@ -1517,43 +1517,130 @@ fn build_xray_full_member(
     })
 }
 
-/// Share-link XHTTP is stored as Xray VLESS, with the same `xrayfullconfig` document
-/// Custom profiles use. Start must bridge either shape.
+/// Xray VLESS and Custom Xray full configs both run behind a local socks bridge.
+///
+/// The stored profile stays the upstream bean. The bridge document is built here.
 fn bridges_xray_full(profile: &Profile) -> bool {
-    if is_xray_full_config_member(profile) {
+    if profile.profile_type == ProfileType::XrayVless || is_xray_full_config_member(profile) {
         return true;
     }
     serde_json::from_str::<Value>(&profile.outbound_json)
         .ok()
-        .and_then(|value| {
-            value
-                .get("subtype")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .is_some_and(|subtype| {
-            matches!(
-                subtype.as_str(),
-                "xrayfullconfig" | "xray_full" | "xray-full"
-            )
-        })
+        .is_some_and(|value| xray_full_subtype(&value) || upstream_xray_vless_bean(&value))
+}
+
+fn xray_full_subtype(value: &Value) -> bool {
+    value
+        .get("subtype")
+        .and_then(Value::as_str)
+        .is_some_and(|subtype| matches!(subtype, "xrayfullconfig" | "xray_full" | "xray-full"))
+}
+
+fn upstream_xray_vless_bean(value: &Value) -> bool {
+    value.get("protocol").and_then(Value::as_str) == Some("vless")
+        && value
+            .pointer("/settings/address")
+            .and_then(Value::as_str)
+            .is_some_and(|address| !address.is_empty())
 }
 
 fn xray_full_config_raw(profile: &Profile) -> Option<String> {
-    if let Ok(v) = serde_json::from_str::<Value>(&profile.outbound_json) {
-        if let Some(cfg) = v.get("config").and_then(|c| c.as_str()) {
-            if !cfg.trim().is_empty() {
-                return Some(cfg.to_string());
-            }
+    let from_value = |value: &Value| -> Option<String> {
+        if let Some(cfg) = value
+            .get("config")
+            .and_then(Value::as_str)
+            .filter(|cfg| !cfg.trim().is_empty())
+        {
+            return Some(cfg.to_string());
         }
-        // Entire outbound_json may itself be the Xray document.
-        if v.get("outbounds").is_some() && v.get("protocol").is_none() {
-            if let Ok(s) = serde_json::to_string(&v) {
-                return Some(s);
+        if value.get("outbounds").is_some() && value.get("protocol").is_none() {
+            return serde_json::to_string(value).ok();
+        }
+        xray_vless_bean_document(value)
+    };
+    if let Ok(value) = serde_json::from_str::<Value>(&profile.outbound_json) {
+        if let Some(raw) = from_value(&value) {
+            return Some(raw);
+        }
+    }
+    profile
+        .outbound
+        .raw_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|value| from_value(&value))
+        .or_else(|| profile.outbound.raw_json.clone())
+}
+
+/// Turn `xrayVless::ExportToJson` into the full document the socks bridge runs.
+///
+/// The bundled core dials standard `vnext`. Original Throne stores the flat
+/// `settings.address` bean, so this conversion stays out of the database.
+fn xray_vless_bean_document(bean: &Value) -> Option<String> {
+    if !upstream_xray_vless_bean(bean) {
+        return None;
+    }
+    let settings = bean.get("settings")?;
+    let address = settings.get("address")?.as_str()?;
+    let port = settings.get("port").and_then(Value::as_u64).unwrap_or(443);
+    let id = settings.get("id").and_then(Value::as_str).unwrap_or("");
+    let encryption = settings
+        .get("encryption")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("none");
+    let mut user = json!({"id": id, "encryption": encryption});
+    if let Some(flow) = settings
+        .get("flow")
+        .and_then(Value::as_str)
+        .filter(|flow| !flow.is_empty() && !flow.eq_ignore_ascii_case("none"))
+    {
+        user["flow"] = json!(flow);
+    }
+    let mut stream = bean
+        .get("streamSettings")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if let Some(reality) = stream
+        .get_mut("realitySettings")
+        .and_then(Value::as_object_mut)
+    {
+        let has_public = reality
+            .get("publicKey")
+            .and_then(Value::as_str)
+            .is_some_and(|key| !key.is_empty());
+        if !has_public {
+            if let Some(password) = reality
+                .get("password")
+                .and_then(Value::as_str)
+                .filter(|key| !key.is_empty())
+            {
+                let password = password.to_string();
+                reality.insert("publicKey".into(), json!(password));
             }
         }
     }
-    profile.outbound.raw_json.clone()
+    let mut outbound = json!({
+        "tag": bean.get("tag").and_then(Value::as_str).filter(|tag| !tag.is_empty()).unwrap_or("proxy"),
+        "protocol": "vless",
+        "settings": {
+            "vnext": [{
+                "address": address,
+                "port": port,
+                "users": [user]
+            }]
+        }
+    });
+    if stream.as_object().is_some_and(|object| !object.is_empty()) {
+        outbound["streamSettings"] = stream;
+    }
+    if bean
+        .get("mux")
+        .is_some_and(|mux| mux.as_object().is_some_and(|object| !object.is_empty()))
+    {
+        outbound["mux"] = bean["mux"].clone();
+    }
+    serde_json::to_string(&json!({"outbounds": [outbound]})).ok()
 }
 
 fn member_uses_xray_sidecar(member: &Profile) -> bool {
@@ -2920,6 +3007,9 @@ fn collect_outbound_server_domains(profile: &Profile) -> Vec<String> {
         if let Some(s) = v.get("server").and_then(|x| x.as_str()) {
             push(s);
         }
+        if let Some(s) = v.pointer("/settings/address").and_then(Value::as_str) {
+            push(s);
+        }
         if let Some(peers) = v.get("peers").and_then(Value::as_array) {
             for peer in peers {
                 if let Some(address) = peer["address"].as_str() {
@@ -3082,6 +3172,49 @@ mod tests {
             "/7728c2990164a8f9"
         );
         assert_eq!(xray["inbounds"][0]["protocol"], "socks");
+        let saved: Value = serde_json::from_str(&profile.outbound_json).unwrap();
+        assert_eq!(saved["protocol"], "vless");
+        assert!(saved.get("subtype").is_none());
+        assert!(saved.pointer("/settings/vnext").is_none());
+    }
+
+    #[test]
+    fn upstream_xray_vless_bean_starts_without_a_stored_wrapper() {
+        let mut profile = Profile::new(1, 1, "xray-usw1", ProfileType::XrayVless);
+        profile.outbound_json = r#"{"tag":"xray-usw1","protocol":"vless","settings":{"address":"edge.example","port":443,"id":"34b67040-a3d5-42e1-ab6b-6e9c7903e7ae","encryption":"none"},"streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"serverName":"edge.example","fingerprint":"chrome"},"xhttpSettings":{"path":"/7728c2990164a8f9","mode":"auto"}}}"#.into();
+        let built = build_load_config(&profile, &AppSettings::default(), None).unwrap();
+        assert_eq!(built.xray_full_configs.len(), 1);
+        let xray: Value = serde_json::from_str(&built.xray_full_configs[0]).unwrap();
+        assert_eq!(
+            xray["outbounds"][0]["settings"]["vnext"][0]["users"][0]["id"],
+            "34b67040-a3d5-42e1-ab6b-6e9c7903e7ae"
+        );
+        assert_eq!(
+            xray["outbounds"][0]["streamSettings"]["xhttpSettings"]["path"],
+            "/7728c2990164a8f9"
+        );
+        assert!(xray["outbounds"][0]["settings"].get("address").is_none());
+        assert_eq!(xray["inbounds"][0]["protocol"], "socks");
+    }
+
+    #[test]
+    fn saved_xray_full_wrapper_still_bridges() {
+        let config = json!({"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"edge.example","port":443,"users":[{"id":"id","encryption":"none"}]}]},"streamSettings":{"network":"xhttp","xhttpSettings":{"path":"/x"}}}]});
+        let mut profile = Profile::new(1, 1, "old", ProfileType::XrayVless);
+        profile.outbound_json = json!({
+            "type": "custom",
+            "subtype": "xrayfullconfig",
+            "config": config.to_string(),
+            "server": "edge.example",
+            "server_port": 443
+        })
+        .to_string();
+        let built = build_load_config(&profile, &AppSettings::default(), None).unwrap();
+        let xray: Value = serde_json::from_str(&built.xray_full_configs[0]).unwrap();
+        assert_eq!(
+            xray["outbounds"][0]["settings"]["vnext"][0]["address"],
+            "edge.example"
+        );
     }
 
     #[test]

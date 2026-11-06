@@ -52,7 +52,6 @@ fn whole_certificate_pins_are_validated_and_not_confused_with_public_key_pins() 
 }
 
 #[test]
-#[test]
 fn cloady_xhttp_link_imports_as_xray_vless_with_decoded_path() {
     let link = "vless://34b67040-a3d5-42e1-ab6b-6e9c7903e7ae@xray-e0vuv8l6-workspace-5fszck.cloady.io:443?encryption=none&security=tls&sni=xray-e0vuv8l6-workspace-5fszck.cloady.io&fp=chrome&type=xhttp&path=%2F7728c2990164a8f9&mode=auto&packetEncoding=xudp#xray-usw1";
     let report = import_text(link);
@@ -79,29 +78,47 @@ fn cloady_xhttp_link_imports_as_xray_vless_with_decoded_path() {
     assert_eq!(imported.outbound.packet_encoding.as_deref(), Some("xudp"));
 
     let saved = imported.outbound.to_db_json(imported.profile_type);
-    let reloaded: throne_domain::ParsedOutbound = serde_json::from_str(&saved).unwrap();
-    assert_eq!(reloaded.server, imported.outbound.server);
-    assert_eq!(reloaded.uuid, imported.outbound.uuid);
-    assert_eq!(reloaded.path.as_deref(), Some("/7728c2990164a8f9"));
     let bean: Value = serde_json::from_str(&saved).unwrap();
-    let config: Value = serde_json::from_str(bean["config"].as_str().unwrap()).unwrap();
-    let stream = &config["outbounds"][0]["streamSettings"];
+    assert_eq!(bean["protocol"], "vless");
+    assert_eq!(bean["tag"], "xray-usw1");
+    assert!(bean.get("type").is_none());
+    assert!(bean.get("subtype").is_none());
+    assert!(bean.get("packetEncoding").is_none());
+    assert_eq!(
+        bean["settings"]["address"],
+        "xray-e0vuv8l6-workspace-5fszck.cloady.io"
+    );
+    assert_eq!(bean["settings"]["port"], 443);
+    assert_eq!(
+        bean["settings"]["id"],
+        "34b67040-a3d5-42e1-ab6b-6e9c7903e7ae"
+    );
+    assert_eq!(bean["settings"]["encryption"], "none");
+    assert!(bean["settings"].get("flow").is_none());
+    let stream = &bean["streamSettings"];
+    assert_eq!(stream["network"], "xhttp");
+    assert_eq!(stream["security"], "tls");
     assert_eq!(stream["xhttpSettings"]["path"], "/7728c2990164a8f9");
     assert_eq!(stream["xhttpSettings"]["mode"], "auto");
+    assert!(stream["xhttpSettings"].get("host").is_none());
     assert_eq!(stream["tlsSettings"]["fingerprint"], "chrome");
     assert_eq!(
         stream["tlsSettings"]["serverName"],
         "xray-e0vuv8l6-workspace-5fszck.cloady.io"
     );
+    let mut reloaded = throne_domain::ParsedOutbound::default();
+    reloaded.hydrate_xray_vless_fields(&bean);
+    assert_eq!(reloaded.server, imported.outbound.server);
+    assert_eq!(reloaded.uuid, imported.outbound.uuid);
+    assert_eq!(reloaded.path.as_deref(), Some("/7728c2990164a8f9"));
 
     let mut profile = Profile::new(1, 1, &imported.name, imported.profile_type);
     profile.outbound_json = saved;
-    profile.outbound = reloaded;
     assert_eq!(
         profile.display_address(),
         "xray-e0vuv8l6-workspace-5fszck.cloady.io:443"
     );
-    assert_eq!(profile.display_type(), "Xray VLESS");
+    assert_eq!(profile.display_type(), "VLESS (Xray)");
     let security = throne_domain::profile_security(&profile, false);
     assert_eq!(security.display(), "XHTTP+TLS");
 }
@@ -115,9 +132,9 @@ fn xhttp_strict_json_values_survive_and_use_the_xray_bridge() {
     assert_eq!(profile.profile_type, ProfileType::XrayVless);
     let out: Value =
         serde_json::from_str(&profile.outbound.to_db_json(profile.profile_type)).unwrap();
-    assert_eq!(out["subtype"], "xrayfullconfig");
-    let config: Value = serde_json::from_str(out["config"].as_str().unwrap()).unwrap();
-    let stream = &config["outbounds"][0]["streamSettings"];
+    assert_eq!(out["protocol"], "vless");
+    assert!(out.get("subtype").is_none());
+    let stream = &out["streamSettings"];
     assert_eq!(
         stream["xhttpSettings"]["extra"]["headers"]["X-Value"],
         "True's A+B"
@@ -148,10 +165,8 @@ fn xhttp_form_and_python_repr_preserve_string_contents() {
         let out = imported_json(&format!(
             "vless://id@edge.example:443?type=xhttp&extra={encoded}"
         ));
-        let config: Value = serde_json::from_str(out["config"].as_str().unwrap()).unwrap();
         assert_eq!(
-            config["outbounds"][0]["streamSettings"]["xhttpSettings"]["extra"]["headers"]
-                ["X-Token"],
+            out["streamSettings"]["xhttpSettings"]["extra"]["headers"]["X-Token"],
             expected
         );
     }
@@ -194,14 +209,14 @@ fn wireguard_json_import_recovers_peer_display_fields() {
 fn mixed_case_xhttp_security_preserves_tls_and_reality_options() {
     for (security, key) in [("TLS", "tlsSettings"), ("ReAliTy", "realitySettings")] {
         let out = imported_json(&format!("vless://id@edge.example:443?security={security}&type=xhttp&sni=identity.example&pbk=pub&ech=public.example"));
-        let config: Value = serde_json::from_str(out["config"].as_str().unwrap()).unwrap();
-        let stream = &config["outbounds"][0]["streamSettings"];
+        let stream = &out["streamSettings"];
         assert_eq!(stream["security"], security.to_lowercase());
         assert_eq!(stream[key]["serverName"], "identity.example");
         if key == "tlsSettings" {
             assert_eq!(stream[key]["echConfigList"], "public.example");
         } else {
-            assert_eq!(stream[key]["publicKey"], "pub");
+            assert_eq!(stream[key]["password"], "pub");
+            assert!(stream[key].get("fingerprint").is_none());
         }
     }
 }

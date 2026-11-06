@@ -212,9 +212,11 @@ pub(crate) fn xhttp_profile(
     query: &[(String, String)],
     source: &str,
 ) -> Option<ImportedProfile> {
-    let mut xhttp =
-        json!({"path":o.path.as_deref().unwrap_or("/"),"mode":get(query,"mode").unwrap_or("auto")});
-    if let Some(host) = &o.host {
+    let mut xhttp = json!({
+        "path": o.path.as_deref().filter(|path| !path.is_empty()).unwrap_or("/"),
+        "mode": get(query, "mode").filter(|mode| !mode.is_empty()).unwrap_or("auto"),
+    });
+    if let Some(host) = o.host.as_deref().filter(|host| !host.is_empty()) {
         xhttp["host"] = json!(host);
     }
     if let Some(extra) = get(query, "extra") {
@@ -223,40 +225,62 @@ pub(crate) fn xhttp_profile(
     let security = o.security.as_deref().unwrap_or("none").to_ascii_lowercase();
     let mut stream = json!({"network":"xhttp","security":security,"xhttpSettings":xhttp});
     if security == "tls" {
-        let mut tls = json!({});
+        // xrayTLS::ExportToJson always writes serverName, even when it is empty.
+        let mut tls = json!({"serverName": o.sni.as_deref().unwrap_or("")});
         for (query_key, key) in [
-            ("sni", "serverName"),
             ("fp", "fingerprint"),
             ("ech", "echConfigList"),
             ("pcs", "pinnedPeerCertSha256"),
             ("vcn", "verifyPeerCertByName"),
         ] {
-            if let Some(v) = get(query, query_key) {
-                tls[key] = json!(v);
+            if let Some(value) = get(query, query_key).filter(|value| !value.is_empty()) {
+                tls[key] = json!(value);
             }
         }
-        if let Some(alpn) = &o.alpn {
-            tls["alpn"] = json!(alpn.split(',').collect::<Vec<_>>());
-        }
-        if let Some(cs) = get(query, "cs").or_else(|| get(query, "tls_cipher_suites")) {
-            tls["cipherSuites"] = json!(cs
-                .split([':', ','])
+        if let Some(alpn) = o.alpn.as_deref().filter(|alpn| !alpn.is_empty()) {
+            tls["alpn"] = json!(alpn
+                .split(',')
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .collect::<Vec<_>>()
-                .join(":"));
+                .collect::<Vec<_>>());
         }
-        if let Some(value) = get(query, "allowInsecure").or_else(|| get(query, "insecure")) {
-            tls["allowInsecure"] = json!(matches!(value, "1" | "true"));
+        if let Some(cs) = get(query, "cs").or_else(|| get(query, "tls_cipher_suites")) {
+            let suites = cs
+                .split([':', ','])
+                .map(str::trim)
+                .filter(|suite| !suite.is_empty())
+                .collect::<Vec<_>>()
+                .join(":");
+            if !suites.is_empty() {
+                tls["cipherSuites"] = json!(suites);
+            }
+        }
+        if get(query, "allowInsecure")
+            .or_else(|| get(query, "insecure"))
+            .is_some_and(|value| matches!(value, "1" | "true"))
+        {
+            // Not in ExportToJson. Qt ignores the extra key; our reload still honors it.
+            tls["allowInsecure"] = json!(true);
         }
         stream["tlsSettings"] = tls;
     } else if security == "reality" {
-        stream["realitySettings"] = json!({"serverName":o.sni.as_deref().unwrap_or(""),"fingerprint":o.fp.as_deref().unwrap_or("chrome"),"publicKey":o.pbk.as_deref().unwrap_or(""),"shortId":o.sid.as_deref().unwrap_or("")});
-    }
-    if stream["realitySettings"]["fingerprint"] == "unsafe" {
-        stream["realitySettings"]
-            .as_object_mut()?
-            .remove("fingerprint");
+        let mut reality = json!({"serverName": o.sni.as_deref().unwrap_or("")});
+        if let Some(fp) =
+            o.fp.as_deref()
+                .filter(|fp| !fp.is_empty() && !fp.eq_ignore_ascii_case("unsafe"))
+        {
+            reality["fingerprint"] = json!(fp);
+        }
+        if let Some(pbk) = o.pbk.as_deref().filter(|pbk| !pbk.is_empty()) {
+            reality["password"] = json!(pbk);
+        }
+        if let Some(sid) = o.sid.as_deref().filter(|sid| !sid.is_empty()) {
+            reality["shortId"] = json!(sid);
+        }
+        if let Some(spx) = o.spx.as_deref().filter(|spx| !spx.is_empty()) {
+            reality["spiderX"] = json!(spx);
+        }
+        stream["realitySettings"] = reality;
     }
     if let Some(key) = ["fm", "finalmask"]
         .into_iter()
@@ -264,80 +288,57 @@ pub(crate) fn xhttp_profile(
     {
         stream["finalmask"] = query_extra(source, key, get(query, key)?)?;
     }
-    let mut user = json!({"id":o.uuid,"encryption":get(query,"encryption").unwrap_or("none")});
-    if let Some(flow) = &o.flow {
-        user["flow"] = json!(flow);
+    let encryption = get(query, "encryption")
+        .filter(|value| !value.is_empty())
+        .unwrap_or("none");
+    let mut settings = json!({
+        "address": o.server.as_deref().unwrap_or(""),
+        "port": o.server_port.unwrap_or(443),
+        "id": o.uuid.as_deref().unwrap_or(""),
+        "encryption": encryption,
+    });
+    if let Some(flow) = o
+        .flow
+        .as_deref()
+        .filter(|flow| !flow.is_empty() && !flow.eq_ignore_ascii_case("none"))
+    {
+        settings["flow"] = json!(flow);
     }
-    let raw = json!({"outbounds":[{"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":o.server,"port":o.server_port.unwrap_or(443),"users":[user]}]},"streamSettings":stream}]});
-    let mut profile = crate::json_sub::custom_xray_full_profile(name, &raw.to_string());
-    profile.source = source.to_string();
-    stamp_xhttp_identity(&mut profile, o, &security);
-    Some(profile)
-}
-
-/// XHTTP cannot run as sing-box VLESS. Keep the Xray document, but store the
-/// link as Xray VLESS so the list, editor type, and DB reload keep the endpoint.
-fn stamp_xhttp_identity(profile: &mut ImportedProfile, o: &ParsedOutbound, security: &str) {
-    profile.profile_type = ProfileType::XrayVless;
-    profile.outbound.server = o.server.clone();
-    profile.outbound.server_port = o.server_port;
-    profile.outbound.uuid = o.uuid.clone();
-    profile.outbound.flow = o.flow.clone();
-    profile.outbound.transport = Some("xhttp".into());
-    profile.outbound.path = o.path.clone();
-    profile.outbound.host = o.host.clone();
-    profile.outbound.sni = o.sni.clone();
-    profile.outbound.fp = o.fp.clone();
-    profile.outbound.alpn = o.alpn.clone();
-    profile.outbound.pbk = o.pbk.clone();
-    profile.outbound.sid = o.sid.clone();
-    profile.outbound.packet_encoding = o.packet_encoding.clone();
-    profile.outbound.tls = Some(matches!(security, "tls" | "reality"));
-    profile.outbound.security = Some(security.to_string());
-
-    let Some(raw) = profile.outbound.raw_json.clone() else {
-        return;
-    };
-    let Ok(mut wrapper) = serde_json::from_str::<Value>(&raw) else {
-        return;
-    };
-    let Some(obj) = wrapper.as_object_mut() else {
-        return;
-    };
-    let put = |obj: &mut serde_json::Map<String, Value>, key: &str, value: Option<&str>| {
-        if let Some(value) = value.filter(|item| !item.is_empty()) {
-            obj.insert(key.to_string(), json!(value));
-        }
-    };
-    put(obj, "server", o.server.as_deref());
-    if let Some(port) = o.server_port.filter(|port| *port > 0) {
-        obj.insert("server_port".into(), json!(port));
+    // Upstream xrayVless::ExportToJson. Original Throne ParseFromJson requires
+    // protocol=vless and settings.address/id, not a custom xrayfullconfig wrapper.
+    let mut bean = json!({
+        "protocol": "vless",
+        "settings": settings,
+        "streamSettings": stream,
+    });
+    if !name.is_empty() {
+        bean["tag"] = json!(name);
     }
-    put(obj, "uuid", o.uuid.as_deref());
-    put(obj, "flow", o.flow.as_deref());
-    put(obj, "transport", Some("xhttp"));
-    put(obj, "path", o.path.as_deref());
-    put(obj, "host", o.host.as_deref());
-    put(obj, "sni", o.sni.as_deref());
-    put(obj, "fp", o.fp.as_deref());
-    put(obj, "alpn", o.alpn.as_deref());
-    put(obj, "pbk", o.pbk.as_deref());
-    put(obj, "sid", o.sid.as_deref());
-    put(obj, "packet_encoding", o.packet_encoding.as_deref());
-    obj.insert("tls".into(), json!(matches!(security, "tls" | "reality")));
-    obj.insert("security".into(), json!(security));
-    if let Ok(text) = serde_json::to_string(&wrapper) {
-        profile.outbound.raw_json = Some(text);
+    let mut outbound = o.clone();
+    if !name.is_empty() {
+        outbound.tag = Some(name.to_string());
     }
+    outbound.transport = Some("xhttp".into());
+    outbound.security = Some(security.clone());
+    outbound.tls = Some(matches!(security.as_str(), "tls" | "reality"));
+    outbound.raw_json = Some(bean.to_string());
+    Some(ImportedProfile {
+        name: name.to_string(),
+        profile_type: ProfileType::XrayVless,
+        outbound,
+        source: source.to_string(),
+    })
 }
 
 pub(crate) fn import_notes(profile: &ImportedProfile) -> Vec<String> {
-    if profile.profile_type == ProfileType::Custom
-        || profile
-            .outbound
-            .raw_json
-            .as_deref()
-            .is_some_and(|raw| raw.contains("\"subtype\":\"xrayfullconfig\""))
+    if matches!(
+        profile.profile_type,
+        ProfileType::Custom | ProfileType::XrayVless
+    ) || profile
+        .outbound
+        .raw_json
+        .as_deref()
+        .is_some_and(|raw| raw.contains("\"subtype\":\"xrayfullconfig\""))
     {
         return Vec::new();
     }

@@ -137,7 +137,8 @@ impl ProfileType {
             Self::TrustTunnel => "TrustTunnel",
             Self::ShadowTls => "ShadowTLS",
             Self::Ssh => "SSH",
-            Self::XrayVless => "Xray VLESS",
+            // Upstream xrayVless::DisplayType().
+            Self::XrayVless => "VLESS (Xray)",
             Self::Chain => "Chain",
             Self::AutoSelector => "Auto Selector",
             Self::Custom => "Custom",
@@ -248,6 +249,108 @@ impl ParsedOutbound {
             });
     }
 
+    /// Fill list and editor fields from an upstream `xrayVless::ExportToJson` bean.
+    ///
+    /// Original Throne stores the endpoint under `settings.address` / `settings.id`,
+    /// not sing-box `server` / `uuid`. Existing values are left alone.
+    pub fn hydrate_xray_vless_fields(&mut self, value: &serde_json::Value) {
+        if value.get("protocol").and_then(|item| item.as_str()) != Some("vless") {
+            return;
+        }
+        let Some(settings) = value.get("settings") else {
+            return;
+        };
+        let text = |object: &serde_json::Value, key: &str| {
+            object
+                .get(key)
+                .and_then(|item| item.as_str())
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+        };
+        if self.server.as_deref().unwrap_or("").is_empty() {
+            self.server = text(settings, "address");
+        }
+        if self.server_port.filter(|port| *port > 0).is_none() {
+            self.server_port = settings
+                .get("port")
+                .and_then(|item| item.as_u64())
+                .and_then(|port| u16::try_from(port).ok())
+                .filter(|port| *port > 0);
+        }
+        if self.uuid.as_deref().unwrap_or("").is_empty() {
+            self.uuid = text(settings, "id");
+        }
+        if self.flow.as_deref().unwrap_or("").is_empty() {
+            self.flow = text(settings, "flow");
+        }
+        let Some(stream) = value.get("streamSettings") else {
+            return;
+        };
+        if self.transport.as_deref().unwrap_or("").is_empty() {
+            self.transport = text(stream, "network");
+        }
+        if self.security.as_deref().unwrap_or("").is_empty() {
+            self.security = text(stream, "security");
+        }
+        if self.tls.is_none() {
+            self.tls = self
+                .security
+                .as_deref()
+                .map(|security| matches!(security, "tls" | "reality"));
+        }
+        if let Some(tls) = stream
+            .get("tlsSettings")
+            .or_else(|| stream.get("realitySettings"))
+        {
+            if self.sni.as_deref().unwrap_or("").is_empty() {
+                self.sni = text(tls, "serverName");
+            }
+            if self.fp.as_deref().unwrap_or("").is_empty() {
+                self.fp = text(tls, "fingerprint");
+            }
+            if self.pbk.as_deref().unwrap_or("").is_empty() {
+                self.pbk = text(tls, "password").or_else(|| text(tls, "publicKey"));
+            }
+            if self.sid.as_deref().unwrap_or("").is_empty() {
+                self.sid = text(tls, "shortId");
+            }
+            if self.spx.as_deref().unwrap_or("").is_empty() {
+                self.spx = text(tls, "spiderX");
+            }
+            if self.alpn.as_deref().unwrap_or("").is_empty() {
+                self.alpn = tls.get("alpn").and_then(|item| {
+                    item.as_str()
+                        .filter(|text| !text.is_empty())
+                        .map(str::to_string)
+                        .or_else(|| {
+                            let joined = item
+                                .as_array()?
+                                .iter()
+                                .filter_map(|entry| entry.as_str())
+                                .filter(|entry| !entry.is_empty())
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            (!joined.is_empty()).then_some(joined)
+                        })
+                });
+            }
+            if self.insecure.is_none() {
+                self.insecure = tls.get("allowInsecure").and_then(|item| item.as_bool());
+            }
+        }
+        if let Some(xhttp) = stream
+            .get("xhttpSettings")
+            .or_else(|| stream.get("splithttpSettings"))
+        {
+            if self.path.as_deref().unwrap_or("").is_empty() {
+                self.path = text(xhttp, "path");
+            }
+            if self.host.as_deref().unwrap_or("").is_empty() {
+                self.host = text(xhttp, "host");
+            }
+        }
+    }
+
     /// Hysteria2 `obfs` object. `None` means obfuscation is off.
     ///
     /// An unset type is salamander. Empty, `none`, and `plain` stay off even
@@ -356,6 +459,11 @@ pub fn normalize_outbound_json(
         .filter(|s| !s.is_empty())
     {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(candidate) {
+            if profile_type == ProfileType::XrayVless {
+                if let Some(bean) = xray_vless_storage_bean(&v, name) {
+                    return serde_json::to_string(&bean).unwrap_or_else(|_| "{}".into());
+                }
+            }
             // A Custom profile may store an entire core document rather than
             // a subtype wrapper. Preserve that document on editor/DB round trips.
             let custom_document = profile_type == ProfileType::Custom
@@ -377,6 +485,81 @@ pub fn normalize_outbound_json(
         fields.tag = Some(name.to_string());
     }
     synthesize_upstream_outbound(profile_type, name, &fields)
+}
+
+/// Keep an upstream xrayvless bean, or rebuild one from a share-link wrapper.
+///
+/// JSON full-config imports stay Custom and are not rewritten here.
+fn xray_vless_storage_bean(value: &serde_json::Value, name: &str) -> Option<serde_json::Value> {
+    if value.get("protocol").and_then(|item| item.as_str()) == Some("vless")
+        && value
+            .pointer("/settings/address")
+            .and_then(|item| item.as_str())
+            .is_some_and(|address| !address.is_empty())
+    {
+        return Some(value.clone());
+    }
+    let subtype = value.get("subtype").and_then(|item| item.as_str())?;
+    if !matches!(subtype, "xrayfullconfig" | "xray_full" | "xray-full") {
+        return None;
+    }
+    let config = value.get("config").and_then(|item| item.as_str())?;
+    let doc: serde_json::Value = serde_json::from_str(config).ok()?;
+    let outbound = doc.pointer("/outbounds/0")?;
+    if outbound.get("protocol").and_then(|item| item.as_str()) != Some("vless") {
+        return None;
+    }
+    let vnext = outbound.pointer("/settings/vnext/0")?;
+    let user = vnext
+        .pointer("/users/0")
+        .unwrap_or(&serde_json::Value::Null);
+    let encryption = user
+        .get("encryption")
+        .and_then(|item| item.as_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("none");
+    let mut settings = serde_json::json!({
+        "address": vnext.get("address").and_then(|item| item.as_str()).unwrap_or(""),
+        "port": vnext.get("port").and_then(|item| item.as_u64()).unwrap_or(443),
+        "id": user.get("id").and_then(|item| item.as_str()).unwrap_or(""),
+        "encryption": encryption,
+    });
+    if let Some(flow) = user
+        .get("flow")
+        .and_then(|item| item.as_str())
+        .filter(|flow| !flow.is_empty() && !flow.eq_ignore_ascii_case("none"))
+    {
+        settings["flow"] = serde_json::json!(flow);
+    }
+    let tag = name
+        .is_empty()
+        .then(|| value.get("name").and_then(|item| item.as_str()))
+        .flatten()
+        .filter(|tag| !tag.is_empty())
+        .or_else(|| {
+            outbound
+                .get("tag")
+                .and_then(|item| item.as_str())
+                .filter(|tag| !tag.is_empty() && *tag != "proxy")
+        })
+        .or_else(|| (!name.is_empty()).then_some(name));
+    let mut bean = serde_json::json!({
+        "protocol": "vless",
+        "settings": settings,
+    });
+    if let Some(tag) = tag {
+        bean["tag"] = serde_json::json!(tag);
+    }
+    if let Some(stream) = outbound.get("streamSettings") {
+        bean["streamSettings"] = stream.clone();
+    }
+    if outbound
+        .get("mux")
+        .is_some_and(|mux| mux.as_object().is_some_and(|object| !object.is_empty()))
+    {
+        bean["mux"] = outbound["mux"].clone();
+    }
+    Some(bean)
 }
 
 fn merge_outbound_fields_from_value(fields: &mut ParsedOutbound, v: &serde_json::Value) {
@@ -953,7 +1136,7 @@ impl Profile {
                         .map(|s| s.to_string())
                 })
             })
-            .or_else(|| nested_xray_text(saved.as_ref(), "address"))
+            .or_else(|| xray_endpoint_text(saved.as_ref(), "address"))
             .unwrap_or_default();
         let port = self
             .outbound
@@ -965,7 +1148,7 @@ impl Profile {
                 })
             })
             .or_else(|| {
-                nested_xray_text(saved.as_ref(), "port").and_then(|text| text.parse().ok())
+                xray_endpoint_text(saved.as_ref(), "port").and_then(|text| text.parse().ok())
             });
         match (server.is_empty(), port) {
             (true, _) => String::new(),
@@ -1002,6 +1185,36 @@ impl Profile {
     }
 }
 
+fn settings_text(settings: &serde_json::Value, key: &str) -> Option<String> {
+    match key {
+        "address" => settings
+            .get("address")
+            .and_then(|item| item.as_str())
+            .filter(|text| !text.is_empty())
+            .map(str::to_string),
+        "port" => settings
+            .get("port")
+            .and_then(|item| item.as_u64())
+            .filter(|port| *port > 0)
+            .map(|port| port.to_string()),
+        _ => None,
+    }
+}
+
+/// Address from an upstream xrayvless bean, a nested vnext document, or a
+/// nested flat `settings.address` left by an older full-config wrapper.
+fn xray_endpoint_text(saved: Option<&serde_json::Value>, key: &str) -> Option<String> {
+    let saved = saved?;
+    saved
+        .get("settings")
+        .and_then(|settings| settings_text(settings, key))
+        .or_else(|| nested_xray_text(Some(saved), key))
+        .or_else(|| {
+            let doc = nested_xray_document(Some(saved))?;
+            settings_text(&doc["outbounds"][0]["settings"], key)
+        })
+}
+
 fn nested_xray_document(saved: Option<&serde_json::Value>) -> Option<serde_json::Value> {
     let config = saved?.get("config").and_then(|item| item.as_str())?;
     serde_json::from_str(config).ok()
@@ -1030,7 +1243,7 @@ fn xray_full_vless_label(outbound_json: &str) -> Option<String> {
     let protocol = doc["outbounds"][0]["protocol"].as_str()?;
     protocol
         .eq_ignore_ascii_case("vless")
-        .then(|| "Xray VLESS".to_string())
+        .then(|| "VLESS (Xray)".to_string())
 }
 
 fn dns_tunnel_display_address(profile: &Profile) -> Option<String> {
@@ -2116,6 +2329,62 @@ pub fn human_bytes(n: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_xray_vless_bean_keeps_address_and_type() {
+        let mut profile = Profile::new(1, 1, "xray-usw1", ProfileType::XrayVless);
+        profile.outbound_json = r#"{"tag":"xray-usw1","protocol":"vless","settings":{"address":"xray-e0vuv8l6-workspace-5fszck.cloady.io","port":443,"id":"34b67040-a3d5-42e1-ab6b-6e9c7903e7ae","encryption":"none"},"streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"serverName":"xray-e0vuv8l6-workspace-5fszck.cloady.io","fingerprint":"chrome"},"xhttpSettings":{"path":"/7728c2990164a8f9","mode":"auto"}}}"#.into();
+        assert_eq!(profile.display_type(), "VLESS (Xray)");
+        assert_eq!(
+            profile.display_address(),
+            "xray-e0vuv8l6-workspace-5fszck.cloady.io:443"
+        );
+        let value: serde_json::Value = serde_json::from_str(&profile.outbound_json).unwrap();
+        let mut outbound = ParsedOutbound::default();
+        outbound.hydrate_xray_vless_fields(&value);
+        assert_eq!(
+            outbound.server.as_deref(),
+            Some("xray-e0vuv8l6-workspace-5fszck.cloady.io")
+        );
+        assert_eq!(outbound.server_port, Some(443));
+        assert_eq!(
+            outbound.uuid.as_deref(),
+            Some("34b67040-a3d5-42e1-ab6b-6e9c7903e7ae")
+        );
+        assert_eq!(outbound.path.as_deref(), Some("/7728c2990164a8f9"));
+        assert_eq!(outbound.transport.as_deref(), Some("xhttp"));
+        assert_eq!(profile.profile_type.display_name(), "VLESS (Xray)");
+    }
+
+    #[test]
+    fn xray_vless_wrapper_saves_as_upstream_bean() {
+        let config = serde_json::json!({
+            "outbounds": [{
+                "tag": "proxy",
+                "protocol": "vless",
+                "settings": {"vnext": [{"address": "edge.example", "port": 443, "users": [{"id": "uuid", "encryption": "none"}]}]},
+                "streamSettings": {"network": "xhttp", "security": "tls", "tlsSettings": {"serverName": "edge.example"}, "xhttpSettings": {"path": "/x", "mode": "auto"}}
+            }]
+        });
+        let wrapper = serde_json::json!({
+            "type": "custom",
+            "name": "node",
+            "subtype": "xrayfullconfig",
+            "config": config.to_string()
+        });
+        let outbound = ParsedOutbound {
+            raw_json: Some(wrapper.to_string()),
+            ..ParsedOutbound::default()
+        };
+        let saved: serde_json::Value =
+            serde_json::from_str(&outbound.to_db_json(ProfileType::XrayVless)).unwrap();
+        assert_eq!(saved["protocol"], "vless");
+        assert_eq!(saved["tag"], "node");
+        assert_eq!(saved["settings"]["address"], "edge.example");
+        assert_eq!(saved["settings"]["id"], "uuid");
+        assert_eq!(saved["streamSettings"]["xhttpSettings"]["path"], "/x");
+        assert!(saved.get("subtype").is_none());
+    }
 
     #[test]
     fn old_default_private_ranges_gain_ipv6() {

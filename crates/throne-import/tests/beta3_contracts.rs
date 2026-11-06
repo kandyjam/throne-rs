@@ -24,8 +24,8 @@ fn xhttp_tls_keeps_cipher_suites_and_insecure_and_reality_ignores_unsafe() {
         assert_eq!(report.profiles.len(), 1);
         let p = &report.profiles[0];
         let out: Value = serde_json::from_str(&p.outbound.to_db_json(p.profile_type)).unwrap();
-        let raw: Value = serde_json::from_str(out["config"].as_str().unwrap()).unwrap();
-        let stream = &raw["outbounds"][0]["streamSettings"];
+        assert_eq!(out["protocol"], "vless");
+        let stream = &out["streamSettings"];
         if security == "tls" {
             assert_eq!(stream["tlsSettings"]["cipherSuites"], "A:B");
             assert_eq!(stream["tlsSettings"]["allowInsecure"], true);

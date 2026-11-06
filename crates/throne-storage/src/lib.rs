@@ -599,10 +599,11 @@ fn parse_outbound_json(s: &str) -> (ParsedOutbound, Option<String>) {
         return (ParsedOutbound::default(), None);
     };
     // Prefer structured ParsedOutbound if we stored one
-    if let Ok(p) = serde_json::from_value::<ParsedOutbound>(v.clone()) {
+    if let Ok(mut p) = serde_json::from_value::<ParsedOutbound>(v.clone()) {
         if v.get("type").and_then(serde_json::Value::as_str) != Some("wireguard")
             && (p.server.is_some() || p.uuid.is_some() || p.raw_json.is_some())
         {
+            p.hydrate_xray_vless_fields(&v);
             let name = p.tag.clone();
             return (p, name);
         }
@@ -663,6 +664,7 @@ fn parse_outbound_json(s: &str) -> (ParsedOutbound, Option<String>) {
             .map(|s| s.to_string());
         outbound.insecure = tls.get("insecure").and_then(|x| x.as_bool());
     }
+    outbound.hydrate_xray_vless_fields(&v);
     outbound.hydrate_wireguard_fields(&v);
     (outbound, tag)
 }
