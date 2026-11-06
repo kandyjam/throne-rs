@@ -158,9 +158,10 @@ pub fn force_clear_system_proxy() {
 
 /// Point primary NICs at Tun DNS (`172.19.0.2`) or clear them (`Empty`).
 ///
-/// Complements Go `sys.SetSystemDNS` so Tun works even when ThroneCore is an
-/// older build that failed to bind DNS on the physical interface after
-/// `auto_route` flipped the default route to utun.
+/// Beta.6 does not call this. The core publishes a temporary network service
+/// whose DNS server is `tun_dns_address`, and that service dies with the
+/// process. Calling the disable path from a failed Start would erase DNS the
+/// user set by hand. The helper remains for an explicit operator reset.
 pub fn set_tun_system_dns(enable: bool, tun_ipv4_cidr: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {

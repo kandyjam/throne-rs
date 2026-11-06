@@ -217,6 +217,8 @@ fn native_protocol(ty: ProfileType, v: &Value) -> bool {
             | Naive
             | ShadowTls
             | Ssh
+            | Dnstt
+            | MasterDns
     );
     supported
         && v.get("type").and_then(Value::as_str).is_some_and(|t| {
@@ -243,6 +245,9 @@ fn fields_for(ty: ProfileType, value: &Value) -> Vec<ProfileEditField> {
         return Vec::new();
     }
     let mut fields = Vec::new();
+    if matches!(ty, Dnstt | MasterDns) {
+        return dns_tunnel_fields(ty, value);
+    }
     let mut add = |key: &str, label, section, kind| {
         // Unexpected field shapes remain available in raw JSON, never flattened.
         let v = value.pointer(key);
@@ -538,8 +543,123 @@ fn nonempty(value: &Value, pointer: &str) -> bool {
         .is_some_and(|s| !s.trim().is_empty())
 }
 
+fn dns_tunnel_fields(ty: ProfileType, value: &Value) -> Vec<ProfileEditField> {
+    use ProfileEditKind::*;
+    use ProfileEditSection::*;
+    use ProfileType::*;
+    let mut fields = Vec::new();
+    let mut add = |key: &str, label, section, kind| {
+        let v = value.pointer(key);
+        let compatible = match (kind, v) {
+            (_, None) => true,
+            (Text | Secret, Some(v)) => v.is_string(),
+            (Boolean, Some(v)) => v.is_boolean(),
+            (Number, Some(v)) => v.is_u64() || v.is_f64(),
+            (StringList, Some(v)) => {
+                v.is_string()
+                    || v.as_array()
+                        .is_some_and(|items| items.iter().all(Value::is_string))
+            }
+        };
+        if !compatible {
+            return;
+        }
+        let display = match (kind, v) {
+            (_, None) => String::new(),
+            (Boolean | Number, Some(v)) => v.to_string(),
+            (StringList, Some(Value::Array(items))) => items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+            (_, Some(v)) => v.as_str().unwrap_or_default().to_owned(),
+        };
+        fields.push(ProfileEditField {
+            key: key.into(),
+            label,
+            section,
+            kind,
+            value: display,
+        });
+    };
+    if ty == Dnstt {
+        add("/domain", "Domain", General, Text);
+        add("/public_key", "Public key", General, Text);
+        add("/mode", "Mode", General, Text);
+        add("/socks/username", "SOCKS username", General, Text);
+        add("/socks/password", "SOCKS password", General, Secret);
+        add("/shadowsocks/method", "Shadowsocks cipher", General, Text);
+        add(
+            "/shadowsocks/password",
+            "Shadowsocks password",
+            General,
+            Secret,
+        );
+        add("/ssh/user", "SSH user", General, Text);
+        add("/ssh/password", "SSH password", General, Secret);
+    } else {
+        add("/domain", "Domains", General, StringList);
+        add("/mode", "Mode", General, Text);
+        add("/encryption_method", "Encryption", General, Text);
+        add("/encryption_key", "Encryption key", General, Secret);
+    }
+    add("/resolvers", "Resolvers", General, StringList);
+    fields
+}
+
+fn validate_dns_tunnel(ty: ProfileType, value: &Value) -> Result<(), String> {
+    use ProfileType::*;
+    if ty == Dnstt {
+        let domain = value["domain"].as_str().unwrap_or("").trim();
+        if domain.is_empty() {
+            return Err("Domain is required".into());
+        }
+        let key = value["public_key"].as_str().unwrap_or("").trim();
+        if key.len() != 64 || !key.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err("Public key must be 64 hexadecimal digits".into());
+        }
+        let mode = value["mode"].as_str().unwrap_or("dnstt");
+        if !matches!(mode, "dnstt" | "vaydns") {
+            return Err("Mode must be dnstt or vaydns".into());
+        }
+    } else {
+        let domains = value["domain"].as_array();
+        if domains.is_none_or(|items| {
+            items
+                .iter()
+                .all(|item| item.as_str().is_none_or(|domain| domain.trim().is_empty()))
+        }) {
+            return Err("At least one domain is required".into());
+        }
+        let mode = value["mode"].as_str().unwrap_or("socks5");
+        if !matches!(mode, "socks5" | "tcp") {
+            return Err("Mode must be socks5 or tcp".into());
+        }
+        let method = value["encryption_method"].as_str().unwrap_or("xor");
+        if !matches!(
+            method,
+            "none" | "xor" | "chacha20" | "aes-128-gcm" | "aes-192-gcm" | "aes-256-gcm"
+        ) {
+            return Err("Unknown encryption method".into());
+        }
+    }
+    if value
+        .get("resolvers")
+        .is_some_and(|items| !items.is_array() && !items.is_string())
+    {
+        return Err("Resolvers must be a list of addresses".into());
+    }
+    Ok(())
+}
+
 fn validate_native(ty: ProfileType, value: &Value) -> Result<(), String> {
     use ProfileType::*;
+    if matches!(ty, Dnstt | MasterDns) {
+        if !native_protocol(ty, value) {
+            return Ok(());
+        }
+        return validate_dns_tunnel(ty, value);
+    }
     if !native_protocol(ty, value) {
         return Ok(());
     }

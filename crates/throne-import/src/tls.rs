@@ -1,7 +1,7 @@
 //! 1.4.0-beta.2 share-link TLS and Xray-only transport contracts.
 use base64::Engine;
 use serde_json::{json, Value};
-use throne_domain::ParsedOutbound;
+use throne_domain::{ParsedOutbound, ProfileType};
 
 use crate::ImportedProfile;
 
@@ -271,13 +271,74 @@ pub(crate) fn xhttp_profile(
     let raw = json!({"outbounds":[{"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":o.server,"port":o.server_port.unwrap_or(443),"users":[user]}]},"streamSettings":stream}]});
     let mut profile = crate::json_sub::custom_xray_full_profile(name, &raw.to_string());
     profile.source = source.to_string();
-    profile.outbound.server = o.server.clone();
-    profile.outbound.server_port = o.server_port;
+    stamp_xhttp_identity(&mut profile, o, &security);
     Some(profile)
 }
 
+/// XHTTP cannot run as sing-box VLESS. Keep the Xray document, but store the
+/// link as Xray VLESS so the list, editor type, and DB reload keep the endpoint.
+fn stamp_xhttp_identity(profile: &mut ImportedProfile, o: &ParsedOutbound, security: &str) {
+    profile.profile_type = ProfileType::XrayVless;
+    profile.outbound.server = o.server.clone();
+    profile.outbound.server_port = o.server_port;
+    profile.outbound.uuid = o.uuid.clone();
+    profile.outbound.flow = o.flow.clone();
+    profile.outbound.transport = Some("xhttp".into());
+    profile.outbound.path = o.path.clone();
+    profile.outbound.host = o.host.clone();
+    profile.outbound.sni = o.sni.clone();
+    profile.outbound.fp = o.fp.clone();
+    profile.outbound.alpn = o.alpn.clone();
+    profile.outbound.pbk = o.pbk.clone();
+    profile.outbound.sid = o.sid.clone();
+    profile.outbound.packet_encoding = o.packet_encoding.clone();
+    profile.outbound.tls = Some(matches!(security, "tls" | "reality"));
+    profile.outbound.security = Some(security.to_string());
+
+    let Some(raw) = profile.outbound.raw_json.clone() else {
+        return;
+    };
+    let Ok(mut wrapper) = serde_json::from_str::<Value>(&raw) else {
+        return;
+    };
+    let Some(obj) = wrapper.as_object_mut() else {
+        return;
+    };
+    let put = |obj: &mut serde_json::Map<String, Value>, key: &str, value: Option<&str>| {
+        if let Some(value) = value.filter(|item| !item.is_empty()) {
+            obj.insert(key.to_string(), json!(value));
+        }
+    };
+    put(obj, "server", o.server.as_deref());
+    if let Some(port) = o.server_port.filter(|port| *port > 0) {
+        obj.insert("server_port".into(), json!(port));
+    }
+    put(obj, "uuid", o.uuid.as_deref());
+    put(obj, "flow", o.flow.as_deref());
+    put(obj, "transport", Some("xhttp"));
+    put(obj, "path", o.path.as_deref());
+    put(obj, "host", o.host.as_deref());
+    put(obj, "sni", o.sni.as_deref());
+    put(obj, "fp", o.fp.as_deref());
+    put(obj, "alpn", o.alpn.as_deref());
+    put(obj, "pbk", o.pbk.as_deref());
+    put(obj, "sid", o.sid.as_deref());
+    put(obj, "packet_encoding", o.packet_encoding.as_deref());
+    obj.insert("tls".into(), json!(matches!(security, "tls" | "reality")));
+    obj.insert("security".into(), json!(security));
+    if let Ok(text) = serde_json::to_string(&wrapper) {
+        profile.outbound.raw_json = Some(text);
+    }
+}
+
 pub(crate) fn import_notes(profile: &ImportedProfile) -> Vec<String> {
-    if profile.profile_type == throne_domain::ProfileType::Custom {
+    if profile.profile_type == ProfileType::Custom
+        || profile
+            .outbound
+            .raw_json
+            .as_deref()
+            .is_some_and(|raw| raw.contains("\"subtype\":\"xrayfullconfig\""))
+    {
         return Vec::new();
     }
     let Ok(url) = url::Url::parse(&profile.source) else {

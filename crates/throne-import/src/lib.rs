@@ -6,6 +6,7 @@
 mod clash;
 mod decode;
 mod deeplink;
+mod dns_tunnel;
 mod fetch;
 mod json_sub;
 mod links;
@@ -194,11 +195,22 @@ fn import_text_inner_unchecked(trimmed: &str) -> ImportReport {
     }
 
     // Single share link
-    if let Some(p) = parse_share_link(trimmed) {
-        return ImportReport {
-            profiles: vec![p],
-            ..Default::default()
-        };
+    match links::parse_share_link_detailed(trimmed) {
+        links::ShareLinkParse::Hit { profile, notes } => {
+            return ImportReport {
+                profiles: vec![profile],
+                notes,
+                ..Default::default()
+            };
+        }
+        links::ShareLinkParse::Rejected(error) => {
+            return ImportReport {
+                errors: vec![error],
+                skipped: 1,
+                ..Default::default()
+            };
+        }
+        links::ShareLinkParse::Unknown => {}
     }
 
     ImportReport {
@@ -270,9 +282,16 @@ fn import_lines(text: &str) -> ImportReport {
                 continue;
             }
         }
-        match parse_share_link(line) {
-            Some(p) => report.profiles.push(p),
-            None => {
+        match links::parse_share_link_detailed(line) {
+            links::ShareLinkParse::Hit { profile, notes } => {
+                report.profiles.push(profile);
+                report.notes.extend(notes);
+            }
+            links::ShareLinkParse::Rejected(error) => {
+                report.skipped += 1;
+                report.errors.push(error);
+            }
+            links::ShareLinkParse::Unknown => {
                 report.skipped += 1;
                 report.errors.push(format!("skip: {line}"));
             }

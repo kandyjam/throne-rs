@@ -13,7 +13,7 @@ require (
 	github.com/sagernet/quic-go v0.61.0-sing-box-mod.12
 	github.com/sagernet/sing v0.9.7-0.20261023115510-03a6cce64bf7
 	github.com/sagernet/sing-box v1.15.0-alpha.13
-	github.com/sagernet/sing-tun v0.9.7-0.20261023115453-611d83b7a57b
+	github.com/sagernet/sing-tun v0.9.7-0.20261103032840-55c7bb51acc7
 	github.com/tailscale/go-winio v0.0.0-20231025203758-c4f33415bf55
 	github.com/xtls/xray-core v1.260327.1-0.20260908222543-52a412d9e2f5
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba
@@ -26,11 +26,13 @@ require (
 
 replace github.com/xtls/xray-core => github.com/throneproj/xray-core v1.251015.1-0.20261101081745-1c6eb7771c4d
 
-replace github.com/sagernet/sing-box => github.com/throneproj/sing-box v1.11.16-0.20261031212642-af51a7460ccd
+replace github.com/sagernet/sing-box => github.com/throneproj/sing-box v1.11.16-0.20261105144313-6bc5c846150e
 
 replace github.com/sagernet/wireguard-go => github.com/throneproj/wireguard-go v0.0.0-20261031210827-e11787583013
 
 replace github.com/sagernet/sing => github.com/throneproj/sing v0.9.4-0.20261024082846-e3e392877db8
+
+replace github.com/metacubex/utls => github.com/throneproj/utls v1.8.8-0.20261105093534-f0ae7792aa1d
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
@@ -61,6 +63,7 @@ require (
 	github.com/enfein/mieru/v3 v3.33.0 // indirect
 	github.com/exclavenetwork/sing-juicity v0.3.0-beta.2 // indirect
 	github.com/florianl/go-nfqueue/v2 v2.1.0 // indirect
+	github.com/flynn/noise v1.1.0 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
 	github.com/gaissmai/bart v0.26.1 // indirect
@@ -91,6 +94,7 @@ require (
 	github.com/keybase/go-keychain v0.0.1 // indirect
 	github.com/klauspost/compress v1.20.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.1 // indirect
+	github.com/klauspost/reedsolomon v1.12.0 // indirect
 	github.com/koron/go-ssdp v0.0.4 // indirect
 	github.com/kr/fs v0.1.0 // indirect
 	github.com/libdns/acmedns v0.5.0 // indirect
@@ -113,6 +117,7 @@ require (
 	github.com/pion/stun/v3 v3.1.7 // indirect
 	github.com/pion/transport/v4 v4.1.0 // indirect
 	github.com/pires/go-proxyproto v0.15.0 // indirect
+	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pkg/sftp v1.13.10 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/refraction-networking/utls v1.8.3-0.20260301010127-aa6edf4b11af // indirect
@@ -158,7 +163,7 @@ require (
 	github.com/sagernet/sing-anytls v0.0.0-20260928104022-580984e4d8cb // indirect
 	github.com/sagernet/sing-cloudflared v0.1.4-0.20261021152903-2d40d788fcf6 // indirect
 	github.com/sagernet/sing-mux v0.3.10-0.20260929204512-caf09fe32475 // indirect
-	github.com/sagernet/sing-openconnect v0.1.1-0.20260929151226-29757281a247 // indirect
+	github.com/sagernet/sing-openconnect v0.1.1-0.20261103042440-6c98622bada6 // indirect
 	github.com/sagernet/sing-openvpn v0.1.1-0.20261020061844-7d24ecd92837 // indirect
 	github.com/sagernet/sing-quic v0.7.2-0.20261020082049-7e0a5869a5f4 // indirect
 	github.com/sagernet/sing-shadowsocks v0.2.9-0.20260929204512-65740e0f0e3e // indirect
@@ -188,6 +193,7 @@ require (
 	github.com/wlynxg/anet v0.0.5 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/xchacha20-poly1305/sing-trusttunnel v0.3.0-beta.7 // indirect
+	github.com/xtaci/kcp-go/v5 v5.6.73 // indirect
 	github.com/xtls/reality v0.0.0-20260908062103-8cdf7bf9c7f0 // indirect
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78 // indirect
 	github.com/yuin/gopher-lua v1.1.2 // indirect

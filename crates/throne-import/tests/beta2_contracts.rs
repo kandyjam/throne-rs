@@ -1,6 +1,6 @@
 use base64::Engine;
 use serde_json::{json, Value};
-use throne_domain::ProfileType;
+use throne_domain::{Profile, ProfileType};
 use throne_import::import_text;
 
 fn imported_json(link: &str) -> Value {
@@ -52,12 +52,67 @@ fn whole_certificate_pins_are_validated_and_not_confused_with_public_key_pins() 
 }
 
 #[test]
+#[test]
+fn cloady_xhttp_link_imports_as_xray_vless_with_decoded_path() {
+    let link = "vless://34b67040-a3d5-42e1-ab6b-6e9c7903e7ae@xray-e0vuv8l6-workspace-5fszck.cloady.io:443?encryption=none&security=tls&sni=xray-e0vuv8l6-workspace-5fszck.cloady.io&fp=chrome&type=xhttp&path=%2F7728c2990164a8f9&mode=auto&packetEncoding=xudp#xray-usw1";
+    let report = import_text(link);
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let imported = &report.profiles[0];
+    assert_eq!(imported.name, "xray-usw1");
+    assert_eq!(imported.profile_type, ProfileType::XrayVless);
+    assert_eq!(
+        imported.outbound.server.as_deref(),
+        Some("xray-e0vuv8l6-workspace-5fszck.cloady.io")
+    );
+    assert_eq!(imported.outbound.server_port, Some(443));
+    assert_eq!(
+        imported.outbound.uuid.as_deref(),
+        Some("34b67040-a3d5-42e1-ab6b-6e9c7903e7ae")
+    );
+    assert_eq!(imported.outbound.transport.as_deref(), Some("xhttp"));
+    assert_eq!(imported.outbound.path.as_deref(), Some("/7728c2990164a8f9"));
+    assert_eq!(
+        imported.outbound.sni.as_deref(),
+        Some("xray-e0vuv8l6-workspace-5fszck.cloady.io")
+    );
+    assert_eq!(imported.outbound.fp.as_deref(), Some("chrome"));
+    assert_eq!(imported.outbound.packet_encoding.as_deref(), Some("xudp"));
+
+    let saved = imported.outbound.to_db_json(imported.profile_type);
+    let reloaded: throne_domain::ParsedOutbound = serde_json::from_str(&saved).unwrap();
+    assert_eq!(reloaded.server, imported.outbound.server);
+    assert_eq!(reloaded.uuid, imported.outbound.uuid);
+    assert_eq!(reloaded.path.as_deref(), Some("/7728c2990164a8f9"));
+    let bean: Value = serde_json::from_str(&saved).unwrap();
+    let config: Value = serde_json::from_str(bean["config"].as_str().unwrap()).unwrap();
+    let stream = &config["outbounds"][0]["streamSettings"];
+    assert_eq!(stream["xhttpSettings"]["path"], "/7728c2990164a8f9");
+    assert_eq!(stream["xhttpSettings"]["mode"], "auto");
+    assert_eq!(stream["tlsSettings"]["fingerprint"], "chrome");
+    assert_eq!(
+        stream["tlsSettings"]["serverName"],
+        "xray-e0vuv8l6-workspace-5fszck.cloady.io"
+    );
+
+    let mut profile = Profile::new(1, 1, &imported.name, imported.profile_type);
+    profile.outbound_json = saved;
+    profile.outbound = reloaded;
+    assert_eq!(
+        profile.display_address(),
+        "xray-e0vuv8l6-workspace-5fszck.cloady.io:443"
+    );
+    assert_eq!(profile.display_type(), "Xray VLESS");
+    let security = throne_domain::profile_security(&profile, false);
+    assert_eq!(security.display(), "XHTTP+TLS");
+}
+
+#[test]
 fn xhttp_strict_json_values_survive_and_use_the_xray_bridge() {
     let extra = r#"{"headers":{"X-Value":"True's A+B"},"noGRPCHeader":true}"#;
     let link = format!("vless://id@edge.example:443?security=tls&type=xhttp&path=%2Fx&mode=auto&extra={}&ech=public.example%2Bhttps%3A%2F%2Fdns.example%2Fdns-query#Node", urlencoding::encode(extra));
     let report = import_text(&link);
     let profile = &report.profiles[0];
-    assert_eq!(profile.profile_type, ProfileType::Custom);
+    assert_eq!(profile.profile_type, ProfileType::XrayVless);
     let out: Value =
         serde_json::from_str(&profile.outbound.to_db_json(profile.profile_type)).unwrap();
     assert_eq!(out["subtype"], "xrayfullconfig");

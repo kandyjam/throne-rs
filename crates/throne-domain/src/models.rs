@@ -40,6 +40,10 @@ pub enum ProfileType {
     OpenVpn,
     /// Upstream 1.3.0-beta.1 OpenConnect/AnyConnect endpoint.
     OpenConnect,
+    /// Upstream 1.4.0-beta.6 DNSTT / VayDNS tunnel. The mode lives in the outbound JSON.
+    Dnstt,
+    /// Upstream 1.4.0-beta.6 MasterDNS tunnel. The profile dials resolvers, not a server.
+    MasterDns,
 }
 
 impl ProfileType {
@@ -73,6 +77,8 @@ impl ProfileType {
             Self::Snell => "snell",
             Self::OpenVpn => "openvpn",
             Self::OpenConnect => "openconnect",
+            Self::Dnstt => "dnstt",
+            Self::MasterDns => "masterdns",
         }
     }
 
@@ -106,6 +112,8 @@ impl ProfileType {
             "snell" => Some(Self::Snell),
             "openvpn" | "openvpn-client" => Some(Self::OpenVpn),
             "openconnect" => Some(Self::OpenConnect),
+            "dnstt" => Some(Self::Dnstt),
+            "masterdns" => Some(Self::MasterDns),
             _ => None,
         }
     }
@@ -139,6 +147,8 @@ impl ProfileType {
             Self::Snell => "Snell",
             Self::OpenVpn => "OpenVPN",
             Self::OpenConnect => "OpenConnect",
+            Self::Dnstt => "DNSTT",
+            Self::MasterDns => "MasterDNS",
         }
     }
 }
@@ -927,29 +937,36 @@ impl Profile {
             }
             return "group".into();
         }
+        if let Some(address) = dns_tunnel_display_address(self) {
+            return address;
+        }
+        let saved = serde_json::from_str::<serde_json::Value>(&self.outbound_json).ok();
         let server = self
             .outbound
             .server
             .clone()
             .filter(|s| !s.is_empty())
             .or_else(|| {
-                serde_json::from_str::<serde_json::Value>(&self.outbound_json)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("server")
-                            .and_then(|x| x.as_str())
-                            .map(|s| s.to_string())
-                    })
+                saved.as_ref().and_then(|v| {
+                    v.get("server")
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string())
+                })
             })
+            .or_else(|| nested_xray_text(saved.as_ref(), "address"))
             .unwrap_or_default();
-        let port = self.outbound.server_port.or_else(|| {
-            serde_json::from_str::<serde_json::Value>(&self.outbound_json)
-                .ok()
-                .and_then(|v| {
+        let port = self
+            .outbound
+            .server_port
+            .or_else(|| {
+                saved.as_ref().and_then(|v| {
                     v.get("server_port")
                         .and_then(|x| x.as_u64().map(|n| n as u16))
                 })
-        });
+            })
+            .or_else(|| {
+                nested_xray_text(saved.as_ref(), "port").and_then(|text| text.parse().ok())
+            });
         match (server.is_empty(), port) {
             (true, _) => String::new(),
             (false, Some(p)) if p > 0 => format!("{server}:{p}"),
@@ -959,7 +976,84 @@ impl Profile {
 
     /// Upstream ColType via outbound DisplayType.
     pub fn display_type(&self) -> String {
+        if self.profile_type == ProfileType::XrayVless {
+            return self.profile_type.display_name().to_string();
+        }
+        if self.profile_type == ProfileType::Custom {
+            if let Some(label) = xray_full_vless_label(&self.outbound_json) {
+                return label;
+            }
+        }
+        if self.profile_type == ProfileType::Dnstt {
+            let mode = serde_json::from_str::<serde_json::Value>(&self.outbound_json)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("mode")
+                        .and_then(|item| item.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            if mode.eq_ignore_ascii_case("vaydns") {
+                return "VayDNS".into();
+            }
+        }
         self.profile_type.display_name().to_string()
+    }
+}
+
+fn nested_xray_document(saved: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    let config = saved?.get("config").and_then(|item| item.as_str())?;
+    serde_json::from_str(config).ok()
+}
+
+fn nested_xray_text(saved: Option<&serde_json::Value>, key: &str) -> Option<String> {
+    let doc = nested_xray_document(saved)?;
+    let peer = &doc["outbounds"][0]["settings"]["vnext"][0];
+    match key {
+        "address" => peer["address"]
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .map(str::to_string),
+        "port" => peer["port"].as_u64().map(|port| port.to_string()),
+        _ => None,
+    }
+}
+
+fn xray_full_vless_label(outbound_json: &str) -> Option<String> {
+    let saved = serde_json::from_str::<serde_json::Value>(outbound_json).ok()?;
+    let subtype = saved.get("subtype").and_then(|item| item.as_str())?;
+    if !matches!(subtype, "xrayfullconfig" | "xray_full" | "xray-full") {
+        return None;
+    }
+    let doc = nested_xray_document(Some(&saved))?;
+    let protocol = doc["outbounds"][0]["protocol"].as_str()?;
+    protocol
+        .eq_ignore_ascii_case("vless")
+        .then(|| "Xray VLESS".to_string())
+}
+
+fn dns_tunnel_display_address(profile: &Profile) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(&profile.outbound_json).ok()?;
+    match profile.profile_type {
+        ProfileType::Dnstt => value
+            .get("domain")
+            .and_then(|item| item.as_str())
+            .filter(|domain| !domain.is_empty())
+            .map(str::to_string),
+        ProfileType::MasterDns => {
+            let domains = value.get("domain")?.as_array()?;
+            let first = domains
+                .first()?
+                .as_str()
+                .filter(|domain| !domain.is_empty())?;
+            if domains.len() <= 1 {
+                Some(first.to_string())
+            } else {
+                Some(format!("{first} +{}", domains.len() - 1))
+            }
+        }
+        _ => None,
     }
 }
 

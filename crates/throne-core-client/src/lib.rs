@@ -528,10 +528,9 @@ impl CoreSession {
             Ok(r) => r,
             Err(e) => {
                 // Don't leave system proxy / Tun DNS pointing at a dead stack.
+                // The core's temporary DNS service dies with the process. Blanking
+                // networksetup DNS here would erase the user's own servers.
                 force_clear_system_proxy();
-                if settings.tun_mode_enabled {
-                    let _ = set_tun_system_dns(false, "");
-                }
                 return Err(e);
             }
         };
@@ -557,16 +556,10 @@ impl CoreSession {
                 let err2 = proto_wire::decode_error_resp(&resp2)?;
                 if !err2.is_empty() {
                     force_clear_system_proxy();
-                    if settings.tun_mode_enabled {
-                        let _ = set_tun_system_dns(false, "");
-                    }
                     return Err(CoreError::Rpc(format_core_error(&err2)));
                 }
             } else {
                 force_clear_system_proxy();
-                if settings.tun_mode_enabled {
-                    let _ = set_tun_system_dns(false, "");
-                }
                 return Err(CoreError::Rpc(format_core_error(&err)));
             }
         }
@@ -790,13 +783,9 @@ impl CoreSession {
 
         if kill {
             self.force_kill_core();
-            // A wedged core cannot run its DNS teardown. Retain explicit
-            // recovery only on the failure path and only for a TUN session.
-            if settings.tun_mode_enabled {
-                if let Err(e) = set_tun_system_dns(false, "") {
-                    warn!(%e, "Tun DNS recovery after forced stop failed");
-                }
-            }
+            // Beta.6 DNS is an SCDynamicStore temporary service. It disappears
+            // with the core, and RestoreLegacy cleans a dead beta.4/beta.5
+            // 127.0.0.53 networksetup state on the next start.
         }
         Ok(())
     }
@@ -860,8 +849,21 @@ impl CoreSession {
         } else {
             settings.test_latency_url.trim()
         };
-        let payload = proto_wire::encode_test_req(&config, &tags, url, false, false, 8, 8000);
-        let timeout = Duration::from_secs(30 + 10 * profiles.len() as u64);
+        let allowance_ms = profiles
+            .iter()
+            .map(|profile| throne_domain::dns_tunnel_startup_allowance_ms(profile.profile_type))
+            .max()
+            .unwrap_or(0);
+        let allowance_total: u64 = profiles
+            .iter()
+            .map(|profile| throne_domain::dns_tunnel_startup_allowance_ms(profile.profile_type))
+            .sum();
+        let test_timeout_ms =
+            i32::try_from(8_000u64.saturating_add(allowance_ms)).unwrap_or(i32::MAX);
+        let payload =
+            proto_wire::encode_test_req(&config, &tags, url, false, false, 8, test_timeout_ms);
+        let timeout =
+            Duration::from_secs(30 + 10 * profiles.len() as u64 + allowance_total.div_ceil(1000));
         self.url_test_with_query_poll(&payload, &tags, timeout, on_progress)
     }
 

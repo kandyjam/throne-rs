@@ -3928,6 +3928,10 @@ impl MainWindow {
         if let Some(url) = report.pending_sub_url {
             msg.push_str(&format!(" · subscription URL pending: {url}"));
         }
+        if !report.notes.is_empty() {
+            msg.push_str(" · ");
+            msg.push_str(&report.notes.join(" · "));
+        }
         self.state.set_status_message(msg);
         if n > 0 || nr > 0 {
             let _ = self.persist_db();
@@ -5054,7 +5058,6 @@ impl MainWindow {
                         cx.spawn(async move |this, cx| {
                             cx.background_spawn(async move {
                                 force_clear_system_proxy();
-                                let _ = throne_core_client::set_tun_system_dns(false, "");
                             })
                             .await;
                             this.update(cx, |this, cx| {

@@ -12,7 +12,29 @@ description: >-
 Keep **throne-rs** (`rewrite/rust-gpui`) behaviorally aligned with
 [throneproj/Throne](https://github.com/throneproj/Throne) without reintroducing Qt.
 
-## 1.4.0-beta.5 feature notes (current pin)
+## 1.4.0 feature notes (current pin)
+
+Target `99f7ecd1` (2026-11-05); audited 2026-11-06. All 7 commits since beta.6 are triaged in `docs/UPSTREAM_TRACKING.md`. `upstream/dev` is `1.4.0-2-g1346d9ee`; `5f92cd98` and `1346d9ee` are excluded. This release pin does not assert complete product parity.
+
+- MasterDNS SOCKS user and password stay ignored and no longer produce an import note. Dial-field, REALITY padding, AnyTLS fast-open, Hysteria `pinSHA256`, WireGuard `DNS`/`AllowedIPs`, and OpenVPN redirect-gateway warnings were not emitted.
+- Core pins: sing-box `6bc5c846150e`, uTLS `f0ae7792aa1d`, Xray `1c6eb7771c4d`, WireGuard `e11787583013`. The MASQUE change is inside sing-box. Native WARP generation remains unported. Both patches still guard the beta.5/beta.6 source hashes.
+- The remote API gained connections, WARP, profile-config, and route-editing endpoints. That API stays unported. Qt title-bar theming and the connections `doItemsLayout` crash fix are N/A.
+- Simple interface, web UI, About/donation, log export, and historical headless/API/scanner/Kill Switch/hotkey gaps remain explicit.
+- Executed on 2026-11-06: 301 tests in throne-domain, throne-import, and throne-core-client; `cargo check -p throne`. Source hashes for `reality_client.go` and `source_darwin.go` match the beta.6 guards. `THRONE_CORE_VERIFY_PATCHES=1 ./script/build-core target/parity-1.4.0` exited 0 (race tests, 78M audit binary). Full workspace tests, strict Clippy, throne-storage, and the 13 actual-core smoke groups were not re-run. Native GUI, privileged DNS/TUN, and cross-platform runtime remain untested.
+
+## 1.4.0-beta.6 feature notes (historical pin)
+
+Target `4b1904e3` (2026-11-04); audited 2026-11-04. All 15 commits since beta.5 are triaged in `docs/UPSTREAM_TRACKING.md`. `upstream/dev` is `1.4.0-beta.6-1-gb8074099`; `b8074099` (fix rare crash) is excluded. This release pin does not assert complete product parity.
+
+- DNSTT and MasterDNS persist as `dnstt` and `masterdns`. `dnst://`, unencrypted `slipnet://`, `masterdns://` / `stormdns://` yptun, and profile JSON import into ExportToJson. Config build strips `server`, turns resolver lines into sing-box objects or MasterDNS strings, and uses the system resolver when the list is empty. URL tests add 30s per DNSTT and 90s per MasterDNS. The editor edits domain, key, mode, resolvers, and DNSTT backend credentials.
+- Encrypted SlipNet links fail visibly. MasterDNS TOML (`v1/`) returns "this MasterDNS link format is not supported." DNSTT resolver ranges are not expanded. Resolver IP lists, the xdns form, and scanner DNS probes stay partial. Chain inner hops stay unwired.
+- macOS Start emits DNS type `local` and does not add a `dns-system` inbound. The core publishes a temporary network service and routes `0.0.0.0/8` into the Tun. The Tun-prefix exclude hole stays, because system DNS is the next address inside that prefix. A failed Start does not blank networksetup DNS.
+- `SystemDNSOverride` and `sing-box-darwin-system-dns.patch` stay so a leftover `127.0.0.53` record is not used as an upstream. `RestoreLegacy` undoes a dead beta.4/beta.5 networksetup state. Do not replay the old `netmon` follow onto the rewritten `sysdns_darwin.go`.
+- Core pins: sing-box `f25a530dc468`, sing-tun `55c7bb51acc7`, Xray `1c6eb7771c4d`, WireGuard `e11787583013`. Both patches apply with zero fuzz. The unpatched REALITY and Darwin source hashes are unchanged from beta.5. Log export, Qt themes, CI, and the shorter upstream README are not ported.
+- Simple interface, web UI, About/donation, and historical headless/API/scanner/Kill Switch/hotkey gaps remain explicit.
+- Executed on 2026-11-04: 298 tests in throne-domain, throne-import, and throne-core-client; `cargo check -p throne`. Go tests of sysdns, rpc, probe, and scan passed (69). `THRONE_CORE_VERIFY_PATCHES=1 ./script/build-core target/parity-beta6` exited 0 (race tests, 78M audit binary). Full workspace tests, strict Clippy, throne-storage, and the 13 actual-core smoke groups were not re-run. Native GUI, privileged DNS/TUN, and cross-platform runtime remain untested.
+
+## 1.4.0-beta.5 feature notes (historical pin)
 
 Target `ec2420df` (2026-11-02); audited 2026-11-03. All 40 commits since beta.4 are triaged in `docs/UPSTREAM_TRACKING.md`. `upstream/dev` is `1.4.0-beta.5-2-ga76f33cf`; later commits (`a76f33cf` remove custom fund address, `4c5b1e0a` shorter README) are excluded. This release pin does not assert complete product parity.
 
@@ -59,8 +81,8 @@ All **16 commits** since beta.2 are triaged in `docs/UPSTREAM_TRACKING.md`; the 
 | Item | Value |
 |------|--------|
 | Upstream remote | `upstream` → `https://github.com/throneproj/Throne.git` |
-| **Pin** | tag **`1.4.0-beta.5`** (`ec2420df`, 2026-11-02) |
-| `upstream/dev` at last audit | `1.4.0-beta.5-2-ga76f33cf` on 2026-11-03 — later commits excluded |
+| **Pin** | tag **`1.4.0`** (`99f7ecd1`, 2026-11-05) |
+| `upstream/dev` at last audit | `1.4.0-2-g1346d9ee` on 2026-11-06 — `5f92cd98` and `1346d9ee` excluded |
 | Product version | root `VERSION` + workspace `Cargo.toml` `version` |
 | Matrix | [`docs/UPSTREAM_TRACKING.md`](../../docs/UPSTREAM_TRACKING.md) |
 | Audit command | `./script/upstream-audit [tag]` |
@@ -91,7 +113,7 @@ git archive <tag> core | tar -x
 # re-apply the local patch (do not drop it)
 ```
 
-**Local patch:** `core/internal/sysdns/sysdns_darwin.go` resolves the physical NIC through `netmon.DefaultInterface()` (TUN/loopback excluded) before sing-box's monitor. The 1.4.0-beta.1 removal of the `boxdns` monitor must not drop this hardening; sing-box's default interface can follow `utun` after `auto_route`.
+**Local patch:** keep `core/internal/boxmain/context.go` injecting `sysdns.DNSOverride` and `core/patches/sing-box-darwin-system-dns.patch`. Beta.6 `Apply(tunCIDR)` publishes a temporary network service; do not replay the old `netmon.DefaultInterface()` follow onto `sysdns_darwin.go`. `RestoreLegacy` cleans a dead beta.4/beta.5 `127.0.0.53` networksetup state.
 
 Proto lives at `core/gen/libcore.proto`. New contracts since 1.3.0-beta.3 include `WarpRegister`, `CaptureDiagnostics`, `StopDiagnostics`, `UpdateRuleSets`, scanner/egress RPCs and the target's guard support. Retired standalone DNS-hijack RPCs are removed. Field 12 `vpn_status_timeout_ms` is reserved. Do not invent framing; the Rust client is length-prefixed method + protobuf.
 

@@ -45,7 +45,7 @@ echo "==> generating gen/ from libcore.proto"
     libcore.proto
 )
 
-# Match upstream throneproj/Throne `script/build_go.sh` (tag 1.4.0-beta.5, module root `core/`).
+# Match upstream throneproj/Throne `script/build_go.sh` (tag 1.4.0, module root `core/`).
 # Base tags + platform extras. Override with THRONE_CORE_TAGS=...
 if [[ -n "${THRONE_CORE_TAGS:-}" ]]; then
   TAGS="$THRONE_CORE_TAGS"
@@ -80,7 +80,7 @@ echo "    tags: $TAGS"
   export GOWORK=off
   VERSION_SINGBOX="$("$GO_BIN" list -m -f '{{.Version}}' github.com/sagernet/sing-box)"
   SINGBOX_REPLACE="$("$GO_BIN" list -m -f '{{with .Replace}}{{.Path}} {{.Version}}{{end}}' github.com/sagernet/sing-box)"
-  EXPECTED_SINGBOX="github.com/throneproj/sing-box v1.11.16-0.20261031212642-af51a7460ccd"
+  EXPECTED_SINGBOX="github.com/throneproj/sing-box v1.11.16-0.20261105144313-6bc5c846150e"
   if [[ "$SINGBOX_REPLACE" != "$EXPECTED_SINGBOX" ]]; then
     echo "error: re-audit core/patches/sing-box-reality-mlkem.patch for $SINGBOX_REPLACE" >&2
     exit 1

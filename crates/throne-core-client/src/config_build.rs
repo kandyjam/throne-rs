@@ -94,7 +94,7 @@ pub fn build_load_config_ex(
             "Auto Selector requires resolved members — call resolve_auto_selector_members first"
                 .into(),
         ));
-    } else if is_xray_full_config_member(profile) {
+    } else if bridges_xray_full(profile) {
         let bridge = build_xray_full_member(profile, settings)?;
         xray_full_configs.push(bridge.xray_config);
         let domains = collect_outbound_server_domains(profile);
@@ -180,9 +180,9 @@ pub fn build_load_config_ex(
         // Upstream route_exclude_address (1.2.3+ / #1738 macOS DNS fix):
         // - loopback + broadcast always excluded
         // - private LAN ranges excluded when bypass is enabled
-        // - on Darwin, punch a hole for the Tun subnet itself: system DNS is
-        //   historically used this subnet; preserve the compatibility carve-out
-        //   while beta.4 system DNS itself uses the loopback alias below.
+        // - on Darwin, punch a hole for the Tun subnet itself. Beta.6 system
+        //   DNS is the next address inside that prefix, so excluding the prefix
+        //   would keep queries to tun+1 off the Tun.
         if !settings.disable_private_range_bypass {
             let excludes = build_tun_route_exclude_addrs(
                 &tun_ipv4_cidr,
@@ -194,13 +194,6 @@ pub fn build_load_config_ex(
                 .insert("route_exclude_address".into(), json!(excludes));
         }
         inbounds.push(tun);
-        if cfg!(target_os = "macos") {
-            // dns-system stays ahead of dns-in, mixed, and tun.
-            inbounds.insert(
-                0,
-                json!({"type":"direct","tag":"dns-system","listen":"127.0.0.53","listen_port":53,"reuse_addr":true}),
-            );
-        }
     }
 
     let (mut route_rules, mut rule_sets, route_final) =
@@ -212,9 +205,6 @@ pub fn build_load_config_ex(
         route_rules.insert(2, json!({"inbound":"dns-in","action":"reject"}));
     } else {
         route_rules.push(json!({"inbound":"dns-in","action":"reject"}));
-    }
-    if cfg!(target_os = "macos") && settings.tun_mode_enabled {
-        route_rules.insert(0, json!({"inbound":"dns-system","action":"hijack-dns"}));
     }
     let l3_bridge = l3_bridge_enabled(settings, route_profile);
     if l3_bridge {
@@ -1365,7 +1355,7 @@ fn build_auto_selector_outbounds(
 
     for member in &auto.members {
         let tag = format!("p{}", member.id);
-        let mut ob = if is_xray_full_config_member(member) {
+        let mut ob = if bridges_xray_full(member) {
             let bridge = build_xray_full_member(member, settings)?;
             xray_full_configs.push(bridge.xray_config);
             any_xray_member = true;
@@ -1527,6 +1517,28 @@ fn build_xray_full_member(
     })
 }
 
+/// Share-link XHTTP is stored as Xray VLESS, with the same `xrayfullconfig` document
+/// Custom profiles use. Start must bridge either shape.
+fn bridges_xray_full(profile: &Profile) -> bool {
+    if is_xray_full_config_member(profile) {
+        return true;
+    }
+    serde_json::from_str::<Value>(&profile.outbound_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("subtype")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .is_some_and(|subtype| {
+            matches!(
+                subtype.as_str(),
+                "xrayfullconfig" | "xray_full" | "xray-full"
+            )
+        })
+}
+
 fn xray_full_config_raw(profile: &Profile) -> Option<String> {
     if let Ok(v) = serde_json::from_str::<Value>(&profile.outbound_json) {
         if let Some(cfg) = v.get("config").and_then(|c| c.as_str()) {
@@ -1603,6 +1615,7 @@ fn build_proxy_outbound(profile: &Profile) -> Result<Value, CoreError> {
         None => from_parsed(profile.profile_type, &profile.outbound)?,
     };
     finalize_hysteria_outbound(&mut out);
+    finalize_dns_tunnel_outbound(&mut out)?;
     Ok(out)
 }
 
@@ -1696,6 +1709,281 @@ fn finalize_hysteria_outbound(out: &mut Value) {
         }
         _ => {}
     }
+}
+
+/// Turn a stored DNSTT or MasterDNS bean into the sing-box outbound.
+///
+/// The profile has no server. Resolver lines become DNSTT objects or
+/// MasterDNS strings. An empty list uses the system resolver. `tcp_fallback`
+/// is applied to UDP resolvers and then removed.
+fn finalize_dns_tunnel_outbound(out: &mut Value) -> Result<(), CoreError> {
+    let Some(obj) = out.as_object_mut() else {
+        return Ok(());
+    };
+    let kind = obj.get("type").and_then(Value::as_str).unwrap_or("");
+    if kind != "dnstt" && kind != "masterdns" {
+        return Ok(());
+    }
+    let kind = kind.to_string();
+    obj.remove("server");
+    obj.remove("server_port");
+    let tcp_fallback = obj
+        .remove("tcp_fallback")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    obj.remove("resolver_list");
+    let stored = obj.get("resolvers").cloned();
+    let resolvers = if kind == "dnstt" {
+        dnstt_resolvers(stored.as_ref(), tcp_fallback)?
+    } else {
+        masterdns_resolvers(stored.as_ref())?
+    };
+    obj.insert("resolvers".into(), resolvers);
+    if kind == "dnstt" {
+        if obj
+            .get("mode")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            obj.insert("mode".into(), json!("dnstt"));
+        }
+        if let Some(key) = obj.get("public_key").and_then(Value::as_str) {
+            let lowered = key.trim().to_ascii_lowercase();
+            obj.insert("public_key".into(), json!(lowered));
+        }
+    } else {
+        if obj
+            .get("mode")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            obj.insert("mode".into(), json!("socks5"));
+        }
+        if obj
+            .get("encryption_method")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            obj.insert("encryption_method".into(), json!("xor"));
+        }
+        if let Some(domains) = obj.get("domain").and_then(Value::as_array) {
+            if domains.is_empty() {
+                return Err(CoreError::Config("MasterDNS profile has no domain".into()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn dnstt_resolvers(stored: Option<&Value>, tcp_fallback: bool) -> Result<Value, CoreError> {
+    let mut resolvers = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for entry in resolver_entries(stored)? {
+        let mut object = match entry {
+            ResolverEntry::Object(object) => object,
+            ResolverEntry::Line(line) => dnstt_resolver_line(&line)?,
+        };
+        if object.is_null() {
+            continue;
+        }
+        if tcp_fallback && object.get("type").and_then(Value::as_str) == Some("udp") {
+            object
+                .as_object_mut()
+                .expect("resolver object")
+                .insert("tcp_fallback".into(), json!(true));
+        }
+        let key = format!(
+            "{}|{}|{}|{}",
+            object.get("type").and_then(Value::as_str).unwrap_or(""),
+            object.get("server").and_then(Value::as_str).unwrap_or(""),
+            object
+                .get("server_port")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            object.get("path").and_then(Value::as_str).unwrap_or("")
+        );
+        if seen.insert(key) {
+            resolvers.push(object);
+        }
+    }
+    if resolvers.is_empty() {
+        resolvers.push(json!({"type": "system"}));
+    }
+    Ok(Value::Array(resolvers))
+}
+
+fn masterdns_resolvers(stored: Option<&Value>) -> Result<Value, CoreError> {
+    let mut resolvers = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for entry in resolver_entries(stored)? {
+        let text = match entry {
+            ResolverEntry::Line(line) => {
+                if line.contains("://") {
+                    return Err(CoreError::Config(format!(
+                        "MasterDNS resolver \"{line}\" must be a host, not a URL"
+                    )));
+                }
+                line
+            }
+            ResolverEntry::Object(object) => {
+                if object.get("type").and_then(Value::as_str) == Some("system") {
+                    "system".to_string()
+                } else if let Some(server) = object.get("server").and_then(Value::as_str) {
+                    match object.get("server_port").and_then(Value::as_u64) {
+                        Some(port) if port > 0 => format!("{server}:{port}"),
+                        _ => server.to_string(),
+                    }
+                } else {
+                    continue;
+                }
+            }
+        };
+        let text = text.trim();
+        if text.is_empty() || text.starts_with('#') {
+            continue;
+        }
+        if seen.insert(text.to_ascii_lowercase()) {
+            resolvers.push(json!(text));
+        }
+    }
+    if resolvers.is_empty() {
+        resolvers.push(json!("system"));
+    }
+    Ok(Value::Array(resolvers))
+}
+
+enum ResolverEntry {
+    Line(String),
+    Object(Value),
+}
+
+fn resolver_entries(stored: Option<&Value>) -> Result<Vec<ResolverEntry>, CoreError> {
+    let Some(stored) = stored else {
+        return Ok(Vec::new());
+    };
+    match stored {
+        Value::String(text) => Ok(text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(|line| ResolverEntry::Line(line.to_string()))
+            .collect()),
+        Value::Array(items) => {
+            let mut entries = Vec::new();
+            for item in items {
+                if let Some(text) = item.as_str() {
+                    if !text.trim().is_empty() {
+                        entries.push(ResolverEntry::Line(text.trim().to_string()));
+                    }
+                } else if item.is_object() {
+                    entries.push(ResolverEntry::Object(item.clone()));
+                } else {
+                    return Err(CoreError::Config(
+                        "a DNS tunnel resolver must be text or an object".into(),
+                    ));
+                }
+            }
+            Ok(entries)
+        }
+        Value::Null => Ok(Vec::new()),
+        _ => Err(CoreError::Config(
+            "DNS tunnel resolvers must be a list".into(),
+        )),
+    }
+}
+
+fn dnstt_resolver_line(line: &str) -> Result<Value, CoreError> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return Ok(Value::Null);
+    }
+    if line.eq_ignore_ascii_case("system") {
+        return Ok(json!({"type": "system"}));
+    }
+    if line.contains("://") {
+        return dnstt_resolver_url(line);
+    }
+    if line.contains('/') {
+        return Err(CoreError::Config(format!(
+            "DNSTT resolver range \"{line}\" is not expanded"
+        )));
+    }
+    let (server, port) = split_host_port(line)?;
+    let mut object = json!({"type": "udp", "server": server});
+    if let Some(port) = port {
+        object["server_port"] = json!(port);
+    }
+    Ok(object)
+}
+
+fn dnstt_resolver_url(line: &str) -> Result<Value, CoreError> {
+    let (scheme, rest) = line
+        .split_once("://")
+        .ok_or_else(|| CoreError::Config(format!("invalid resolver \"{line}\"")))?;
+    let scheme = scheme.to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "udp" | "tcp" | "tls" | "https") {
+        return Err(CoreError::Config(format!(
+            "unsupported resolver scheme in \"{line}\""
+        )));
+    }
+    let (authority, path) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, format!("/{path}")),
+        None => (rest, String::new()),
+    };
+    if !path.is_empty() && path != "/" && scheme != "https" {
+        return Err(CoreError::Config(
+            "Only https:// addresses take a path.".into(),
+        ));
+    }
+    let (server, port) = split_host_port(authority)?;
+    if server.is_empty() {
+        return Err(CoreError::Config(format!("invalid resolver \"{line}\"")));
+    }
+    let mut object = json!({"type": scheme, "server": server});
+    if let Some(port) = port {
+        object["server_port"] = json!(port);
+    }
+    if scheme == "https" && !path.is_empty() && path != "/" {
+        object["path"] = json!(path);
+    }
+    if scheme == "tls" || scheme == "https" {
+        let mut tls = json!({"enabled": true});
+        if server.parse::<std::net::IpAddr>().is_err() {
+            tls["server_name"] = json!(server);
+        }
+        object["tls"] = tls;
+    }
+    Ok(object)
+}
+
+fn split_host_port(text: &str) -> Result<(String, Option<u16>), CoreError> {
+    let text = text.trim();
+    if let Some(rest) = text.strip_prefix('[') {
+        let Some((host, after)) = rest.split_once(']') else {
+            return Err(CoreError::Config(format!("invalid resolver \"{text}\"")));
+        };
+        let port = if let Some(port) = after.strip_prefix(':') {
+            Some(parse_resolver_port(port)?)
+        } else if after.is_empty() {
+            None
+        } else {
+            return Err(CoreError::Config(format!("invalid resolver \"{text}\"")));
+        };
+        return Ok((host.to_string(), port));
+    }
+    if let Some((host, port)) = text.rsplit_once(':') {
+        if !host.contains(':') && !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
+            return Ok((host.to_string(), Some(parse_resolver_port(port)?)));
+        }
+    }
+    Ok((text.to_string(), None))
+}
+
+fn parse_resolver_port(text: &str) -> Result<u16, CoreError> {
+    text.parse::<u16>()
+        .ok()
+        .filter(|port| *port > 0)
+        .ok_or_else(|| CoreError::Config(format!("invalid resolver port \"{text}\"")))
 }
 
 fn stored_positive_mbps(value: Option<&Value>) -> Option<u32> {
@@ -1873,6 +2161,8 @@ fn is_singbox_outbound_type(ty: &str) -> bool {
             | "snell"
             | "openvpn"
             | "openconnect"
+            | "dnstt"
+            | "masterdns"
     )
 }
 
@@ -2662,23 +2952,19 @@ fn underlying_dns_address(settings: &AppSettings) -> Result<String, CoreError> {
     Ok(String::new())
 }
 
-/// macOS Tun and URL tests must not use sing-box `local`. The system resolver
-/// points at `dns-system`, and `local` loops through it (#2045).
+/// DNS type for an empty or `local` resolver address.
+///
+/// Beta.6 no longer publishes the macOS `dns-system` listener. The core's
+/// temporary network service and `0.0.0.0/8` route scope lookups into the Tun,
+/// so Start emits `local` on every platform.
 fn system_resolver_type(tun_enabled: bool, for_test: bool) -> &'static str {
-    #[cfg(target_os = "macos")]
-    if tun_enabled || for_test {
-        return "underlying";
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (tun_enabled, for_test);
-    }
+    let _ = (tun_enabled, for_test);
     "local"
 }
 
 /// Upstream `buildDnsObj(address, ctx)`.
 ///
-/// `local` / `localhost` stays type `local` except on macOS Tun and URL tests.
+/// `local` / `localhost` stays type `local`.
 fn build_dns_obj(address: &str, tun_enabled: bool, for_test: bool, underlying: &str) -> Value {
     let _ = underlying;
     let address = address.trim();
@@ -2768,6 +3054,35 @@ fn build_dns_server_obj(address: &str) -> Value {
 mod tests {
     use super::*;
     use throne_domain::{ParsedOutbound, Profile, ProfileType, RulesetMirror};
+
+    #[test]
+    fn xhttp_share_link_starts_through_the_xray_bridge() {
+        let link = "vless://34b67040-a3d5-42e1-ab6b-6e9c7903e7ae@xray-e0vuv8l6-workspace-5fszck.cloady.io:443?encryption=none&security=tls&sni=xray-e0vuv8l6-workspace-5fszck.cloady.io&fp=chrome&type=XHTTP&path=%2F7728c2990164a8f9&mode=auto&packetEncoding=xudp#xray-usw1";
+        let mut report = throne_import::import_text(link);
+        let imported = report.profiles.remove(0);
+        let mut profile = Profile::new(7, 1, imported.name, imported.profile_type);
+        profile.outbound_json = imported.outbound.to_db_json(imported.profile_type);
+        profile.outbound = imported.outbound;
+        let built = build_load_config(&profile, &AppSettings::default(), None).unwrap();
+        assert_eq!(
+            built.xray_full_configs.len(),
+            1,
+            "{}",
+            built.core_config_json
+        );
+        let xray: Value = serde_json::from_str(&built.xray_full_configs[0]).unwrap();
+        let outbound = &xray["outbounds"][0];
+        assert_eq!(outbound["protocol"], "vless");
+        assert_eq!(
+            outbound["settings"]["vnext"][0]["users"][0]["id"],
+            "34b67040-a3d5-42e1-ab6b-6e9c7903e7ae"
+        );
+        assert_eq!(
+            outbound["streamSettings"]["xhttpSettings"]["path"],
+            "/7728c2990164a8f9"
+        );
+        assert_eq!(xray["inbounds"][0]["protocol"], "socks");
+    }
 
     #[test]
     fn ech_query_and_bootstrap_rule_share_canonical_domain_identity() {
@@ -3277,6 +3592,57 @@ mod tests {
     }
 
     #[test]
+    fn dns_tunnel_outbound_strips_server_and_normalizes_resolvers() {
+        let mut profile = Profile::new(1, 1, "tunnel", ProfileType::Dnstt);
+        profile.outbound_json = json!({
+            "type": "dnstt",
+            "mode": "dnstt",
+            "domain": "tunnel.example",
+            "public_key": "AB",
+            "server": "should-go",
+            "server_port": 1,
+            "tcp_fallback": true,
+            "resolvers": ["1.1.1.1:53", "system"]
+        })
+        .to_string();
+        let built = build_load_config(&profile, &AppSettings::default(), None).unwrap();
+        let v: Value = serde_json::from_str(&built.core_config_json).unwrap();
+        let proxy = v["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|outbound| outbound["tag"] == "proxy")
+            .unwrap();
+        assert!(proxy.get("server").is_none());
+        assert!(proxy.get("tcp_fallback").is_none());
+        assert_eq!(proxy["resolvers"][0]["type"], "udp");
+        assert_eq!(proxy["resolvers"][0]["server"], "1.1.1.1");
+        assert_eq!(proxy["resolvers"][0]["server_port"], 53);
+        assert_eq!(proxy["resolvers"][0]["tcp_fallback"], true);
+        assert_eq!(proxy["resolvers"][1], json!({"type": "system"}));
+        assert_eq!(proxy["public_key"], "ab");
+
+        let mut master = Profile::new(2, 1, "master", ProfileType::MasterDns);
+        master.outbound_json = json!({
+            "type": "masterdns",
+            "domain": ["dns.example"],
+            "encryption_method": "xor",
+            "encryption_key": "k"
+        })
+        .to_string();
+        let built = build_load_config(&master, &AppSettings::default(), None).unwrap();
+        let v: Value = serde_json::from_str(&built.core_config_json).unwrap();
+        let proxy = v["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|outbound| outbound["tag"] == "proxy")
+            .unwrap();
+        assert_eq!(proxy["resolvers"], json!(["system"]));
+        assert_eq!(proxy["mode"], "socks5");
+    }
+
+    #[test]
     fn tun_allows_local_dns_without_override() {
         // 1.3.0 dropped the Darwin "Local DNS and Tun mode do not work together" error.
         let mut p = Profile::new(1, 1, "n1", ProfileType::Vless);
@@ -3297,11 +3663,10 @@ mod tests {
             .iter()
             .find(|s| s["tag"] == "dns-local")
             .unwrap();
-        // macOS Tun uses `underlying` so `local` does not loop through dns-system (#2045).
-        #[cfg(target_os = "macos")]
-        assert_eq!(local["type"], "underlying");
-        #[cfg(not(target_os = "macos"))]
+        // Beta.6 scopes macOS lookups with a temporary service, so local no longer
+        // loops through a 127.0.0.53 dns-system inbound.
         assert_eq!(local["type"], "local");
+        assert!(!v.to_string().contains("dns-system"));
         assert_eq!(v["experimental"]["cache_file"]["store_dns"], false);
         assert_eq!(v["experimental"]["cache_file"]["store_fakeip"], false);
         let tun = v["inbounds"]

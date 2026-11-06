@@ -4,6 +4,7 @@
 //! (profiles, groups, routes, runtime status) without Qt dependencies.
 
 mod auto_selector;
+mod dns_tunnel;
 mod endpoint_source;
 mod ip_list;
 mod ip_scan;
@@ -22,6 +23,7 @@ pub use auto_selector::{
     rerank_auto_selector_pool, AutoSelectorConfig, AutoSelectorPlan, AutoSelectorSkip,
     CustomMemberKind,
 };
+pub use dns_tunnel::{dns_tunnel_identity, dns_tunnel_startup_allowance_ms};
 pub use endpoint_source::{
     effective_endpoint_source, endpoint_override_blocker, materialize_profile_endpoint,
     resolve_endpoint_source, EndpointError, EndpointSource,

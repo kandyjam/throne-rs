@@ -2268,6 +2268,11 @@ fn profile_identity_key(profile: &Profile) -> String {
 }
 
 fn subscription_item_identity_key(profile_type: ProfileType, outbound: &ParsedOutbound) -> String {
+    if let Some(raw) = outbound.raw_json.as_deref() {
+        if let Some(identity) = crate::dns_tunnel_identity(profile_type, raw) {
+            return identity;
+        }
+    }
     let has_structured_identity = outbound.server.is_some()
         || outbound.server_port.is_some()
         || outbound.uuid.is_some()

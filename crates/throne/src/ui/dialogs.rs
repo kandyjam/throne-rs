@@ -315,7 +315,7 @@ impl Dialog {
             draft,
             tab,
             error: String::new(),
-            type_label: p.profile_type.as_str().to_string(),
+            type_label: p.display_type(),
             selector_groups: throne_domain::profile_auto_selector(p).map(|cfg| cfg.gids),
         })
     }

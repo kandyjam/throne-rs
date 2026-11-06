@@ -164,7 +164,10 @@ pub fn profile_security(profile: &Profile, skip_cert: bool) -> SecurityInfo {
     })
     .or_else(|| serde_json::from_str(&profile.export_outbound_json()).ok())
     .unwrap_or(Value::Null);
-    if profile.profile_type == ProfileType::Custom {
+    let subtype = value.get("subtype").and_then(Value::as_str).unwrap_or("");
+    if profile.profile_type == ProfileType::Custom
+        || matches!(subtype, "xrayfullconfig" | "xray_full" | "xray-full")
+    {
         return custom_security(&value);
     }
     if value.get("protocol").and_then(Value::as_str).is_some() {
@@ -241,6 +244,12 @@ fn singbox_security(ty: ProfileType, value: &Value, skip_cert: bool) -> Security
                 SecurityInfo::new("TLS", Secure)
             }
         }
+        Dnstt => SecurityInfo::new("Encrypted", Secure),
+        MasterDns => match text(value, "encryption_method") {
+            "none" => SecurityInfo::new("Raw", None),
+            method if method.starts_with("aes-") => SecurityInfo::new("Plaintext Replies", Weak),
+            _ => SecurityInfo::new("Weak Cipher", Weak),
+        },
         Wireguard | Snell | Mieru | Tailscale => SecurityInfo::new("Encrypted", Secure),
         _ => {
             let must_tls = matches!(
@@ -289,7 +298,8 @@ fn singbox_security(ty: ProfileType, value: &Value, skip_cert: bool) -> Security
         Naive | TrustTunnel if value["quic"] == true => "QUIC".into(),
         Tailscale => "WireGuard".into(),
         Wireguard if value["enable_amnezia"] == true => "AmneziaWG".into(),
-        Shadowsocks | Ssh | OpenVpn | OpenConnect | Wireguard | Snell | Mieru => String::new(),
+        Shadowsocks | Ssh | OpenVpn | OpenConnect | Wireguard | Snell | Mieru | Dnstt
+        | MasterDns => String::new(),
         _ => transport_name(text(&value["transport"], "type")),
     };
     if skip_cert && info.ca_verified && ty != Naive {

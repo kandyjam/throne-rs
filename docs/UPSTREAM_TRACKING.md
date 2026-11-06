@@ -2,9 +2,9 @@
 
 Remote: `upstream` → `https://github.com/throneproj/Throne.git`  
 Baseline branch: `upstream/dev`  
-**Target release (this audit):** tag **`1.4.0-beta.5`** (`ec2420df`, 2026-11-02).
-**Last audited tip:** `upstream/dev` describe **`1.4.0-beta.5-2-ga76f33cf`** on 2026-11-03 (2 commits past the pin; not absorbed).
-**Product version:** `1.4.0-beta.5` (root [`VERSION`](../VERSION) + workspace Cargo version = this pin).
+**Target release (this audit):** tag **`1.4.0`** (`99f7ecd1`, 2026-11-05).
+**Last audited tip:** `upstream/dev` describe **`1.4.0-2-g1346d9ee`** on 2026-11-06 (2 commits past the pin: `5f92cd98` telegram README link, `1346d9ee` Homebrew postflight; not absorbed).
+**Product version:** `1.4.0` (root [`VERSION`](../VERSION) + workspace Cargo version = this pin).
 
 This pin identifies the audited release baseline; it does not claim complete product parity. The new remote control API, full scanner, Kill Switch, global hotkeys, OS proxy refactor, and historical gaps below remain partial or unported.
 
@@ -14,7 +14,7 @@ Agent skill for ongoing parity work: [`skills/throne-upstream-parity/SKILL.md`](
 
 ```bash
 ./script/upstream-audit            # current VERSION → newest 1.* tag
-./script/upstream-audit 1.4.0-beta.5 # explicit release tag
+./script/upstream-audit 1.4.0 # explicit release tag
 ```
 
 Manual equivalent:
@@ -24,6 +24,56 @@ git fetch upstream --prune --tags
 git log --oneline 1.4.0-beta.4..1.4.0-beta.5
 git diff --dirstat=files,0 1.4.0-beta.4 1.4.0-beta.5
 ```
+
+## 1.4.0 audit (2026-11-06)
+
+**Pinned release:** `99f7ecd1e7175d0b7073333b3f4e9fc2137b918e` (2026-11-05), **7 commits** after beta.6 (`4b1904e3`). `upstream/dev` is `1.4.0-2-g1346d9ee`; `5f92cd98` (telegram README link) and `1346d9ee` (Homebrew `postflight_steps`) are excluded. This audit does not claim complete product parity.
+
+| Commit | Upstream change | Disposition in this rewrite |
+|--------|-----------------|-----------------------------|
+| `b8074099` | Connections tree `doItemsLayout` after a rare crash | N/A Qt widget layout |
+| `46e7dff3` | Native title bar follows the Qt color scheme | N/A Qt `QStyleHints` |
+| `7ce0953f` | Drop noisy import warnings | ✅ MasterDNS SOCKS listener credentials stay ignored and no longer produce a note. Dial-field, REALITY padding, AnyTLS fast-open, Hysteria `pinSHA256`, WireGuard `DNS`/`AllowedIPs`, and OpenVPN `bypass-dhcp`/`bypass-dns` warnings were not emitted here |
+| `a973efea` | uTLS secondary classical key share | ✅ `replace github.com/metacubex/utls => github.com/throneproj/utls v1.8.8-0.20261105093534-f0ae7792aa1d`. No Rust fingerprint field |
+| `39955b7d` | API for connections, WARP, profile config, and route editing | ⏳ Remote control API remains unported. `WarpConfigured` is the same missing-config check, extracted for that API. `NewSimpleRule` and `action_scope` are API helpers |
+| `cb89a14f` | Improve MASQUE | ✅ sing-box pin `6bc5c846150e`. The commit changes `protocol/warpmasque` and `transport/warpmasque` only. Native WARP generation remains ⏳ |
+| `99f7ecd1` | Bump to 1.4.0 | ✅ `VERSION`, workspace version, and README. Upstream changelog is not copied |
+
+Upstream `core/` between beta.6 and 1.4.0 changes only `go.mod` and `go.sum`. The local Darwin `sysdns` rewrite stays. Xray stays `1c6eb7771c4d`. WireGuard stays `e11787583013`. The downloaded sing-box module still requires sing-tun `55c7bb51acc7`. Unpatched `reality_client.go` is still `38a5d553fffd108afca51bde0b0888512d2f4633daa608e03767838b8fdcdbc0`. Unpatched `source_darwin.go` is still `72d4037c73ef1a71d0e56d25cbed3ba7eb79b3785b316eececbae6dc86ad2248`. Both patches applied with zero fuzz. `SystemDNSOverride` and `RestoreLegacy` stay. The remote API, simple interface, web UI, log export, and historical scanner/Kill Switch/hotkey gaps remain explicit.
+
+Executed on 2026-11-06: 301 tests in throne-domain, throne-import, and throne-core-client (15 suites); `cargo check -p throne`. `THRONE_CORE_VERIFY_PATCHES=1 ./script/build-core target/parity-1.4.0` exited 0 (systemconfig and sysdns race tests, 78M audit binary). Linker warned about duplicate `-lobjc` and `-lresolv`. Full workspace tests, strict Clippy, throne-storage, and the 13 actual-core smoke groups were not re-run. Native GUI, privileged DNS/TUN, and cross-platform runtime remain untested.
+
+## 1.4.0-beta.6 audit (2026-11-04)
+
+**Pinned release:** `4b1904e3252e4a99c25a91dbfc15b9c10fe77f1f` (2026-11-04), **15 commits** after beta.5 (`ec2420df`). `upstream/dev` is `1.4.0-beta.6-1-gb8074099`; `b8074099` (fix rare crash) is excluded. This audit does not claim complete product parity.
+
+| Commit | Upstream change | Disposition in this rewrite |
+|--------|-----------------|-----------------------------|
+| `4c5b1e0a` | Shorter README | N/A. This repo keeps the rewrite README |
+| `a76f33cf` | Remove custom fund address | N/A. No `.github/FUNDING.yml` here |
+| `9f75d82b` | Fix WireGuard stall | ✅ Inside the sing-box pin. No Rust DF/GSO flag |
+| `f14b86b3` | Reword macOS local DNS | ✅ Core temporary service + `0.0.0.0/8` route. Rust Start emits `local` and no `dns-system` inbound. GUI no longer blanks networksetup DNS |
+| `8327f362` | DNS tunnels | ✅ `dnstt` and `masterdns` persist, import, and build. Scanner DNS UI, xdns form, TOML links, and resolver IP lists stay partial |
+| `77aa05b1` | Fix CI | N/A |
+| `87585b70` | Qt themes | N/A |
+| `cc83f348` | Unify build env | N/A |
+| `32167664` | Update sing-box | ✅ Pin `f25a530dc468`, sing-tun `55c7bb51acc7`. Xray `1c6eb7771c4d` and WireGuard `e11787583013` unchanged |
+| `b71819c0` | manylinux ninja | N/A |
+| `d5efd9ca` | manylinux libxkbcommon | N/A |
+| `dae587ad` | arm64 deb smoke | N/A |
+| `60aae49f` | Included DNS test lists | 🧩 No Rust loader for `res/scanner/iran-resolvers.txt` or `russia-resolvers.txt` |
+| `f048c9cc` | Route editor freeze (#2064) | N/A Qt widget |
+| `4b1904e3` | Log export | ⏳ No native log-export surface |
+
+macOS Tun DNS is no longer a `127.0.0.53` direct inbound. The core publishes `State:/Network/Service/Throne/` after the box is up and routes `0.0.0.0/8` into the utun that holds the Tun address. Rust keeps the Tun-prefix `route_exclude` hole because that DNS server is the next address inside the prefix. `SystemDNSOverride` and `sing-box-darwin-system-dns.patch` stay, so a leftover beta.4/beta.5 alias is not used as an upstream. `RestoreLegacy` undoes a dead core's networksetup state. The obsolete `netmon` follow inside `sysdns_darwin.go` is not replayed. A failed Start does not call `networksetup -setdnsservers Empty`.
+
+DNSTT (`dnst://`, unencrypted `slipnet://`) and MasterDNS (`masterdns://`, `stormdns://`, yptun `v1?`, profile JSON) store ExportToJson and build sing-box outbounds with no server. Empty resolvers become `{type:system}` or the string `system`. URL tests add 30s per DNSTT profile and 90s per MasterDNS profile. The editor covers domain, key, mode, resolvers, and the DNSTT backend credentials. Encrypted SlipNet links fail with the upstream message. MasterDNS TOML (`v1/`) returns "this MasterDNS link format is not supported." DNSTT resolver ranges are rejected at config build instead of expanded. Chain inner hops are still not expanded. Subscription identity uses type, mode, domain, key, and backend, not the resolver list.
+
+`ScanDnsOptions` is appended to `libcore.proto`. The hand-written Rust scan encoder omits it, so old probes stay wire-compatible. The scanner UI does not expose DNS probes. Xray `xdns` stream settings still ride the full-config JSON bridge when the document already contains them. There is no xdns form.
+
+Both patches apply to `f25a530dc468` with zero fuzz. Unpatched `reality_client.go` is still `38a5d553fffd108afca51bde0b0888512d2f4633daa608e03767838b8fdcdbc0`. Unpatched `source_darwin.go` is still `72d4037c73ef1a71d0e56d25cbed3ba7eb79b3785b316eececbae6dc86ad2248`. `replaceManagedDNS` is unchanged.
+
+Executed on 2026-11-04: 298 tests in throne-domain, throne-import, and throne-core-client; `cargo check -p throne`. `go test` of `sysdns`, `rpc`, `probe`, and `scan` passed (69 tests) after regenerating `libcore.pb.go`, which stays gitignored. `THRONE_CORE_VERIFY_PATCHES=1 ./script/build-core target/parity-beta6` exited 0 (systemconfig and sysdns race tests, 78M audit binary). Linker warned about duplicate `-lobjc` and `-lresolv`. Full workspace tests, strict Clippy, throne-storage, and the 13 actual-core smoke groups were not re-run. Native GUI, privileged DNS/TUN, and cross-platform runtime remain untested.
 
 ## 1.4.0-beta.5 audit (2026-11-03)
 
@@ -251,13 +301,19 @@ Status legend: ✅ implemented for the stated contract · 🧩 partial · ⏳ pl
 | Profile editor tab order (1.2.4) | `33777e27` | ⏳ GPUI focus order later | `throne` |
 | Linux CLI installer | `89f3ec1d` | ⏳ | `script/` / xtask |
 | Windows unwritable config dir (1.2.4) | `d8e663cc` | ⏳ NSI; macOS package already uses AppConfig | `script/`, `throne` |
-| Core: sing-box / xray / TUN / DNS | Go `core/` (moved out of `core/server` in 1.3.0-beta.4) | ❌ Rust data-plane rewrite remains out of scope; shipping `ThroneCore` **synced to 1.4.0-beta.5** (sing-box `af51a7460ccd`, Xray `1c6eb7771c4d`, WireGuard `e11787583013`; ResolveDomains and rule metadata) with retained local Darwin/REALITY hardening | `core/` |
+| Core: sing-box / xray / TUN / DNS | Go `core/` (moved out of `core/server` in 1.3.0-beta.4) | ❌ Rust data-plane rewrite remains out of scope; shipping `ThroneCore` **synced to 1.4.0** (sing-box `6bc5c846150e`, sing-tun `55c7bb51acc7`, Xray `1c6eb7771c4d`, WireGuard `e11787583013`, uTLS `f0ae7792aa1d`) with retained Darwin override and REALITY hardening | `core/` |
 | **Per-group routing (1.4.0-beta.5)** | `3c7cab39` | 🧩 `route_id` / `import_sub_route` / `source_gid`; Start and domain resolve use the group route; subscription route import. No editor. Chain inner hops remain | `throne-domain`, `throne-storage`, `throne-import`, `throne` |
 | **DNS for other devices (1.4.0-beta.5)** | `617f8baa` | 🧩 direct `dns-in` on Start, loopback unless `core_dns_in_lan`, port default 5533, reject rule. No settings control. URL tests stay without it | `throne-domain`, `throne-core-client` |
 | **Hysteria obfs and v1 bandwidth (1.4.0-beta.5)** | `591bb264`, `51274c94` | ✅ empty/none/plain obfs off; v1 defaults 10/50 at config build; Clash unit parser. Hy2 `user:pass` not re-ported | `throne-import`, `throne-core-client` |
 | **Subscription successor reconnect (1.4.0-beta.5)** | `f6d42fa7` | ✅ one same-type same-name successor; otherwise stop and stay stopped | `throne-domain`, `throne` |
 | **Auto Selector country and quorum (1.4.0-beta.5)** | `1af312fb`, `6891043a` | 🧩 pure helpers only; Start does not wait for a quorum | `throne-domain` |
-| **macOS DNS underlying (1.4.0-beta.5)** | `c852fe31` #2045 | ✅ Tun and URL tests use `underlying` on Darwin. Mixed and ResolveDomains stay `local` | `throne-core-client` |
+| **macOS DNS underlying (1.4.0-beta.5)** | `c852fe31` #2045 | Historical for that pin. Beta.6 emits `local` and drops `dns-system`; see the beta.6 row | `throne-core-client` |
+| **macOS temporary DNS service (1.4.0-beta.6)** | `f14b86b3` | ✅ Start emits `local` and no `127.0.0.53` inbound. Core publishes the temporary service and the `0.0.0.0/8` route. GUI does not blank networksetup DNS | `core/`, `throne-core-client` |
+| **DNS tunnels (1.4.0-beta.6)** | `8327f362` | ✅ `dnstt` / `masterdns` import, editor fields, sing-box build, and URL-test allowance. TOML links, resolver ranges, resolver IP lists, xdns form, and scanner DNS probes remain 🧩 | `throne-domain`, `throne-import`, `throne-core-client` |
+| **Log export (1.4.0-beta.6)** | `4b1904e3` | ⏳ Qt Diagnostics tab only. No native export action | `throne` |
+| **Import warning quieting (1.4.0)** | `7ce0953f` | ✅ MasterDNS SOCKS listener credentials are ignored with no note. The other dropped warnings were not emitted | `throne-import` |
+| **MASQUE and uTLS pins (1.4.0)** | `cb89a14f`, `a973efea` | ✅ sing-box `6bc5c846150e` and uTLS `f0ae7792aa1d`. Native WARP generator remains ⏳ | `core/` |
+| **Remote API expansion (1.4.0)** | `39955b7d` | ⏳ Connections, WARP, profile-config, and route-editing endpoints stay unported | `throne` |
 | Core IPC Start/Stop | `dispatch.go` + Qt framing | 🧩 Start/Stop/Test/QueryStats/QueryConnections/**CloseConnections**, AutoSelector, scanner/egress RPCs; API service keeps trackers available; Xray strategy reserved field 12 and connection source field 14 retained | `throne-core-client`, `core/` |
 | **IP lists and scanner (1.4.0-beta.1)** | `86f196d4` | 🧩 native manual lists and bounded TCP scanning only: 4,096 targets, 256 hosts per CIDR, concurrency 16, batches 64; scan models/storage/RPCs exist, but full probes, resume UI, remote updates and default list seeds are not ported | `throne-domain`, `throne-storage`, `throne-core-client`, `throne` |
 | **Profile/group endpoint sources** | `1809cb0e` | 🧩 group/profile inheritance and DB round-trip; profile list assignment and Own/Inherit restoration; Start and stored-profile tests clone server overrides while retaining identity; group/fixed-address editor remains | `throne-domain`, `throne-storage`, `throne` |

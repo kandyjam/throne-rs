@@ -2,7 +2,7 @@
 
 `script/build-core` applies `sing-box-reality-mlkem.patch` and
 `sing-box-darwin-system-dns.patch` to a private copy of
-`github.com/throneproj/sing-box` at `v1.11.16-0.20261031212642-af51a7460ccd`.
+`github.com/throneproj/sing-box` at `v1.11.16-0.20261105144313-6bc5c846150e`.
 It verifies the replacement module version and original source SHA256 before
 patching, uses a temporary modfile with `-mod=readonly`, and removes the copy
 after the build. Committed lockfiles and the shared Go module cache are untouched.
@@ -34,7 +34,11 @@ which now brackets IPv6 hosts. The ML-KEM share strip and the Ecdhe /
 MlkemEcdhe authentication-key order are unchanged. The existing patch applies
 with zero fuzz. The source-hash guard is now
 `38a5d553fffd108afca51bde0b0888512d2f4633daa608e03767838b8fdcdbc0`.
-The dependency-version guard names the beta.5 pin.
+The dependency-version guard names the 1.4.0 pin. Re-audited on 2026-11-04:
+`f25a530dc468` leaves `reality_client.go` byte-identical to the beta.5 hash, and
+the same patch still applies with zero fuzz. Re-audited on 2026-11-06:
+`6bc5c846150e` changes only `protocol/warpmasque` and `transport/warpmasque`.
+`reality_client.go` stays at the hash above.
 
 ## Darwin system DNS loop prevention
 
@@ -77,6 +81,20 @@ core passed all 13 configuration/RPC smoke groups.
 Executed on 2026-11-03 against pin `af51a7460ccd`: the same verify flag passed
 the rebased systemconfig and sysdns race tests and wrote
 `target/parity-beta5/ThroneCore`. The 13 smoke groups were not repeated.
+
+Re-audited on 2026-11-04 against pin `f25a530dc468`: `source_darwin.go` is
+byte-identical to the beta.5 hash above, and both patches apply with zero fuzz.
+`THRONE_CORE_VERIFY_PATCHES=1 ./script/build-core target/parity-beta6` exited 0.
+The patched systemconfig and sysdns race tests passed. The audit binary is
+78M. The 13 smoke groups were not repeated. Installed or setuid copies are not
+refreshed by that path.
+
+Re-audited on 2026-11-06 against pin `6bc5c846150e`: `reality_client.go` and
+`source_darwin.go` keep the hashes above. Both patches applied with zero fuzz.
+`THRONE_CORE_VERIFY_PATCHES=1 ./script/build-core target/parity-1.4.0` exited 0.
+The patched systemconfig and sysdns race tests passed. The audit binary is
+78M. The 13 smoke groups were not repeated. Installed or setuid copies are not
+refreshed by that path.
 
 These deterministic tests do not mutate system DNS. Privileged alias setup,
 restoration, network-service failover and resolver notification timing still

@@ -5,14 +5,61 @@ use throne_domain::{ParsedOutbound, ProfileType};
 use crate::decode::{decode_b64_flexible, percent_decode};
 use crate::ImportedProfile;
 
+/// A recognized share link, or a scheme that must be shown as an error.
+pub enum ShareLinkParse {
+    Hit {
+        profile: ImportedProfile,
+        notes: Vec<String>,
+    },
+    /// Scheme this importer does not own.
+    Unknown,
+    /// The scheme is known, but the link cannot be imported.
+    Rejected(String),
+}
+
 /// Parse one share link into a profile draft. Returns `None` if scheme unknown
 /// or required fields missing (mirrors upstream `ParseFromLink` failure).
 pub fn parse_share_link(raw: &str) -> Option<ImportedProfile> {
+    match parse_share_link_detailed(raw) {
+        ShareLinkParse::Hit { profile, .. } => Some(profile),
+        ShareLinkParse::Unknown | ShareLinkParse::Rejected(_) => None,
+    }
+}
+
+pub fn parse_share_link_detailed(raw: &str) -> ShareLinkParse {
     let link = raw.trim();
     if link.is_empty() {
-        return None;
+        return ShareLinkParse::Unknown;
     }
+    let lower = link.to_ascii_lowercase();
+    if lower.starts_with("dnst://")
+        || lower.starts_with("slipnet://")
+        || lower.starts_with("slipnet-")
+        || lower.starts_with("masterdns://")
+        || lower.starts_with("stormdns://")
+    {
+        return match crate::dns_tunnel::parse_dns_tunnel_link(link) {
+            Ok(parsed) => ShareLinkParse::Hit {
+                profile: parsed.profile,
+                notes: parsed.notes,
+            },
+            Err(error) => ShareLinkParse::Rejected(error),
+        };
+    }
+    parse_share_link_known(link)
+}
 
+fn parse_share_link_known(link: &str) -> ShareLinkParse {
+    let Some(profile) = parse_share_link_inner(link) else {
+        return ShareLinkParse::Unknown;
+    };
+    ShareLinkParse::Hit {
+        profile,
+        notes: Vec::new(),
+    }
+}
+
+fn parse_share_link_inner(link: &str) -> Option<ImportedProfile> {
     let lower = link.to_ascii_lowercase();
     if lower.starts_with("ss://") {
         return parse_ss(link);
@@ -80,6 +127,11 @@ fn query_map(url: &Url) -> Vec<(String, String)> {
             (percent_decode(key), percent_decode(value))
         })
         .collect()
+}
+
+fn is_xhttp_transport(transport: &str) -> bool {
+    let transport = transport.trim();
+    transport.eq_ignore_ascii_case("xhttp") || transport.eq_ignore_ascii_case("splithttp")
 }
 
 fn qget<'a>(q: &'a [(String, String)], key: &str) -> Option<&'a str> {
@@ -294,7 +346,7 @@ fn parse_vless(link: &str) -> Option<ImportedProfile> {
     if outbound
         .transport
         .as_deref()
-        .is_some_and(|t| matches!(t, "xhttp" | "splithttp"))
+        .is_some_and(is_xhttp_transport)
     {
         return crate::tls::xhttp_profile(&name_or("VLESS", &name), &outbound, &q, link);
     }

@@ -122,32 +122,26 @@ fn disabled_mixed_inbound_is_not_recreated_by_config_generation() {
     assert!(inbounds.iter().all(|inbound| inbound["type"] != "mixed"));
     assert!(inbounds.iter().any(|inbound| inbound["tag"] == "dns-in"));
 }
-#[cfg(target_os = "macos")]
 #[test]
-fn darwin_tun_uses_loopback_system_dns_and_first_hijack_rule() {
+fn tun_does_not_publish_loopback_dns_system() {
     let s = AppSettings {
         tun_mode_enabled: true,
         ..Default::default()
     };
     let v = config(&profile(Value::Null), &s, None);
-    let inbound = v["inbounds"]
+    let rendered = v.to_string();
+    assert!(
+        !rendered.contains("dns-system"),
+        "beta.6 removed the 127.0.0.53 direct inbound"
+    );
+    assert!(!rendered.contains("127.0.0.53"));
+    let local = v["dns"]["servers"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|x| x["tag"] == "dns-system")
+        .find(|server| server["tag"] == "dns-local")
         .unwrap();
-    assert_eq!(inbound["listen"], "127.0.0.53");
-    assert_eq!(inbound["listen_port"], 53);
-    assert_eq!(inbound["reuse_addr"], true);
-    assert_eq!(
-        v["route"]["rules"][0],
-        json!({"inbound":"dns-system","action":"hijack-dns"})
-    );
-    assert!(
-        !config(&profile(Value::Null), &AppSettings::default(), None)
-            .to_string()
-            .contains("dns-system")
-    );
+    assert_eq!(local["type"], "local");
 }
 
 #[test]
