@@ -3685,6 +3685,7 @@ impl MainWindow {
                 if let Err(e) = &result {
                     this.state
                         .push_log(failed_start_profile_log(&profile_display));
+                    this.state.push_log(format!("Start failed: {e}"));
                     this.state
                         .set_status_message_only(format!("Start failed: {e}"));
                 }

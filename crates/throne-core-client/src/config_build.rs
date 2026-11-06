@@ -1506,6 +1506,7 @@ fn build_xray_full_member(
         serde_json::to_string(&user_cfg).map_err(|e| CoreError::Config(e.to_string()))?;
     let socks_outbound = json!({
         "type": "socks",
+        "tag": "proxy",
         "server": "127.0.0.1",
         "server_port": port,
         "username": auth,
@@ -3172,6 +3173,9 @@ mod tests {
             "/7728c2990164a8f9"
         );
         assert_eq!(xray["inbounds"][0]["protocol"], "socks");
+        let singbox: Value = serde_json::from_str(&built.core_config_json).unwrap();
+        assert_eq!(singbox["outbounds"][0]["tag"], "proxy");
+        assert_eq!(singbox["route"]["final"], "proxy");
         let saved: Value = serde_json::from_str(&profile.outbound_json).unwrap();
         assert_eq!(saved["protocol"], "vless");
         assert!(saved.get("subtype").is_none());
