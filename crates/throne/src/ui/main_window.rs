@@ -674,6 +674,8 @@ pub struct MainWindow {
     col_resize: Option<ColResizeDrag>,
     /// Keeps the OS appearance observer alive for the current window.
     _appearance_sub: Option<Subscription>,
+    /// Last system-menu snapshot installed into the OS menu bar.
+    system_menu_stamp: String,
 }
 
 /// Drag payload for profile table column resize handles.
@@ -818,6 +820,7 @@ impl MainWindow {
             runtime_generation: 0,
             col_resize: None,
             _appearance_sub: None,
+            system_menu_stamp: String::new(),
         };
         window.spawn_runtime_poller(cx);
         window.spawn_periodic_runner(cx);
@@ -3434,6 +3437,7 @@ impl MainWindow {
         // Upstream menu_spmode_disabled: both off.
         self.set_sys_proxy(false, cx);
         self.set_vpn(false, cx);
+        self.set_sys_dns(false, cx);
         self.sync_tray_menu();
     }
 
@@ -5929,6 +5933,290 @@ impl MainWindow {
         panel
     }
 
+    fn refresh_system_menu(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.system_menu_snapshot();
+        let stamp = format!("{snapshot:?}");
+        if stamp == self.system_menu_stamp {
+            return;
+        }
+        self.system_menu_stamp = stamp;
+        cx.defer(move |cx| {
+            crate::ui::system_menu::install(cx, &snapshot);
+        });
+    }
+
+    fn system_menu_snapshot(&self) -> crate::ui::system_menu::MenuSnapshot {
+        let settings = self.state.settings();
+        let active = self.state.active_route().map(|route| route.id);
+        crate::ui::system_menu::MenuSnapshot {
+            start_with_system: settings.start_with_system,
+            remember_last: settings.remember_enable,
+            allow_lan: crate::tray::allow_lan_from_address(&settings.inbound_address),
+            adblock: settings.adblock_enable,
+            warp: settings.enable_warp,
+            routes: self
+                .state
+                .all_routes()
+                .into_iter()
+                .map(|route| crate::ui::system_menu::RouteMenuItem {
+                    id: route.id,
+                    name: route.summary(),
+                    active: active == Some(route.id),
+                })
+                .collect(),
+            version: throne_domain::NKR_VERSION.to_string(),
+        }
+    }
+
+    /// Run a command from the system menu bar or the matching toolbar dropdown.
+    fn apply_system_command(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(route_id) = id.strip_prefix("route:") {
+            if let Ok(route_id) = route_id.parse() {
+                self.select_active_route(route_id, cx);
+            }
+            return;
+        }
+        match id {
+            "hide" => crate::hide_main_window(),
+            "new-profile" => self.open_add_from_input(window, cx),
+            "new-auto" => self.create_auto_selector(cx),
+            "clipboard" => self.import_clipboard(cx),
+            "files" => self.import_from_files(cx),
+            "start-with-system" => self.tray_toggle_start_with_system(cx),
+            "remember-last" => self.tray_toggle_remember_last(cx),
+            "allow-lan" => self.tray_toggle_allow_lan(cx),
+            "check-update" => {
+                self.state.set_status_message(format!(
+                    "Current version {} · throne-rs rewrite (no auto-update yet)",
+                    throne_domain::NKR_VERSION
+                ));
+                cx.notify();
+            }
+            "about" => {
+                self.state.set_status_message(format!(
+                    "ThroneRs {} · Rust/GPUI rewrite of Throne",
+                    throne_domain::NKR_VERSION
+                ));
+                cx.notify();
+            }
+            "restart-core" => self.tray_restart_core(cx),
+            "restart-program" => crate::restart_program(cx),
+            "quit" => cx.quit(),
+            "basic" => self.open_basic_settings(window, cx),
+            "routing-settings" => self.open_routing_settings(Some(window), cx),
+            "tun" => self.open_tun_settings(window, cx),
+            "preset" => self.open_core_options(cx),
+            "hotkeys" => self.open_hotkey_settings(window, cx),
+            "config-folder" => self.open_config_folder(cx),
+            "clear-proxy" => {
+                force_clear_system_proxy();
+                self.state
+                    .set_status_message("System proxy force-cleared on all interfaces");
+                cx.notify();
+            }
+            "start" => self.menu_start(cx),
+            "stop" => {
+                if self.state.core_status().is_running() {
+                    self.stop_proxy(cx);
+                }
+            }
+            "delete" => self.delete_selected(cx),
+            "select-all" => self.select_all(cx),
+            "url-test-selected" => self.url_test_selected(cx),
+            "speedtest-selected" => self.speed_test_selected(cx),
+            "resolve-selected-ip" => self.ip_test_selected(cx),
+            "resolve-selected-domain" => self.resolve_profile_domains(false, cx),
+            "manage-groups" => self.open_manage_groups(window, cx),
+            "add-group" => self.open_edit_group_new(window, cx),
+            "edit-group" => {
+                let gid = self.state.active_group_id();
+                self.open_edit_group(gid, window, cx);
+            }
+            "delete-group" => self.confirm_delete_current_group(window, cx),
+            "url-test-group" => self.url_test_group(cx),
+            "speedtest-group" => self.speed_test_group_id(self.state.active_group_id(), cx),
+            "resolve-group-domain" => self.resolve_profile_domains(true, cx),
+            "clear-group-test" => {
+                let gid = self.state.active_group_id();
+                self.state.clear_test_results_in_group(gid);
+                let _ = self.persist_db();
+                cx.notify();
+            }
+            "update-sub" => self.update_subscription(false, Some(window), cx),
+            "update-all-subs" => self.update_subscription(true, Some(window), cx),
+            "remove-duplicates" => {
+                let gid = self.state.active_group_id();
+                self.state.remove_duplicates_in_group(gid);
+                let _ = self.persist_db();
+                cx.notify();
+            }
+            "remove-unavailable" => self.delete_unavailable(Some(window), cx),
+            "remove-invalid" => {
+                let gid = self.state.active_group_id();
+                self.state.remove_invalid_in_group(gid);
+                let _ = self.persist_db();
+                cx.notify();
+            }
+            "remove-insecure" => {
+                let gid = self.state.active_group_id();
+                self.state.remove_insecure_in_group(gid);
+                let _ = self.persist_db();
+                cx.notify();
+            }
+            "auto-selector-stats" => self.open_auto_selector_stats(window, cx),
+            "speedtest-current" => self.speedtest_current(cx),
+            "scanner" => self.open_scanner(cx),
+            "traffic-stats" => self.open_traffic_stats(window, cx),
+            "column-widths" => self.refresh_column_widths(cx),
+            "adblock" => self.toggle_routed_flag(true, cx),
+            "warp" => self.toggle_routed_flag(false, cx),
+            _ => {}
+        }
+    }
+
+    fn menu_start(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.state.selected_profile_id() else {
+            self.state
+                .set_status_message_only("Select a profile before Start");
+            cx.notify();
+            return;
+        };
+        if let CoreStatus::Running { profile_id, .. } = self.state.core_status() {
+            if *profile_id == id {
+                self.state
+                    .set_status_message_only("Selected profile is already running");
+                cx.notify();
+                return;
+            }
+            self.activate_profile(id, cx);
+            return;
+        }
+        self.start_proxy(cx);
+    }
+
+    fn speedtest_current(&mut self, cx: &mut Context<Self>) {
+        let CoreStatus::Running { profile_id, .. } = self.state.core_status() else {
+            self.state
+                .set_status_message_only("Speedtest Current needs a running profile");
+            cx.notify();
+            return;
+        };
+        let _ = self.state.select_profile(*profile_id);
+        self.speed_test_selected(cx);
+    }
+
+    fn confirm_delete_current_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let gid = self.state.active_group_id();
+        if self.state.group_order().len() <= 1 {
+            self.state
+                .set_status_message_only("Cannot delete the only group");
+            cx.notify();
+            return;
+        }
+        let name = self
+            .state
+            .group(gid)
+            .map(|group| {
+                if group.name.is_empty() {
+                    format!("Group {gid}")
+                } else {
+                    group.name.clone()
+                }
+            })
+            .unwrap_or_else(|| format!("Group {gid}"));
+        self.dialog = Dialog::ConfirmRemoveGroup {
+            group_id: gid,
+            name,
+        };
+        self.dialog_inputs = None;
+        self.present_gpui_dialog(window, cx);
+    }
+
+    fn open_config_folder(&mut self, cx: &mut Context<Self>) {
+        let path = if self.db_path_label.is_empty() {
+            throne_storage::default_db_path()
+        } else {
+            std::path::PathBuf::from(&self.db_path_label)
+        };
+        if let Some(dir) = path.parent() {
+            let _ = std::process::Command::new("open").arg(dir).spawn();
+            self.state
+                .set_status_message(format!("Opened {}", dir.display()));
+            cx.notify();
+        }
+    }
+
+    fn toggle_routed_flag(&mut self, adblock: bool, cx: &mut Context<Self>) {
+        if adblock {
+            let next = !self.state.settings().adblock_enable;
+            self.state.settings_mut().adblock_enable = next;
+        } else {
+            let next = !self.state.settings().enable_warp;
+            self.state.settings_mut().enable_warp = next;
+        }
+        let _ = self.persist_db();
+        self.sync_tray_menu();
+        if self.state.core_status().is_running()
+            || matches!(self.state.core_status(), CoreStatus::Starting)
+        {
+            self.tray_restart_core(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn fill_synced_menu(
+        &self,
+        mut panel: gpui::Div,
+        section: &str,
+        entity: Entity<Self>,
+    ) -> gpui::Div {
+        let Some(section) = crate::ui::system_menu::sections(&self.system_menu_snapshot())
+            .into_iter()
+            .find(|item| item.name == section)
+        else {
+            return panel;
+        };
+        panel = panel.child(menu_label(section.name));
+        self.append_menu_nodes(panel, &section.items, entity)
+    }
+
+    fn append_menu_nodes(
+        &self,
+        mut panel: gpui::Div,
+        nodes: &[crate::ui::system_menu::MenuNode],
+        entity: Entity<Self>,
+    ) -> gpui::Div {
+        for node in nodes {
+            if node.is_separator() {
+                panel = panel.child(menu_separator());
+                continue;
+            }
+            if !node.children.is_empty() {
+                panel = panel.child(menu_label(node.label.clone()));
+                panel = self.append_menu_nodes(panel, &node.children, entity.clone());
+                continue;
+            }
+            let id = node.id.clone();
+            let checked = node.checked;
+            let label = node.label.clone();
+            let e = entity.clone();
+            panel = panel.child(menu_item_checked(
+                SharedString::from(id.clone()),
+                label,
+                checked,
+                move |_, window, cx| {
+                    e.update(cx, |this, cx| {
+                        this.apply_system_command(&id, window, cx);
+                        this.close_menus();
+                        cx.notify();
+                    });
+                },
+            ));
+        }
+        panel
+    }
+
     /// Compact dropdown body for the open toolbar / context menu.
     fn menu_items_for(&self, menu: OpenMenu, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity().clone();
@@ -5956,204 +6244,19 @@ impl MainWindow {
 
         match menu {
             OpenMenu::Program => {
-                panel = panel.child(menu_label("Program"));
-                // Upstream 1.2.3: Program → New Profile (+ Auto Selector)
-                item!("prog-new-auto", "New Auto Selector", |t, _w, cx| {
-                    t.create_auto_selector(cx);
-                });
-                item!("prog-input", "Add profile from input", |t, w, cx| {
-                    t.open_add_from_input(w, cx);
-                });
-                item!("prog-clip", "Add profile from clipboard", |t, _w, cx| {
-                    t.import_clipboard(cx);
-                });
-                item!("prog-files", "Import from file(s)…", |t, _w, cx| {
-                    t.import_from_files(cx);
-                });
-                item!("prog-start", "Start", |t, _w, cx| t.toggle_proxy(cx));
-                item!("prog-stop", "Stop", |t, _w, cx| {
-                    if t.state.core_status().is_running() {
-                        t.toggle_proxy(cx);
-                    }
-                });
-                panel = panel.child(menu_separator());
-                item!("prog-proxy", "Enable System Proxy", |t, _w, cx| {
-                    t.set_sys_proxy(true, cx);
-                });
-                item!("prog-tun", "Enable Tun", |t, _w, cx| {
-                    t.set_vpn(true, cx);
-                });
-                item!("prog-off", "Disable", |t, _w, cx| {
-                    t.set_sys_proxy(false, cx);
-                    t.set_vpn(false, cx);
-                    t.set_sys_dns(false, cx);
-                });
-                panel = panel.child(menu_separator());
-                item!("prog-exit", "Exit", |_t, _w, cx| cx.quit());
+                panel = self.fill_synced_menu(panel, "Program", entity.clone());
             }
             OpenMenu::Settings => {
-                panel = panel.child(menu_label("Preferences"));
-                item!("set-search", "Command Palette (Ctrl/⌘K)", |t, w, cx| t
-                    .open_command_palette(w, cx));
-                item!("set-core", "Core Options…", |t, _w, cx| t
-                    .open_core_options(cx));
-                item!("set-basic", "Basic Settings", |t, w, cx| t
-                    .open_basic_settings(w, cx));
-                item!("set-route", "Routing Settings", |t, w, cx| {
-                    t.open_routing_settings(Some(w), cx);
-                });
-                item!("set-tun", "Tun Settings", |t, w, cx| t
-                    .open_tun_settings(w, cx));
-                item!("set-hotkey", "Hotkey Settings", |t, w, cx| t
-                    .open_hotkey_settings(w, cx));
-                item!("set-clear-proxy", "Clear system proxy now", |t, _w, cx| {
-                    force_clear_system_proxy();
-                    t.state
-                        .set_status_message("System proxy force-cleared on all interfaces");
-                });
-                panel = panel.child(menu_separator());
-                item!("set-folder", "Open Config Folder", |t, _w, cx| {
-                    let path = if t.db_path_label.is_empty() {
-                        throne_storage::default_db_path()
-                    } else {
-                        std::path::PathBuf::from(&t.db_path_label)
-                    };
-                    if let Some(dir) = path.parent() {
-                        let _ = std::process::Command::new("open").arg(dir).spawn();
-                        t.state
-                            .set_status_message(format!("Opened {}", dir.display()));
-                    }
-                });
-                item!("set-save", "Save database", |t, _w, cx| t.save_db(cx));
+                panel = self.fill_synced_menu(panel, "Preferences", entity.clone());
             }
             OpenMenu::Groups => {
-                panel = panel.child(menu_label("Groups"));
-                item!("g-manage", "Manage Groups", |t, w, cx| t
-                    .open_manage_groups(w, cx));
-                item!("g-update", "Update subscription", |t, w, cx| {
-                    t.update_subscription(false, Some(w), cx);
-                });
-                item!("g-update-all", "Update all subscriptions", |t, w, cx| {
-                    t.update_subscription(true, Some(w), cx);
-                });
-                panel = panel.child(menu_separator());
-                item!("g-urltest", "Url Test Group", |t, _w, cx| t
-                    .url_test_group(cx));
-                item!("g-clear", "Clear Group test result", |t, _w, cx| {
-                    let gid = t.state.active_group_id();
-                    t.state.clear_test_results_in_group(gid);
-                    let _ = t.persist_db();
-                });
-                item!("g-dup", "Remove Duplicates", |t, _w, cx| {
-                    let gid = t.state.active_group_id();
-                    t.state.remove_duplicates_in_group(gid);
-                    let _ = t.persist_db();
-                });
-                item!("g-unavail", "Remove Unavailable", |t, w, cx| {
-                    t.delete_unavailable(Some(w), cx);
-                });
-                item!("g-invalid", "Remove Invalid Configs", |t, _w, cx| {
-                    let gid = t.state.active_group_id();
-                    t.state.remove_invalid_in_group(gid);
-                    let _ = t.persist_db();
-                });
-                item!("g-insecure", "Remove Insecure Configs", |t, _w, cx| {
-                    let gid = t.state.active_group_id();
-                    t.state.remove_insecure_in_group(gid);
-                    let _ = t.persist_db();
-                });
+                panel = self.fill_synced_menu(panel, "Groups", entity.clone());
             }
             OpenMenu::Routing => {
-                panel = panel.child(menu_label("Routing"));
-                item!("r-settings", "Routing Settings", |t, w, cx| {
-                    t.open_routing_settings(Some(w), cx);
-                });
-                item!("r-cycle", "Next route profile", |t, _w, cx| t
-                    .cycle_route(cx));
-                let routes: Vec<_> = self
-                    .state
-                    .all_routes()
-                    .into_iter()
-                    .map(|r| {
-                        let active = self.state.active_route().is_some_and(|a| a.id == r.id);
-                        (r.id, r.summary(), active)
-                    })
-                    .collect();
-                if !routes.is_empty() {
-                    panel = panel.child(menu_separator());
-                    for (id, name, active) in routes {
-                        let e = entity.clone();
-                        panel = panel.child(menu_item_checked(
-                            SharedString::from(format!("route-{id}")),
-                            name,
-                            active,
-                            move |_, _, cx| {
-                                e.update(cx, |t, cx| {
-                                    t.select_active_route(id, cx);
-                                });
-                            },
-                        ));
-                    }
-                }
+                panel = self.fill_synced_menu(panel, "Routing", entity.clone());
             }
             OpenMenu::Tools => {
-                panel = panel.child(menu_label("Tools"));
-                item!(
-                    "t-resolve-selected",
-                    "Resolve Selected Domain to IP",
-                    |t, _w, cx| t.resolve_profile_domains(false, cx)
-                );
-                item!(
-                    "t-resolve-group",
-                    "Resolve Group Domains to IP",
-                    |t, _w, cx| t.resolve_profile_domains(true, cx)
-                );
-                item!("t-ip-scanner", "IP Lists & Scanner…", |t, _w, cx| t
-                    .open_scanner(cx));
-                item!("t-url", "Url Test Selected", |t, _w, cx| t
-                    .url_test_selected(cx));
-                item!("t-url-group", "Url Test Group (⌘⇧G)", |t, _w, cx| {
-                    t.url_test_group(cx);
-                });
-                item!(
-                    "t-delete-unavailable",
-                    "Delete Unavailable (⌘⇧R)",
-                    |t, w, cx| {
-                        t.delete_unavailable(Some(w), cx);
-                    }
-                );
-                item!("t-speed", "Speedtest Selected", |t, _w, cx| {
-                    t.speed_test_selected(cx);
-                });
-                item!("t-ip", "IP Test Selected", |t, _w, cx| t
-                    .ip_test_selected(cx));
-                panel = panel.child(menu_separator());
-                item!("t-runtime", "Runtime Stats", |t, _w, cx| {
-                    t.bottom_tab = 1;
-                    t.state.set_status_message(
-                        "Connections tab shows live sessions while core is running",
-                    );
-                });
-                item!("t-auto-sel", "Auto Selector Stats", |t, w, cx| {
-                    t.open_auto_selector_stats(w, cx);
-                });
-                item!("t-traffic", "Traffic Stats", |t, w, cx| {
-                    t.open_traffic_stats(w, cx);
-                });
-                item!("t-col-width", "Refresh Column Widths", |t, _w, cx| {
-                    t.refresh_column_widths(cx);
-                });
-                item!("t-update", "Check For Update", |t, _w, cx| {
-                    t.state.set_status_message(format!(
-                        "Current version {} · throne-rs rewrite (no auto-update yet)",
-                        throne_domain::NKR_VERSION
-                    ));
-                });
-                panel = panel.child(menu_separator());
-                panel = panel.child(menu_label(format!(
-                    "Version {}",
-                    throne_domain::NKR_VERSION
-                )));
+                panel = self.fill_synced_menu(panel, "Tools", entity.clone());
             }
             OpenMenu::ProfileCtx => {
                 panel = panel.child(menu_label("Server"));
@@ -7428,6 +7531,7 @@ impl EntityInputHandler for MainWindow {
 
 impl Render for MainWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.refresh_system_menu(cx);
         self.sync_tray_menu();
         // Keep paint tokens + gpui-component chrome aligned with settings / OS appearance.
         self.sync_theme_from_window(window, cx);
@@ -7499,6 +7603,11 @@ impl Render for MainWindow {
                 this.open_command_palette(window, cx)
             }))
             .on_action(cx.listener(|_this, _: &Quit, _, cx| cx.quit()))
+            .on_action(cx.listener(
+                |this, command: &crate::ui::system_menu::SystemCommand, window, cx| {
+                    this.apply_system_command(&command.id, window, cx);
+                },
+            ))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.bottom_tab == 0
                     && this.log_filter_visible

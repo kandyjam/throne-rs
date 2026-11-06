@@ -71,6 +71,17 @@ fn main() {
         let main = cx.new(MainWindow::new);
         *main_slot.borrow_mut() = Some(main.clone());
         *window_slot.borrow_mut() = Some(open_main_window(cx, main.clone()));
+        // System menu stays available when the main window is hidden to the tray.
+        let menu_window = window_slot.clone();
+        let menu_main = main.clone();
+        cx.on_action(move |command: &ui::system_menu::SystemCommand, cx| {
+            match command.id.as_str() {
+                "hide" => hide_main_window(),
+                "quit" => cx.quit(),
+                "restart-program" => restart_program(cx),
+                _ => show_main_window(cx, &menu_window, &menu_main),
+            }
+        });
 
         // When the platform window is destroyed, drop the stale handle so the
         // next Show / Dock click recreates instead of activating a dead window.
@@ -135,7 +146,7 @@ fn closed_too_recently() -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn hide_main_window() {
+pub(crate) fn hide_main_window() {
     use objc2::MainThreadMarker;
     use objc2_app_kit::NSApplication;
     let Some(mtm) = MainThreadMarker::new() else {
@@ -150,7 +161,7 @@ fn hide_main_window() {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn hide_main_window() {}
+pub(crate) fn hide_main_window() {}
 
 fn open_main_window(cx: &mut App, main: Entity<MainWindow>) -> WindowHandle<Root> {
     // Upstream mainwindow.ui minimum 800×600
@@ -286,7 +297,7 @@ fn dispatch_tray_command(
 }
 
 /// Upstream `actionRestart_Program` — re-exec current binary then quit.
-fn restart_program(cx: &mut App) {
+pub(crate) fn restart_program(cx: &mut App) {
     match std::env::current_exe() {
         Ok(exe) => {
             let mut cmd = std::process::Command::new(&exe);

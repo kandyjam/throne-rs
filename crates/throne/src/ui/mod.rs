@@ -11,6 +11,7 @@ mod route_completion;
 mod routing;
 mod scanner;
 mod speed_graph;
+pub(crate) mod system_menu;
 mod widgets;
 
 pub use app_shell::AppShell;

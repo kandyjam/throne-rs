@@ -19,7 +19,8 @@ Target `99f7ecd1` (2026-11-05); audited 2026-11-06. All 7 commits since beta.6 a
 - MasterDNS SOCKS user and password stay ignored and no longer produce an import note. Dial-field, REALITY padding, AnyTLS fast-open, Hysteria `pinSHA256`, WireGuard `DNS`/`AllowedIPs`, and OpenVPN redirect-gateway warnings were not emitted.
 - Core pins: sing-box `6bc5c846150e`, uTLS `f0ae7792aa1d`, Xray `1c6eb7771c4d`, WireGuard `e11787583013`. The MASQUE change is inside sing-box. Native WARP generation remains unported. Both patches still guard the beta.5/beta.6 source hashes.
 - The remote API gained connections, WARP, profile-config, and route-editing endpoints. That API stays unported. Qt title-bar theming and the connections `doItemsLayout` crash fix are N/A.
-- Simple interface, web UI, About/donation, log export, and historical headless/API/scanner/Kill Switch/hotkey gaps remain explicit.
+- The system menu bar and toolbar dropdowns follow the 1.4.0 Program, Preferences, Server, Routing, Groups, and Tools order. Scan QR, Integration Settings, OTP, the web dashboard, Download Profiles, and Update Rule-Sets stay omitted.
+- Simple interface, web UI, log export, and historical headless/API/scanner/Kill Switch/hotkey gaps remain explicit.
 - Executed on 2026-11-06: 301 tests in throne-domain, throne-import, and throne-core-client; `cargo check -p throne`. Source hashes for `reality_client.go` and `source_darwin.go` match the beta.6 guards. `THRONE_CORE_VERIFY_PATCHES=1 ./script/build-core target/parity-1.4.0` exited 0 (race tests, 78M audit binary). Full workspace tests, strict Clippy, throne-storage, and the 13 actual-core smoke groups were not re-run. Native GUI, privileged DNS/TUN, and cross-platform runtime remain untested.
 
 ## 1.4.0-beta.6 feature notes (historical pin)
