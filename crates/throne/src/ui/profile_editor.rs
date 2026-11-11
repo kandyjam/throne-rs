@@ -1,11 +1,12 @@
 //! Native profile form; JSON and structured tabs share one lossless domain draft.
 use gpui::{div, prelude::*, px, App, AppContext, Context, Entity, SharedString, Window};
-use gpui_component::input::{Input, InputState, TextareaState};
+use gpui_component::input::{InputState, TextareaState};
 use throne_domain::{GroupId, ProfileEditDraft, ProfileEditKind, ProfileEditSection};
 
 use super::dialog_inputs::DialogInputs;
 use super::widgets::{
-    dialog_actions, input_area_tall, input_field_row, section_hint, settings_switch_row, tab_bar,
+    dialog_actions, input_area_tall, input_field_row, line_input, section_hint,
+    settings_switch_row, tab_bar,
 };
 use crate::theme::Theme;
 
@@ -184,7 +185,7 @@ pub fn profile_editor_body(
                             div()
                                 .flex_1()
                                 .min_w(px(0.))
-                                .child(Input::new(input).mask_toggle().cleanable(true)),
+                                .child(line_input(input).mask_toggle()),
                         ),
                 );
             } else {

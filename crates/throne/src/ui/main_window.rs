@@ -58,9 +58,9 @@ use crate::ui::routing::{
 };
 use crate::ui::speed_graph::{speed_graph_element, SpeedGraph};
 use crate::ui::widgets::{
-    icon_btn, menu_item, menu_item_checked, menu_label, menu_panel, menu_separator, mode_switch,
-    start_stop_btn, status_tag, tab_bar, toolbar_btn, StartStopState, ToolbarIcon, TOOLBAR_BTN_GAP,
-    TOOLBAR_BTN_W, TOOLBAR_MENU_TOP, TOOLBAR_PAD_X,
+    icon_btn, line_input, menu_item, menu_item_checked, menu_label, menu_panel, menu_separator,
+    mode_switch, start_stop_btn, status_tag, tab_bar, toolbar_btn, StartStopState, ToolbarIcon,
+    TOOLBAR_BTN_GAP, TOOLBAR_BTN_W, TOOLBAR_MENU_TOP, TOOLBAR_PAD_X,
 };
 use gpui_component::{
     button::{Button, ButtonVariant, ButtonVariants as _},
@@ -68,7 +68,7 @@ use gpui_component::{
         Cancel as DialogCancel, Confirm as DialogConfirm, Dialog as GpuiDialog, DialogButtonProps,
         DialogFooter,
     },
-    input::{Input, InputEvent, InputState},
+    input::{InputEvent, InputState},
     ActiveTheme as _, WindowExt as _,
 };
 
@@ -7005,7 +7005,7 @@ impl MainWindow {
             )
             .when(tab == 0 && self.log_filter_visible, |el| {
                 if let Some(input) = &self.log_filter {
-                    el.child(div().px_2().child(Input::new(input).cleanable(true)))
+                    el.child(div().px_2().child(line_input(input)))
                 } else {
                     el
                 }

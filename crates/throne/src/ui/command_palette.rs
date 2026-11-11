@@ -5,14 +5,14 @@ use gpui::{
     TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use gpui_component::{
-    input::{Input, InputEvent, InputState},
+    input::{InputEvent, InputState},
     scroll::ScrollableElement as _,
     Root,
 };
 
 use crate::{
     theme::Theme,
-    ui::widgets::{secondary_btn, section_hint},
+    ui::widgets::{line_input, secondary_btn, section_hint},
 };
 
 type Apply = Box<dyn Fn(&str, &mut App)>;
@@ -116,7 +116,7 @@ impl Render for Palette {
                     cx.stop_propagation();
                 }
             })
-            .child(Input::new(&self.input).cleanable(true))
+            .child(line_input(&self.input))
             .child(section_hint("Enter runs the first result · Escape closes"))
             .child(list)
     }

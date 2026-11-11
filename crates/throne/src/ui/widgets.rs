@@ -256,12 +256,22 @@ pub fn form_row(label: impl Into<SharedString>, control: impl IntoElement) -> im
         .child(div().flex_1().min_w(px(0.)).child(control))
 }
 
+/// Single-line [`Input`] whose glyphs fit inside the border box.
+///
+/// gpui-component Medium is `h_8` (2rem, border-box) with 8px of vertical
+/// padding and a 1px border. The content box is then shorter than the 1.25rem
+/// line, so the line is clipped. `.py` is applied by `refine_style` after that
+/// padding and replaces only the vertical sides.
+pub fn line_input(state: &Entity<InputState>) -> Input {
+    Input::new(state).cleanable(true).py(px(2.))
+}
+
 /// Form row bound to a real [`Input`] (label | input).
 pub fn form_input_row(
     label: impl Into<SharedString>,
     state: &Entity<InputState>,
 ) -> impl IntoElement {
-    form_row(label, Input::new(state).cleanable(true))
+    form_row(label, line_input(state))
 }
 
 /// Upstream auto-update row: `Label | [Enable] Interval … [minutes]`.
@@ -302,12 +312,7 @@ pub fn form_enable_interval_row(
                     .flex_shrink_0()
                     .child("Interval (minute, invalid if less than 30)"),
             )
-            .child(
-                div()
-                    .w(px(88.))
-                    .flex_shrink_0()
-                    .child(Input::new(minutes).cleanable(true)),
-            ),
+            .child(div().w(px(88.)).flex_shrink_0().child(line_input(minutes))),
     )
 }
 
@@ -430,12 +435,7 @@ pub fn input_field_row(
                 .text_color(Theme::text_muted())
                 .child(label),
         )
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.))
-                .child(Input::new(state).cleanable(true)),
-        )
+        .child(div().flex_1().min_w(px(0.)).child(line_input(state)))
 }
 
 /// Format a GPUI keystroke as a Throne hotkey label (`Cmd/Ctrl+Shift+C`).
@@ -677,11 +677,16 @@ pub fn editor_area_tall(state: &Entity<EditorState>, height: f32) -> impl IntoEl
 }
 
 /// Compact Input (flex-1) for inline rows; optional trailing control (e.g. preset ▼).
+///
+/// Small is `h_6` (1.5rem) with 2px vertical padding, which still clips the
+/// 1.25rem line. Zero vertical padding keeps that line inside the border box.
 pub fn input_inline(state: &Entity<InputState>) -> impl IntoElement {
-    div()
-        .flex_1()
-        .min_w(px(120.))
-        .child(Input::new(state).cleanable(true).with_size(Size::Small))
+    div().flex_1().min_w(px(120.)).child(
+        Input::new(state)
+            .cleanable(true)
+            .with_size(Size::Small)
+            .py(px(0.)),
+    )
 }
 
 /// Multiline focus box (Add from input / multi-line routing fields).
