@@ -2,9 +2,9 @@
 
 Remote: `upstream` → `https://github.com/throneproj/Throne.git`  
 Baseline branch: `upstream/dev`  
-**Target release (this audit):** tag **`1.4.0`** (`99f7ecd1`, 2026-11-05).
-**Last audited tip:** `upstream/dev` describe **`1.4.0-2-g1346d9ee`** on 2026-11-06 (2 commits past the pin: `5f92cd98` telegram README link, `1346d9ee` Homebrew postflight; not absorbed).
-**Product version:** `1.4.0` (root [`VERSION`](../VERSION) + workspace Cargo version = this pin).
+**Target release (this audit):** tag **`1.4.2`** (`a7986a03`, 2026-11-15).
+**Last audited tip:** `upstream/dev` describe **`1.4.2-10-g48273be2`** on 2026-11-19 (10 commits past the pin, not absorbed).
+**Product version:** `1.4.2` (root [`VERSION`](../VERSION) + workspace Cargo version = this pin).
 
 This pin identifies the audited release baseline; it does not claim complete product parity. The new remote control API, full scanner, Kill Switch, global hotkeys, OS proxy refactor, and historical gaps below remain partial or unported.
 
@@ -24,6 +24,55 @@ git fetch upstream --prune --tags
 git log --oneline 1.4.0-beta.4..1.4.0-beta.5
 git diff --dirstat=files,0 1.4.0-beta.4 1.4.0-beta.5
 ```
+
+## 1.4.2 audit (2026-11-19)
+
+**Pinned release:** `a7986a03e978952b585ee1d24b6d8f2a48f7df41` (2026-11-15), **55 commits** after `1.4.0` (`99f7ecd1`). That range includes `1.4.1` (`3bbe551d`). `upstream/dev` is `1.4.2-10-g48273be2`; those 10 commits are excluded. This audit does not claim complete product parity.
+
+| Commit | Upstream change | Disposition in this rewrite |
+|--------|-----------------|-----------------------------|
+| `5f92cd98`, `1346d9ee` | Telegram README link; Homebrew postflight | N/A. Previously excluded from the 1.4.0 pin; they are inside 1.4.1 and stay out of this README |
+| `fbaf6817` | macOS Tun DNS via pf redirect and `dns-system` | ✅ Darwin Tun Start emits direct inbound `dns-system` on `127.0.0.53:53` and a leading hijack rule. Darwin Tun and URL tests use DNS type `underlying`. Core `sysdns` is the 1.4.2 listener; `Devices` is recorded so the local resolver patch can still see the saved servers |
+| `4d435e1d` | Main window minimum width | N/A Qt geometry |
+| `22888235`, `c03c044d`, `3e74e128` | Translations | ⏳ |
+| `c55556b8` | XHTTP extra and Clash `xhttp-opts` | 🧩 Existing XHTTP share links still bridge. The extra-field and Clash option parser from this commit is not re-audited line by line |
+| `21c056e4` | Release-notes download badge | N/A |
+| `3bbe551d` | Bump to 1.4.1 | ✅ Absorbed by the 1.4.2 pin |
+| `d32de94f` | Typo | N/A |
+| `7fe7b84c`, `0bb0cbe7` | Endpoint route rules and DNS rule order | ⏳ Route editor still does not special-case endpoint rules |
+| `2971fd49` | libc++ `ostream` include | N/A |
+| `ec26780a` | Stop link for profile tests | ⏳ |
+| `a1d1229c` | Group front/landing proxy on rule outbounds | ⏳ Start still does not wrap routing-rule outbounds with the group's front and landing proxies |
+| `eebbdabf` | Kill switch behavior | 🧩 Persisted guard only. No GUI or lifecycle integration |
+| `ec62e5eb`, `5e753ce7` | Chain tests; auto selector inside a chain | ⏳ A chain may store a selector. Native Start still does not build the hops around it |
+| `8d2823e2` | QUIC opener | ⏳ `quic_opener` is not yet a dial field |
+| `f6cfdb01` | Multiple DNS servers, raced | ✅ Comma-separated remote and direct addresses keep the lead tag and race the rest |
+| `967c6450`, `065607ff`, `1db4bbe0` | Auto selector UI, priority tiers, latency cap | ✅ Latency cap changes rank and `member_works`. Priority tiers, fail-back, and passive scoring persist and are emitted. The editor does not expose the new controls. Native Start still does not wait for a quorum |
+| `7eda1f64`, `40eedf2f` | Windows core elevation | N/A this macOS tree. The Go sources are synced |
+| `371421ed` | Xray chain test failure | ⏳ |
+| `642feea7` | Rule tester and program picker | ⏳ Core RPC `TestRoute` and `ListProcesses` are in the synced proto. The Rust client does not call them |
+| `f5fb80b4` | Subscription profile filter | ⏳ |
+| `6e2063c4`, `a38ead7f` | Service availability check | ⏳ Core service-check package is synced. No profile menu |
+| `046b2c5a` | DPI evasion parameter finder | ⏳ |
+| `fde077ad`, `321743c1`, `d4d3ea79` | Settings, shortcuts, cleanup | ⏳ Qt settings reorg is not a GPUI layout |
+| `35abd923` | Pin profile; subscription update | ⏳ `pinned_json` is not stored yet |
+| `372e9b08` | WireGuard handshake DPI | ✅ Inside the WireGuard pin `827ce83a4eed` when the patch still applies. No new Rust flag |
+| `27d5e27a` | Clash import | 🧩 Prior Clash bandwidth and Hysteria defaults stay. This commit's extra compatibility is not separately ported |
+| `47332470` | Dashboard and Tailscale paths | ⏳ Tailscale state-directory removal is not ported |
+| `37dc5870` | Mieru 3.39.0 | ✅ `core/go.mod` |
+| `ed600397` | `pinSHA256` as a `pcs` alias | ✅ TLS links accept hex or base64 `pinSHA256` when `pcs` is absent. Hysteria keeps its own pin |
+| `9c21f3e4`, `05a80e97`, `b778ef48`, `7b250e4c`, `f52f3769` | sing-box and core bumps | ✅ sing-box `9c9776a477b6`, Xray `eea0cb078b79`, WireGuard `827ce83a4eed`. uTLS stays `f0ae7792aa1d` |
+| `81b6953f` | Subscription traffic without a total | ⏳ |
+| `92a910ba` | Tor egress | 🧩 `enable_tor` persists and Start fails with the upstream not-downloaded message. Download, the Tor outbound, and the egress control are not ported |
+| `188e1c23` | Lint | N/A |
+| `666218ce`, `d61f9f8b` | Juicity certificate chain pin | ⏳ |
+| `4178ecf4`, `98fb0bc0` | TrustTunnel auth key and SNI check | ⏳ |
+| `e363c6ec` | Route test and auto-selector status in mobile core | ✅ Go sources synced. Desktop does not call `TestRoute` |
+| `a7986a03` | Changelogs and 1.4.2 | ✅ `VERSION`, workspace version, and README |
+
+Simple interface, web UI, log export, the remote API, scanner DNS probes, and the historical headless/Kill Switch/hotkey gaps remain explicit.
+
+Executed on 2026-11-19: 305 tests in throne-domain, throne-import, and throne-core-client; `cargo check -p throne`. `go test` of `sysdns` and `boxmain` passed (13). Both sing-box patches apply with zero fuzz. Unpatched `reality_client.go` is still `38a5d553fffd108afca51bde0b0888512d2f4633daa608e03767838b8fdcdbc0`. Unpatched `source_darwin.go` is still `72d4037c73ef1a71d0e56d25cbed3ba7eb79b3785b316eececbae6dc86ad2248`. `THRONE_CORE_VERIFY_PATCHES=1 ./script/build-core target/parity-1.4.2` exited 0 (systemconfig and sysdns race tests, 79M audit binary). Linker warned about duplicate `-lobjc` and `-lresolv`. Full workspace tests, strict Clippy, throne-storage, and the actual-core smoke groups were not re-run. Native GUI, privileged DNS/TUN, and cross-platform runtime remain untested. Installed or setuid copies are not refreshed by that path.
 
 ## 1.4.0 audit (2026-11-06)
 

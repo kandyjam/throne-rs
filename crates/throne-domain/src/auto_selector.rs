@@ -146,6 +146,21 @@ pub struct AutoSelectorConfig {
     pub balance_mode: String,
     #[serde(default = "default_balance_interval")]
     pub balance_interval_sec: i32,
+    /// `latency` or `priority`.
+    #[serde(default = "default_strategy")]
+    pub strategy: String,
+    #[serde(default)]
+    pub tiers: Vec<AutoSelectorTier>,
+    #[serde(default = "default_failback_checks")]
+    pub failback_checks: i32,
+    #[serde(default = "default_failback_delay")]
+    pub failback_delay_sec: i32,
+    #[serde(default)]
+    pub failback_interrupt: bool,
+    #[serde(default)]
+    pub passive: bool,
+    #[serde(default = "default_site_memory")]
+    pub site_memory_mins: i32,
     #[serde(default)]
     pub pool: Vec<ProfileId>,
     #[serde(default)]
@@ -205,6 +220,31 @@ fn default_balance_mode() -> String {
 fn default_balance_interval() -> i32 {
     30
 }
+fn default_strategy() -> String {
+    "latency".into()
+}
+fn default_failback_checks() -> i32 {
+    3
+}
+fn default_failback_delay() -> i32 {
+    60
+}
+fn default_site_memory() -> i32 {
+    60
+}
+
+/// One priority tier. `gid` of -1 matches every tracked group. The first match wins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoSelectorTier {
+    #[serde(default = "default_any_group")]
+    pub gid: GroupId,
+    #[serde(default)]
+    pub name_filter: String,
+}
+
+fn default_any_group() -> GroupId {
+    -1
+}
 fn default_pinned() -> ProfileId {
     -1
 }
@@ -236,6 +276,13 @@ impl Default for AutoSelectorConfig {
             balance: false,
             balance_mode: "rotate".into(),
             balance_interval_sec: 30,
+            strategy: default_strategy(),
+            tiers: Vec::new(),
+            failback_checks: default_failback_checks(),
+            failback_delay_sec: default_failback_delay(),
+            failback_interrupt: false,
+            passive: false,
+            site_memory_mins: default_site_memory(),
             pool: Vec::new(),
             pool_ranked_at: 0,
             pinned_id: -1,
@@ -315,6 +362,21 @@ impl AutoSelectorConfig {
         if self.balance_mode != "connection" {
             self.balance_mode = "rotate".into();
         }
+        if self.strategy != "priority" {
+            self.strategy = "latency".into();
+        }
+        self.failback_checks = self.failback_checks.clamp(1, self.sampling);
+        self.failback_delay_sec = self.failback_delay_sec.clamp(1, 3600);
+        self.site_memory_mins = self.site_memory_mins.clamp(1, 1440);
+        for tier in &mut self.tiers {
+            if tier.gid < -1 {
+                tier.gid = -1;
+            }
+        }
+    }
+
+    pub fn prioritized(&self) -> bool {
+        self.strategy == "priority"
     }
 
     pub fn to_outbound_json(&self) -> String {
@@ -346,6 +408,13 @@ impl AutoSelectorConfig {
             "balance": cfg.balance,
             "balance_mode": cfg.balance_mode,
             "balance_interval_sec": cfg.balance_interval_sec,
+            "strategy": cfg.strategy,
+            "tiers": cfg.tiers,
+            "failback_checks": cfg.failback_checks,
+            "failback_delay_sec": cfg.failback_delay_sec,
+            "failback_interrupt": cfg.failback_interrupt,
+            "passive": cfg.passive,
+            "site_memory_mins": cfg.site_memory_mins,
             "pool": cfg.pool,
             "pool_ranked_at": cfg.pool_ranked_at,
             "pinned_id": cfg.pinned_id,
@@ -380,6 +449,36 @@ impl AutoSelectorConfig {
         cfg.normalize();
         Some(cfg)
     }
+}
+
+/// First matching tier, or `tiers.len()` when none match. An invalid pattern matches nothing.
+pub fn auto_selector_tier_index(
+    selector: &AutoSelectorConfig,
+    group_id: GroupId,
+    name: &str,
+) -> usize {
+    if !selector.prioritized() {
+        return 0;
+    }
+    for (index, tier) in selector.tiers.iter().enumerate() {
+        if tier.gid >= 0 && group_id != tier.gid {
+            continue;
+        }
+        let pattern = tier.name_filter.trim();
+        if pattern.is_empty() {
+            return index;
+        }
+        let Ok(pattern) = regex::RegexBuilder::new(pattern)
+            .case_insensitive(true)
+            .build()
+        else {
+            continue;
+        };
+        if pattern.is_match(name) {
+            return index;
+        }
+    }
+    selector.tiers.len()
 }
 
 /// Parse Auto Selector config from a profile, if it is one.
@@ -434,10 +533,23 @@ pub fn start_quorum(selector: &AutoSelectorConfig) -> i32 {
     cfg.expected.max(cfg.active_size).min(cfg.build_limit)
 }
 
-/// A member works when its effective latency is a positive fresh measurement.
+/// A member works when its fresh latency is positive and under the latency cap.
+///
+/// At or over `max_rtt_ms`, the member is only a fallback (1.4.2).
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn member_works(selector: &AutoSelectorConfig, member: &Profile, now: i64) -> bool {
-    effective_latency(member, selector, now) > 0
+    qualifying_latency(
+        effective_latency(member, selector, now),
+        selector.max_rtt_ms,
+    )
+}
+
+fn qualifying_latency(latency: i32, max_rtt_ms: i32) -> bool {
+    latency > 0 && !over_latency_cap(latency, max_rtt_ms)
+}
+
+fn over_latency_cap(latency: i32, max_rtt_ms: i32) -> bool {
+    latency > 0 && max_rtt_ms > 0 && latency >= max_rtt_ms
 }
 
 /// Upstream `AutoSelectorBuildChanged`.
@@ -473,6 +585,7 @@ pub fn selector_build_changed(
 pub fn unmeasured_candidates(
     eligible: &[ProfileId],
     stale: &[ProfileId],
+    max_rtt_ms: i32,
     effective_latency_of: impl Fn(ProfileId) -> i32,
 ) -> (Vec<ProfileId>, i32) {
     let stale_set: std::collections::HashSet<_> = stale.iter().copied().collect();
@@ -486,20 +599,80 @@ pub fn unmeasured_candidates(
         let latency = effective_latency_of(id);
         if latency == 0 {
             needed.push(id);
-        } else if latency > 0 {
+        } else if latency > 0 && (max_rtt_ms <= 0 || latency < max_rtt_ms) {
             working += 1;
         }
     }
     (needed, working)
 }
 
-fn latency_rank(latency: i32) -> i32 {
+/// Each non-empty tier keeps a share of `limit`, then leftover slots fill in tier order.
+fn cap_by_tier(
+    ordered: &[ProfileId],
+    limit: i32,
+    tier_of: impl Fn(ProfileId) -> usize,
+) -> Vec<ProfileId> {
+    let limit = limit.max(0) as usize;
+    if ordered.len() <= limit {
+        return ordered.to_vec();
+    }
+    let mut by_tier: Vec<Vec<ProfileId>> = Vec::new();
+    for &id in ordered {
+        let tier = tier_of(id);
+        if tier >= by_tier.len() {
+            by_tier.resize(tier + 1, Vec::new());
+        }
+        by_tier[tier].push(id);
+    }
+    let non_empty = by_tier
+        .iter()
+        .filter(|members| !members.is_empty())
+        .count()
+        .max(1);
+    let reserve = (limit / (2 * non_empty)).max(1);
+    let mut quota = vec![0usize; by_tier.len()];
+    let mut given = 0usize;
+    for (index, members) in by_tier.iter().enumerate() {
+        quota[index] = members.len().min(reserve);
+        given += quota[index];
+    }
+    if given > limit {
+        given = 0;
+        for (index, members) in by_tier.iter().enumerate() {
+            quota[index] = usize::from(!members.is_empty() && given < limit);
+            given += quota[index];
+        }
+    }
+    for index in 0..by_tier.len() {
+        if given >= limit {
+            break;
+        }
+        let extra = by_tier[index]
+            .len()
+            .saturating_sub(quota[index])
+            .min(limit - given);
+        quota[index] += extra;
+        given += extra;
+    }
+    let mut capped = Vec::with_capacity(given);
+    for (index, members) in by_tier.iter().enumerate() {
+        capped.extend(members.iter().copied().take(quota[index]));
+    }
+    capped
+}
+
+/// Untested outranks over-cap and failed: a fresh subscription is still explored.
+fn latency_rank(latency: i32, max_rtt_ms: i32) -> i32 {
     if latency > 0 {
-        0
+        if over_latency_cap(latency, max_rtt_ms) {
+            2
+        } else {
+            0
+        }
     } else if latency == 0 {
         1
     } else {
-        2
+        3
     }
 }
 
@@ -853,8 +1026,8 @@ pub fn plan_auto_selector_groups(
         let lb = lookup(b)
             .map(|m| effective_latency(&m, selector, now))
             .unwrap_or(0);
-        let ra = latency_rank(la);
-        let rb = latency_rank(lb);
+        let ra = latency_rank(la, selector.max_rtt_ms);
+        let rb = latency_rank(lb, selector.max_rtt_ms);
         ra.cmp(&rb).then_with(|| {
             if ra == 0 {
                 la.cmp(&lb)
@@ -866,12 +1039,23 @@ pub fn plan_auto_selector_groups(
     ordered.extend(newcomers);
 
     plan.truncated = ordered.len() as i32 > selector.pool_cap;
-    if ordered.len() as i32 > selector.pool_cap {
-        ordered.truncate(selector.pool_cap as usize);
+    let tier_of = |id: ProfileId| {
+        lookup(id)
+            .map(|member| auto_selector_tier_index(selector, member.group_id, &member.name))
+            .unwrap_or(selector.tiers.len())
+    };
+    if selector.prioritized() {
+        ordered = cap_by_tier(&ordered, selector.pool_cap, &tier_of);
+        plan.pool = ordered.clone();
+        plan.build = cap_by_tier(&ordered, selector.build_limit, &tier_of);
+    } else {
+        if ordered.len() as i32 > selector.pool_cap {
+            ordered.truncate(selector.pool_cap as usize);
+        }
+        plan.pool = ordered.clone();
+        let build_n = (selector.build_limit as usize).min(ordered.len());
+        plan.build = ordered[..build_n].to_vec();
     }
-    plan.pool = ordered.clone();
-    let build_n = (selector.build_limit as usize).min(ordered.len());
-    plan.build = ordered[..build_n].to_vec();
 
     if ordered.len() as i32 > selector.build_limit {
         let unranked = plan
@@ -926,8 +1110,8 @@ pub fn rerank_auto_selector_groups(
         let lb = lookup(b)
             .map(|m| effective_latency(&m, selector, now))
             .unwrap_or(0);
-        let ra = latency_rank(la);
-        let rb = latency_rank(lb);
+        let ra = latency_rank(la, selector.max_rtt_ms);
+        let rb = latency_rank(lb, selector.max_rtt_ms);
         ra.cmp(&rb).then_with(|| {
             if ra == 0 {
                 la.cmp(&lb)
@@ -1256,7 +1440,7 @@ mod tests {
 
     #[test]
     fn unmeasured_candidates_count_stale_and_working() {
-        let (needed, working) = unmeasured_candidates(&[1, 2, 3, 4], &[2], |id| match id {
+        let (needed, working) = unmeasured_candidates(&[1, 2, 3, 4], &[2], 0, |id| match id {
             1 => 40,
             2 => 40,
             3 => 0,

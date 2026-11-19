@@ -123,25 +123,31 @@ fn disabled_mixed_inbound_is_not_recreated_by_config_generation() {
     assert!(inbounds.iter().any(|inbound| inbound["tag"] == "dns-in"));
 }
 #[test]
-fn tun_does_not_publish_loopback_dns_system() {
+fn tun_dns_system_follows_the_1_4_2_macos_listener() {
     let s = AppSettings {
         tun_mode_enabled: true,
         ..Default::default()
     };
     let v = config(&profile(Value::Null), &s, None);
     let rendered = v.to_string();
-    assert!(
-        !rendered.contains("dns-system"),
-        "beta.6 removed the 127.0.0.53 direct inbound"
-    );
-    assert!(!rendered.contains("127.0.0.53"));
     let local = v["dns"]["servers"]
         .as_array()
         .unwrap()
         .iter()
         .find(|server| server["tag"] == "dns-local")
         .unwrap();
-    assert_eq!(local["type"], "local");
+    #[cfg(target_os = "macos")]
+    {
+        assert!(rendered.contains("dns-system"));
+        assert!(rendered.contains("127.0.0.53"));
+        assert_eq!(local["type"], "underlying");
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        assert!(!rendered.contains("dns-system"));
+        assert!(!rendered.contains("127.0.0.53"));
+        assert_eq!(local["type"], "local");
+    }
 }
 
 #[test]

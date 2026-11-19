@@ -19,8 +19,8 @@ Keep **throne-rs** (`rewrite/rust-gpui`) behaviorally aligned with
 |------|--------|
 | Upstream remote | `upstream` → `https://github.com/throneproj/Throne.git` |
 | Baseline branch | `upstream/dev` (or a release tag e.g. `1.2.4`) |
-| **Current pin** | tag **`1.4.0`** (`99f7ecd1`, 2026-11-05) |
-| **Tip tracked** | `upstream/dev` describe `1.4.0-2-g1346d9ee` on 2026-11-06; 2 later commits excluded |
+| **Current pin** | tag **`1.4.2`** (`a7986a03`, 2026-11-15) |
+| **Tip tracked** | `upstream/dev` describe `1.4.2-10-g48273be2` on 2026-11-19; 10 later commits excluded |
 | **1.2.5** | Never tagged; line jumped to **1.3.0-beta.1**. |
 | Product version | root [`VERSION`](../../VERSION) + workspace `Cargo.toml` `version` (= requested audited release tag / `NKR_VERSION`) |
 | Parity matrix | [`docs/UPSTREAM_TRACKING.md`](../../docs/UPSTREAM_TRACKING.md) |
@@ -101,7 +101,19 @@ Packaging scripts already read root `VERSION`.
 
 When **1.2.5** is tagged: `git log --oneline 1.2.4..1.2.5` → triage → bump `VERSION` + skill pin + matrix.
 
-## 1.4.0 feature notes (current pin)
+## 1.4.2 feature notes (current pin)
+
+Target `a7986a03` (2026-11-15); audited 2026-11-19. All 55 commits since 1.4.0 are triaged in `docs/UPSTREAM_TRACKING.md`. `upstream/dev` is `1.4.2-10-g48273be2`. This release pin does not assert complete product parity.
+
+- macOS Tun Start emits `dns-system` on `127.0.0.53:53` and hijacks that inbound before sniff. Darwin Tun and URL tests use DNS type `underlying`. The core uses the 1.4.2 pf redirect. The local resolver patch still receives saved servers through `record.Devices`.
+- Comma-separated remote and direct DNS addresses race. A single address stays a plain route rule.
+- Auto Selector latency at or over `max_rtt_ms` ranks behind untested members and does not count as working. Priority tiers, fail-back, and passive scoring persist and are emitted. The editor does not show them.
+- `pinSHA256` is a `pcs` alias on non-Hysteria TLS links, in hex or base64.
+- `enable_tor` fails Start with the upstream not-downloaded message. Tor download and the egress outbound are not ported.
+- Rule tester, program picker, service check, DPI scan, subscription filters, profile pins, Juicity chain pins, TrustTunnel auth keys, and QUIC opener stay unported. Windows elevation is in the synced Go core only.
+- Core pins: sing-box `9c9776a477b6`, Xray `eea0cb078b79`, WireGuard `827ce83a4eed`, uTLS `f0ae7792aa1d`. Both patches still match the previous source hashes. `THRONE_CORE_VERIFY_PATCHES=1 ./script/build-core target/parity-1.4.2` exited 0 (79M audit binary).
+
+## 1.4.0 feature notes (historical pin)
 
 Target `99f7ecd1` (2026-11-05); audited 2026-11-06. All 7 commits since beta.6 are triaged in `docs/UPSTREAM_TRACKING.md`. `upstream/dev` is `1.4.0-2-g1346d9ee`; `5f92cd98` and `1346d9ee` are excluded. This release pin does not assert complete product parity.
 

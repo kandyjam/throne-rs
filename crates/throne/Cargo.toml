@@ -6,7 +6,6 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "ThroneRs desktop client — Rust + GPUI rewrite of Throne"
-homepage = "https://github.com/kandyjam/throne-rs"
 # Binary must stay named `Throne` — Go ThroneCore parentcheck requires
 # parent basename == "Throne" and ThroneCore living in the same directory.
 # Display / bundle name is ThroneRs (see [package.metadata.bundle]).

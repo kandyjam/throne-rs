@@ -22,6 +22,28 @@ const NATIVE_CIPHER_SUITES: &[&str] = &[
     "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
 ];
 
+fn certificate_sha256_pin(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let hex: String = trimmed
+        .chars()
+        .filter(|ch| *ch != ':' && *ch != '-')
+        .collect();
+    if hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        let bytes: Vec<u8> = (0..64)
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
+            .collect();
+        return Some(base64::engine::general_purpose::STANDARD.encode(bytes));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(trimmed)
+        .ok()?;
+    (bytes.len() == 32).then(|| base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
 fn get<'a>(query: &'a [(String, String)], key: &str) -> Option<&'a str> {
     query
         .iter()
@@ -50,6 +72,11 @@ fn config_lines(text: &str) -> Vec<String> {
 }
 
 pub(crate) fn apply_link_tls(outbound: &mut Value, query: &[(String, String)]) {
+    let outbound_type = outbound
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
     let Some(tls) = outbound.get_mut("tls").and_then(Value::as_object_mut) else {
         return;
     };
@@ -74,21 +101,16 @@ pub(crate) fn apply_link_tls(outbound: &mut Value, query: &[(String, String)]) {
             tls.remove("utls");
         }
     }
-    if let Some(pcs) = get(query, "pcs") {
-        let hashes: Vec<_> = pcs
-            .split(',')
-            .filter_map(|hash| {
-                let hex = hash.trim().replace(':', "");
-                if hex.len() != 64 || !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
-                    return None;
-                }
-                let bytes: Vec<_> = (0..64)
-                    .step_by(2)
-                    .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
-                    .collect();
-                Some(base64::engine::general_purpose::STANDARD.encode(bytes))
-            })
-            .collect();
+    let pin = get(query, "pcs").or_else(|| {
+        // Hysteria parses pinSHA256 itself. Other TLS links accept it as a pcs alias (#2115).
+        if matches!(outbound_type.as_str(), "hysteria" | "hysteria2" | "hy2") {
+            None
+        } else {
+            get(query, "pinSHA256")
+        }
+    });
+    if let Some(pcs) = pin {
+        let hashes: Vec<_> = pcs.split(',').filter_map(certificate_sha256_pin).collect();
         if !hashes.is_empty() {
             tls.insert("certificate_sha256".into(), json!(hashes));
         }

@@ -2,10 +2,10 @@
 
 **Rust + [GPUI](https://github.com/zed-industries/zed) rewrite** of [Throne](https://github.com/throneproj/Throne) (formerly Nekoray) — a cross-platform desktop GUI proxy client powered by Sing-box / Xray.
 
-**Version:** `1.4.0` (aligned with upstream release tag / `NKR_VERSION` — see root [`VERSION`](./VERSION))
+**Version:** `1.4.2` (aligned with upstream release tag / `NKR_VERSION` — see root [`VERSION`](./VERSION))
 
-> Status: **Wave 1.4.0** — core pins include the MASQUE and uTLS fixes, and MasterDNS import no longer notes ignored SOCKS listener credentials. Scanner DNS probes, MasterDNS TOML links, log export, the remote API, and the earlier headless/Kill Switch/hotkey gaps stay explicit in the parity matrix.
-> Upstream remote: `upstream` → [throneproj/Throne](https://github.com/throneproj/Throne) (`dev` is two commits ahead; pin is tag `1.4.0`).
+> Status: **Wave 1.4.2** — macOS Tun publishes the `dns-system` listener again, comma-separated DNS servers race, and Auto Selector honors the latency cap plus priority tiers. Tor download, the rule tester, service check, and the DPI scanner stay explicit in the parity matrix.
+> Upstream remote: `upstream` → [throneproj/Throne](https://github.com/throneproj/Throne) (`dev` is ten commits ahead; pin is tag `1.4.2`).
 > Parity matrix: [docs/UPSTREAM_TRACKING.md](./docs/UPSTREAM_TRACKING.md) · Skill: [skills/throne-upstream-parity/SKILL.md](./skills/throne-upstream-parity/SKILL.md).
 
 ## Architecture
@@ -17,7 +17,7 @@
 | Import | `crates/throne-import` | Share links + `throne://` deeplinks (GroupUpdater-aligned) |
 | Storage | `crates/throne-storage` | SQLite schema compatible with upstream repos |
 | Core client | `crates/throne-core-client` | Async API toward the Go `ThroneCore` process |
-| Data plane | `core/` | Existing Go core (sing-box / xray, TUN, DNS, tests), synced to upstream 1.4.0 |
+| Data plane | `core/` | Existing Go core (sing-box / xray, TUN, DNS, tests), synced to upstream 1.4.2 |
 
 ```
 ┌──────────────────────────┐

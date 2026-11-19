@@ -1545,6 +1545,9 @@ pub fn upgrade_tun_private_ranges(list: Vec<String>) -> Vec<String> {
 pub struct AppSettings {
     #[serde(default = "default_disable_mixed_inbound")]
     pub disable_mixed_inbound: bool,
+    /// Send traffic through Tor after the selected server. The core downloads the binary.
+    #[serde(default)]
+    pub enable_tor: bool,
     #[serde(default = "default_xray_use_system_ca")]
     pub xray_use_system_ca: bool,
     #[serde(default = "default_mux_default_on")]
@@ -1840,6 +1843,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             disable_mixed_inbound: default_disable_mixed_inbound(),
+            enable_tor: false,
             xray_use_system_ca: default_xray_use_system_ca(),
             mux_default_on: default_mux_default_on(),
             mux_protocol: default_mux_protocol(),

@@ -18,10 +18,10 @@ mod store;
 mod version;
 
 pub use auto_selector::{
-    classify_custom_member, is_xray_full_config_member, plan_auto_selector,
-    plan_auto_selector_groups, profile_auto_selector, rerank_auto_selector_groups,
-    rerank_auto_selector_pool, AutoSelectorConfig, AutoSelectorPlan, AutoSelectorSkip,
-    CustomMemberKind,
+    auto_selector_tier_index, classify_custom_member, is_xray_full_config_member,
+    plan_auto_selector, plan_auto_selector_groups, profile_auto_selector,
+    rerank_auto_selector_groups, rerank_auto_selector_pool, AutoSelectorConfig, AutoSelectorPlan,
+    AutoSelectorSkip, AutoSelectorTier, CustomMemberKind,
 };
 pub use dns_tunnel::{dns_tunnel_identity, dns_tunnel_startup_allowance_ms};
 pub use endpoint_source::{

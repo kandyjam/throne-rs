@@ -7,11 +7,13 @@ import (
 	"strconv"
 
 	"ThroneCore/internal/sysdns"
+	"ThroneCore/internal/torproc"
 
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/experimental/deprecated"
 	"github.com/sagernet/sing-box/include"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing-box/protocol/tor"
 	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/filemanager"
 )
@@ -41,6 +43,7 @@ func newBoxContext() context.Context {
 		ctx = filemanager.WithDefault(ctx, "", "", ownerUID, ownerGID)
 	}
 	ctx = service.ContextWith(ctx, deprecated.NewStderrManager(log.StdLogger()))
+	ctx = service.ContextWith[tor.ProcessCreator](ctx, torproc.Creator{})
 	ctx = box.Context(ctx, include.InboundRegistry(), include.OutboundRegistry(), include.EndpointRegistry(), include.DNSTransportRegistry(), include.ServiceRegistry(), include.CertificateProviderRegistry())
 	return ctx
 }

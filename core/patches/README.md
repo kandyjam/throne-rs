@@ -2,7 +2,7 @@
 
 `script/build-core` applies `sing-box-reality-mlkem.patch` and
 `sing-box-darwin-system-dns.patch` to a private copy of
-`github.com/throneproj/sing-box` at `v1.11.16-0.20261105144313-6bc5c846150e`.
+`github.com/throneproj/sing-box` at `v1.11.16-0.20261114014555-9c9776a477b6`.
 It verifies the replacement module version and original source SHA256 before
 patching, uses a temporary modfile with `-mod=readonly`, and removes the copy
 after the build. Committed lockfiles and the shared Go module cache are untouched.
@@ -91,6 +91,9 @@ refreshed by that path.
 
 Re-audited on 2026-11-06 against pin `6bc5c846150e`: `reality_client.go` and
 `source_darwin.go` keep the hashes above. Both patches applied with zero fuzz.
+Re-audited on 2026-11-19 against pin `9c9776a477b6`: both source hashes are
+unchanged and both patches still apply with zero fuzz. The dependency-version
+guard names the 1.4.2 pin.
 `THRONE_CORE_VERIFY_PATCHES=1 ./script/build-core target/parity-1.4.0` exited 0.
 The patched systemconfig and sysdns race tests passed. The audit binary is
 78M. The 13 smoke groups were not repeated. Installed or setuid copies are not

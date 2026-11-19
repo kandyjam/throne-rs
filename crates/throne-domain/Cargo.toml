@@ -13,3 +13,4 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 sha1_smol = "1.0.1"
+regex = "1"

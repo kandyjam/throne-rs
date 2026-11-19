@@ -67,6 +67,11 @@ pub fn build_load_config_ex(
         effective
     });
     let settings = effective_settings.as_ref().unwrap_or(settings);
+    if settings.enable_tor {
+        return Err(CoreError::Config(
+            "Tor is enabled but not downloaded yet. Open Routing Settings > Egress and press OK to download it.".into(),
+        ));
+    }
     let mut xray_full_configs = Vec::new();
     let mut xray_lazy_start = false;
     let mut xray_idle_seconds = 0;
@@ -195,6 +200,20 @@ pub fn build_load_config_ex(
         }
         inbounds.push(tun);
     }
+    // 1.4.1 points macOS system DNS at this lo0 alias. The core pf-redirects :53
+    // onto it. URL tests do not publish the listener.
+    if cfg!(target_os = "macos") && settings.tun_mode_enabled {
+        inbounds.insert(
+            0,
+            json!({
+                "type": "direct",
+                "tag": "dns-system",
+                "listen": "127.0.0.53",
+                "listen_port": 53,
+                "reuse_addr": true
+            }),
+        );
+    }
 
     let (mut route_rules, mut rule_sets, route_final) =
         compile_route_section(route_profile, settings.ruleset_mirror);
@@ -205,6 +224,9 @@ pub fn build_load_config_ex(
         route_rules.insert(2, json!({"inbound":"dns-in","action":"reject"}));
     } else {
         route_rules.push(json!({"inbound":"dns-in","action":"reject"}));
+    }
+    if cfg!(target_os = "macos") && settings.tun_mode_enabled {
+        route_rules.insert(0, json!({"inbound":"dns-system","action":"hijack-dns"}));
     }
     let l3_bridge = l3_bridge_enabled(settings, route_profile);
     if l3_bridge {
@@ -1435,6 +1457,45 @@ fn build_auto_selector_outbounds(
                 json!(format!("{}s", auto.config.balance_interval_sec.max(5))),
             );
         }
+        if auto.config.strategy == "priority" {
+            let mut buckets = vec![Vec::new(); auto.config.tiers.len() + 1];
+            for (member, tag) in auto.members.iter().zip(tags.iter()) {
+                let index = throne_domain::auto_selector_tier_index(
+                    &auto.config,
+                    member.group_id,
+                    &member.name,
+                );
+                buckets[index].push(tag.clone());
+            }
+            obj.insert("strategy".into(), json!("priority"));
+            obj.insert("tiers".into(), json!(buckets));
+            obj.insert(
+                "failback_checks".into(),
+                json!(auto
+                    .config
+                    .failback_checks
+                    .clamp(1, auto.config.sampling.clamp(2, 60))),
+            );
+            obj.insert(
+                "failback_delay".into(),
+                json!(format!(
+                    "{}s",
+                    auto.config.failback_delay_sec.clamp(1, 3600)
+                )),
+            );
+            if auto.config.failback_interrupt {
+                obj.insert("failback_interrupt".into(), json!(true));
+            }
+        }
+        if auto.config.passive {
+            obj.insert(
+                "passive".into(),
+                json!({
+                    "enabled": true,
+                    "site_memory": format!("{}m", auto.config.site_memory_mins.clamp(1, 1440))
+                }),
+            );
+        }
     }
 
     Ok(AutoSelectorOutbounds {
@@ -2630,6 +2691,113 @@ fn apply_tls(v: &mut Value, o: &ParsedOutbound, default_on: bool) {
 /// - proxy server hostnames → route to dns-direct
 /// - final DNS rule from `dns_final_out`
 /// - no top-level `dns.final` (rules carry the final server)
+/// Comma-separated DNS addresses, trimmed, with case-insensitive duplicates dropped.
+fn split_dns_addresses(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for part in text.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if out
+            .iter()
+            .any(|have: &String| have.eq_ignore_ascii_case(part))
+        {
+            continue;
+        }
+        out.push(part.to_string());
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+fn dns_role_tags(lead: &str, count: usize) -> Vec<String> {
+    let mut tags = vec![lead.to_string()];
+    for index in 1..count {
+        tags.push(format!("{lead}-{index}"));
+    }
+    tags
+}
+
+fn dns_role_servers(
+    addresses: &str,
+    lead: &str,
+    tun_enabled: bool,
+    underlying: &str,
+    detour_proxy: bool,
+) -> Vec<Value> {
+    let addresses = split_dns_addresses(addresses);
+    let tags = dns_role_tags(lead, addresses.len());
+    addresses
+        .into_iter()
+        .zip(tags)
+        .map(|(address, tag)| {
+            let mut server = build_dns_obj(&address, tun_enabled, false, underlying);
+            if let Some(obj) = server.as_object_mut() {
+                obj.insert("tag".into(), json!(tag));
+                obj.insert("domain_resolver".into(), json!("dns-local"));
+                if detour_proxy {
+                    obj.insert("detour".into(), json!("proxy"));
+                }
+            }
+            server
+        })
+        .collect()
+}
+
+/// One server keeps a route rule. Several servers evaluate in parallel and the
+/// first NOERROR or NXDOMAIN wins.
+fn append_dns_route(
+    rules: &mut Vec<Value>,
+    conditions: Map<String, Value>,
+    members: &[String],
+    strategy: &str,
+) {
+    if members.len() < 2 {
+        let mut route = conditions;
+        route.insert("action".into(), json!("route"));
+        route.insert(
+            "server".into(),
+            json!(members.first().map(String::as_str).unwrap_or("dns-remote")),
+        );
+        if !strategy.is_empty() {
+            route.insert("strategy".into(), json!(strategy));
+        }
+        rules.push(Value::Object(route));
+        return;
+    }
+    let prefix = format!(
+        "race{}-",
+        rules
+            .iter()
+            .filter(|rule| rule["action"] == "evaluate")
+            .count()
+    );
+    for (index, member) in members.iter().enumerate() {
+        let mut evaluate = conditions.clone();
+        evaluate.insert("action".into(), json!("evaluate"));
+        evaluate.insert("server".into(), json!(member));
+        evaluate.insert("tag".into(), json!(format!("{prefix}{index}")));
+        rules.push(Value::Object(evaluate));
+    }
+    for rcode in ["NOERROR", "NXDOMAIN"] {
+        for index in 0..members.len() {
+            rules.push(json!({
+                "match_response": format!("{prefix}{index}"),
+                "response_rcode": rcode,
+                "action": "respond",
+                "race": true
+            }));
+        }
+    }
+    let mut fail = conditions;
+    fail.insert("action".into(), json!("predefined"));
+    fail.insert("rcode".into(), json!("SERVFAIL"));
+    rules.push(Value::Object(fail));
+}
+
 fn build_dns_section(
     settings: &AppSettings,
     tun_enabled: bool,
@@ -2669,20 +2837,24 @@ fn build_dns_section(
 
     let underlying = underlying_dns_address(settings)?;
 
-    // remote — upstream: only dns-remote gets detour=proxy
-    let mut remote = build_dns_obj(&settings.remote_dns, tun_enabled, false, &underlying);
-    if let Some(obj) = remote.as_object_mut() {
-        obj.insert("tag".into(), json!("dns-remote"));
-        obj.insert("detour".into(), json!("proxy"));
-        obj.insert("domain_resolver".into(), json!("dns-local"));
-    }
-
-    // direct — upstream: buildDnsObj(direct_dns); no detour
-    let mut direct = build_dns_obj(&settings.direct_dns, tun_enabled, false, &underlying);
-    if let Some(obj) = direct.as_object_mut() {
-        obj.insert("tag".into(), json!("dns-direct"));
-        obj.insert("domain_resolver".into(), json!("dns-local"));
-    }
+    // A role may list several comma-separated addresses. The first keeps the
+    // plain tag; the rest are raced and the first definitive answer wins.
+    let remote_servers = dns_role_servers(
+        &settings.remote_dns,
+        "dns-remote",
+        tun_enabled,
+        &underlying,
+        true,
+    );
+    let direct_servers = dns_role_servers(
+        &settings.direct_dns,
+        "dns-direct",
+        tun_enabled,
+        &underlying,
+        false,
+    );
+    let remote_tags = dns_role_tags("dns-remote", remote_servers.len());
+    let direct_tags = dns_role_tags("dns-direct", direct_servers.len());
 
     // local — the patched core bypasses its own Darwin DNS alias.
     let dns_local_address = if settings.core_box_underlying_dns.trim().is_empty() {
@@ -2696,11 +2868,6 @@ fn build_dns_section(
     }
 
     let use_direct_final = settings.dns_final_out.trim().eq_ignore_ascii_case("direct");
-    let final_tag = if use_direct_final {
-        "dns-direct"
-    } else {
-        "dns-remote"
-    };
     let direct_strategy = if settings.direct_dns_disable_ipv6 {
         "ipv4_only"
     } else {
@@ -2737,20 +2904,15 @@ fn build_dns_section(
     // Upstream needDirectDnsRules: proxy server domains must not go via dns-remote
     // (chicken-egg before the outbound is up).
     if !proxy_domains.is_empty() {
-        let mut rule = json!({
-            "domain": proxy_domains,
-            "action": "route",
-            "server": "dns-direct"
-        });
-        if !direct_strategy.is_empty() {
-            rule.as_object_mut()
-                .unwrap()
-                .insert("strategy".into(), json!(direct_strategy));
-        }
-        rules.push(rule);
+        let mut matched = Map::new();
+        matched.insert("domain".into(), json!(proxy_domains));
+        append_dns_route(&mut rules, matched, &direct_tags, direct_strategy);
     }
 
-    let mut servers = vec![remote, direct, local];
+    let mut servers = Vec::new();
+    servers.extend(remote_servers);
+    servers.extend(direct_servers);
+    servers.push(local);
     if settings.fake_dns {
         let mut fake = json!({"type":"fakeip","tag":"dns-fake","inet4_range":"198.18.0.0/15"});
         // Keep fake IPv6 outside the private fc00::/7 TUN bypass.
@@ -2790,27 +2952,22 @@ fn build_dns_section(
                     if matched.is_empty() {
                         continue;
                     }
-                    matched.insert("action".into(), json!("route"));
-                    matched.insert("server".into(), json!(tag));
-                    if !strategy.is_empty() {
-                        matched.insert("strategy".into(), json!(strategy));
-                    }
-                    rules.push(Value::Object(matched));
+                    let members = if tag == "dns-direct" {
+                        &direct_tags
+                    } else {
+                        &remote_tags
+                    };
+                    append_dns_route(&mut rules, matched, members, strategy);
                 }
             }
         }
     }
-    let mut final_rule = json!({
-        "action": "route",
-        "server": final_tag
-    });
-    if !final_strategy.is_empty() {
-        final_rule
-            .as_object_mut()
-            .unwrap()
-            .insert("strategy".into(), json!(final_strategy));
-    }
-    rules.push(final_rule);
+    let final_members = if use_direct_final {
+        &direct_tags
+    } else {
+        &remote_tags
+    };
+    append_dns_route(&mut rules, Map::new(), final_members, final_strategy);
 
     // Upstream dns object: servers + rules + cache_* — no top-level final.
     let mut dns = json!({
@@ -3045,10 +3202,13 @@ fn underlying_dns_address(settings: &AppSettings) -> Result<String, CoreError> {
 
 /// DNS type for an empty or `local` resolver address.
 ///
-/// Beta.6 no longer publishes the macOS `dns-system` listener. The core's
-/// temporary network service and `0.0.0.0/8` route scope lookups into the Tun,
-/// so Start emits `local` on every platform.
+/// 1.4.1 macOS Tun and URL tests use `underlying`. `local` would query the
+/// `dns-system` listener and loop (#2045). Other platforms stay `local`.
 fn system_resolver_type(tun_enabled: bool, for_test: bool) -> &'static str {
+    #[cfg(target_os = "macos")]
+    if tun_enabled || for_test {
+        return "underlying";
+    }
     let _ = (tun_enabled, for_test);
     "local"
 }
@@ -3692,6 +3852,36 @@ mod tests {
     }
 
     #[test]
+    fn macos_tun_publishes_dns_system_ahead_of_sniff() {
+        let mut profile = Profile::new(1, 1, "n1", ProfileType::Vless);
+        profile.outbound = ParsedOutbound {
+            server: Some("1.2.3.4".into()),
+            server_port: Some(443),
+            uuid: Some("11111111-1111-1111-1111-111111111111".into()),
+            ..Default::default()
+        };
+        let built = build_load_config(&profile, &tun_settings(), None).unwrap();
+        let config: Value = serde_json::from_str(&built.core_config_json).unwrap();
+        let rules = config["route"]["rules"].as_array().unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(rules[0]["inbound"], "dns-system");
+            assert_eq!(rules[0]["action"], "hijack-dns");
+            assert_eq!(rules[1]["action"], "sniff");
+            assert!(config["inbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|inbound| inbound["tag"] == "dns-system" && inbound["reuse_addr"] == true));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(rules.iter().all(|rule| rule["inbound"] != "dns-system"));
+            assert!(!config.to_string().contains("dns-system"));
+        }
+    }
+
+    #[test]
     fn tun_dns_routes_proxy_hostname_via_direct() {
         // Upstream CalculatePrerequisities → directDomains for getEntDomains.
         let mut p = Profile::new(1, 1, "hy2", ProfileType::Hysteria2);
@@ -3800,10 +3990,25 @@ mod tests {
             .iter()
             .find(|s| s["tag"] == "dns-local")
             .unwrap();
-        // Beta.6 scopes macOS lookups with a temporary service, so local no longer
-        // loops through a 127.0.0.53 dns-system inbound.
-        assert_eq!(local["type"], "local");
-        assert!(!v.to_string().contains("dns-system"));
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(local["type"], "underlying");
+            let dns_system = v["inbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|inbound| inbound["tag"] == "dns-system")
+                .expect("dns-system inbound");
+            assert_eq!(dns_system["listen"], "127.0.0.53");
+            assert_eq!(dns_system["listen_port"], 53);
+            assert_eq!(v["route"]["rules"][0]["inbound"], "dns-system");
+            assert_eq!(v["route"]["rules"][0]["action"], "hijack-dns");
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(local["type"], "local");
+            assert!(!v.to_string().contains("dns-system"));
+        }
         assert_eq!(v["experimental"]["cache_file"]["store_dns"], false);
         assert_eq!(v["experimental"]["cache_file"]["store_fakeip"], false);
         let tun = v["inbounds"]

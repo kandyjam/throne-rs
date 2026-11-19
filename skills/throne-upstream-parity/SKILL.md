@@ -12,7 +12,16 @@ description: >-
 Keep **throne-rs** (`rewrite/rust-gpui`) behaviorally aligned with
 [throneproj/Throne](https://github.com/throneproj/Throne) without reintroducing Qt.
 
-## 1.4.0 feature notes (current pin)
+## 1.4.2 feature notes (current pin)
+
+Target `a7986a03` (2026-11-15); audited 2026-11-19. All 55 commits since 1.4.0 are triaged in `docs/UPSTREAM_TRACKING.md`. `upstream/dev` is `1.4.2-10-g48273be2`. This release pin does not assert complete product parity.
+
+- macOS Tun Start emits `dns-system` on `127.0.0.53:53` and hijacks that inbound before sniff. Darwin Tun and URL tests use DNS type `underlying`.
+- Comma-separated DNS addresses race. Auto Selector latency cap, priority tiers, fail-back, and passive scoring persist and emit. `pinSHA256` is a `pcs` alias except on Hysteria. `enable_tor` fails Start until Tor is downloaded.
+- Rule tester, service check, DPI scan, subscription filters, profile pins, Juicity/TrustTunnel rework, and QUIC opener stay unported.
+- Core pins: sing-box `9c9776a477b6`, Xray `eea0cb078b79`, WireGuard `827ce83a4eed`, uTLS `f0ae7792aa1d`. `THRONE_CORE_VERIFY_PATCHES=1 ./script/build-core target/parity-1.4.2` exited 0 (79M audit binary).
+
+## 1.4.0 feature notes (historical pin)
 
 Target `99f7ecd1` (2026-11-05); audited 2026-11-06. All 7 commits since beta.6 are triaged in `docs/UPSTREAM_TRACKING.md`. `upstream/dev` is `1.4.0-2-g1346d9ee`; `5f92cd98` and `1346d9ee` are excluded. This release pin does not assert complete product parity.
 
@@ -82,8 +91,8 @@ All **16 commits** since beta.2 are triaged in `docs/UPSTREAM_TRACKING.md`; the 
 | Item | Value |
 |------|--------|
 | Upstream remote | `upstream` → `https://github.com/throneproj/Throne.git` |
-| **Pin** | tag **`1.4.0`** (`99f7ecd1`, 2026-11-05) |
-| `upstream/dev` at last audit | `1.4.0-2-g1346d9ee` on 2026-11-06 — `5f92cd98` and `1346d9ee` excluded |
+| **Pin** | tag **`1.4.2`** (`a7986a03`, 2026-11-15) |
+| `upstream/dev` at last audit | `1.4.2-10-g48273be2` on 2026-11-19 — 10 commits excluded |
 | Product version | root `VERSION` + workspace `Cargo.toml` `version` |
 | Matrix | [`docs/UPSTREAM_TRACKING.md`](../../docs/UPSTREAM_TRACKING.md) |
 | Audit command | `./script/upstream-audit [tag]` |
@@ -114,7 +123,7 @@ git archive <tag> core | tar -x
 # re-apply the local patch (do not drop it)
 ```
 
-**Local patch:** keep `core/internal/boxmain/context.go` injecting `sysdns.DNSOverride` and `core/patches/sing-box-darwin-system-dns.patch`. Beta.6 `Apply(tunCIDR)` publishes a temporary network service; do not replay the old `netmon.DefaultInterface()` follow onto `sysdns_darwin.go`. `RestoreLegacy` cleans a dead beta.4/beta.5 `127.0.0.53` networksetup state.
+**Local patch:** keep `core/internal/boxmain/context.go` injecting `sysdns.DNSOverride` and `core/patches/sing-box-darwin-system-dns.patch`. 1.4.2 `Apply` points network services at `127.0.0.53` and pf-redirects port 53. Record `Devices` on that state so the resolver patch can restore saved servers. Do not delete `override_darwin.go`. `RestoreLegacy` still cleans a dead beta.4/beta.5 networksetup state.
 
 Proto lives at `core/gen/libcore.proto`. New contracts since 1.3.0-beta.3 include `WarpRegister`, `CaptureDiagnostics`, `StopDiagnostics`, `UpdateRuleSets`, scanner/egress RPCs and the target's guard support. Retired standalone DNS-hijack RPCs are removed. Field 12 `vpn_status_timeout_ms` is reserved. Do not invent framing; the Rust client is length-prefixed method + protobuf.
 
