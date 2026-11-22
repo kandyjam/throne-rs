@@ -143,6 +143,18 @@ pub enum Dialog {
     AddFromInput {
         text: String,
     },
+    /// Upstream Share → QR Code and link.
+    ShareLink {
+        title: String,
+        protocol: String,
+        throne: String,
+        deep: bool,
+    },
+    /// Upstream Share → Export config.
+    ExportConfig {
+        title: String,
+        body: String,
+    },
     /// Full upstream-style Routes dialog (tabs + draft + nested editors).
     RoutingSettings(RoutingDraft),
     TunSettings {

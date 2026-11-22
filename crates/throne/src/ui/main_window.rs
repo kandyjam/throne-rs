@@ -1248,6 +1248,14 @@ impl MainWindow {
             Dialog::EditGroup { .. } => 12,
             Dialog::ConfirmRemoveGroup { .. } => 13,
             Dialog::AddFromInput { .. } => 3,
+            Dialog::ShareLink { deep, .. } => {
+                if *deep {
+                    17
+                } else {
+                    16
+                }
+            }
+            Dialog::ExportConfig { .. } => 18,
             Dialog::TunSettings { .. } => 4,
             Dialog::HotkeySettings { .. } => 5,
             Dialog::EditProfile { .. } => 6,
@@ -5555,6 +5563,152 @@ impl MainWindow {
         }
     }
 
+    fn selected_profile(&self) -> Option<&Profile> {
+        let id = self.state.selected_profile_id()?;
+        self.state.profile(id)
+    }
+
+    fn copy_selected_links(&mut self, format: throne_import::ShareFormat, cx: &mut Context<Self>) {
+        let Some(profile) = self.selected_profile() else {
+            self.state
+                .set_status_message_only("Select a profile before sharing");
+            cx.notify();
+            return;
+        };
+        let link =
+            throne_import::share_link(&profile.name, &profile.export_outbound_json(), format);
+        cx.write_to_clipboard(ClipboardItem::new_string(link));
+        self.state.set_status_message("Copied 1 item");
+        cx.notify();
+    }
+
+    fn copy_selected_test_result(&mut self, cx: &mut Context<Self>) {
+        let Some(profile) = self.selected_profile() else {
+            self.state
+                .set_status_message_only("Select a profile before copying its test result");
+            cx.notify();
+            return;
+        };
+        let text = profile.display_test_result();
+        if text.trim().is_empty() {
+            self.state
+                .set_status_message_only("This profile has no test result");
+        } else {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            self.state.set_status_message("Copied 1 test result");
+        }
+        cx.notify();
+    }
+
+    fn open_share_qr(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(profile) = self.selected_profile() else {
+            self.state
+                .set_status_message_only("Select a profile before sharing");
+            cx.notify();
+            return;
+        };
+        let json = profile.export_outbound_json();
+        let title = if profile.name.is_empty() {
+            profile.profile_type.display_name().to_string()
+        } else {
+            profile.name.clone()
+        };
+        let protocol =
+            throne_import::share_link(&title, &json, throne_import::ShareFormat::Protocol);
+        let throne = throne_import::share_link(&title, &json, throne_import::ShareFormat::Throne);
+        self.dialog = Dialog::ShareLink {
+            title,
+            deep: protocol.starts_with("throne://"),
+            protocol,
+            throne,
+        };
+        self.dialog_inputs = None;
+        self.present_gpui_dialog(window, cx);
+    }
+
+    fn open_export_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(profile) = self.selected_profile().cloned() else {
+            self.state
+                .set_status_message_only("Select a profile before exporting");
+            cx.notify();
+            return;
+        };
+        let route = self.state.route_for_group(profile.group_id).cloned();
+        let settings = self.state.settings().clone();
+        match throne_core_client::build_load_config(&profile, &settings, route.as_ref()) {
+            Ok(built) => {
+                let mut body = built.core_config_json;
+                for (index, xray) in built.xray_full_configs.iter().enumerate() {
+                    body.push_str(&format!("\n\n// Xray {}\n{xray}", index + 1));
+                }
+                if !built.xray_config.is_empty() {
+                    body.push_str("\n\n// Xray\n");
+                    body.push_str(&built.xray_config);
+                }
+                self.dialog = Dialog::ExportConfig {
+                    title: profile.name,
+                    body,
+                };
+                self.dialog_inputs = None;
+                self.present_gpui_dialog(window, cx);
+            }
+            Err(error) => {
+                self.state
+                    .set_status_message(format!("Build config error: {error}"));
+                cx.notify();
+            }
+        }
+    }
+
+    fn clone_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.state.selected_profile_id() else {
+            self.state
+                .set_status_message_only("Select a profile before cloning");
+            cx.notify();
+            return;
+        };
+        if let Some(new_id) = self.state.clone_profile(id) {
+            let _ = self.state.select_profile(new_id);
+            let _ = self.persist_db();
+            self.state.set_status_message("Cloned 1 item");
+        }
+        cx.notify();
+    }
+
+    fn clear_selected_test(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.state.selected_profile_id() else {
+            return;
+        };
+        if self.state.clear_profile_test(id) {
+            let _ = self.persist_db();
+            self.state.set_status_message("Test result cleared");
+        }
+        cx.notify();
+    }
+
+    fn reset_selected_traffic(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.state.selected_profile_id() else {
+            return;
+        };
+        if self.state.reset_profile_traffic(id) {
+            let _ = self.persist_db();
+            self.state.set_status_message("Traffic reset");
+        }
+        cx.notify();
+    }
+
+    fn qr_blocks(text: &str) -> String {
+        let Ok(code) = qrcode::QrCode::new(text.as_bytes()) else {
+            return "This link is too long for a QR code.".into();
+        };
+        code.render()
+            .quiet_zone(true)
+            .module_dimensions(1, 1)
+            .light_color(' ')
+            .dark_color('█')
+            .build()
+    }
+
     fn copy_group_share_links(&mut self, deep: bool, cx: &mut Context<Self>) {
         let Dialog::EditGroup {
             group_id: Some(gid),
@@ -5567,18 +5721,18 @@ impl MainWindow {
             return;
         };
         let mut links = Vec::new();
+        let format = if deep {
+            throne_import::ShareFormat::Throne
+        } else {
+            throne_import::ShareFormat::Protocol
+        };
         for &pid in &g.profile_ids {
-            if let Some(p) = self.state.profile(pid) {
-                if !p.outbound_json.trim().is_empty() {
-                    if deep {
-                        // Deep link: keep JSON outbound blob (best-effort without full exporter).
-                        links.push(p.outbound_json.clone());
-                    } else if let Some(line) = p.outbound_json.lines().next() {
-                        links.push(line.trim().to_string());
-                    }
-                } else {
-                    links.push(format!("# {} ({})", p.name, p.profile_type.display_name()));
-                }
+            if let Some(profile) = self.state.profile(pid) {
+                links.push(throne_import::share_link(
+                    &profile.name,
+                    &profile.export_outbound_json(),
+                    format,
+                ));
             }
         }
         let text = links.join("\n");
@@ -5634,7 +5788,9 @@ impl MainWindow {
             | Dialog::ConfirmUpdateAllSubscriptions
             | Dialog::SubscriptionDiff { .. }
             | Dialog::AutoSelectorStats { .. }
-            | Dialog::TrafficStats { .. } => None,
+            | Dialog::TrafficStats { .. }
+            | Dialog::ShareLink { .. }
+            | Dialog::ExportConfig { .. } => None,
             Dialog::EditGroup { .. } => None,
             Dialog::AddFromInput { text } => Some((text, true)),
             Dialog::RoutingSettings(draft) => {
@@ -6260,23 +6416,70 @@ impl MainWindow {
             }
             OpenMenu::ProfileCtx => {
                 panel = panel.child(menu_label("Server"));
-                item!("c-start", "Start", |t, _w, cx| t.toggle_proxy(cx));
-                item!("c-stop", "Stop", |t, _w, cx| {
-                    if t.state.core_status().is_running() {
-                        t.toggle_proxy(cx);
-                    }
-                });
-                item!("c-input", "Add profile from input", |t, w, cx| {
+                item!("c-input", "New profile", |t, w, cx| {
                     t.open_add_from_input(w, cx);
                 });
                 item!("c-clip", "Add profile from clipboard", |t, _w, cx| {
                     t.import_clipboard(cx);
                 });
-                item!("c-edit", "Edit profile…", |t, w, cx| t
-                    .open_edit_profile(w, cx));
+                item!("c-file", "Add profile from file", |t, _w, cx| {
+                    t.import_from_files(cx);
+                });
+                item!("c-scan", "Scan QR", |t, _w, cx| {
+                    t.state
+                        .set_status_message_only("Scan QR is not available in this build");
+                });
+                panel = panel.child(menu_separator());
+                item!("c-start", "Start", |t, _w, cx| t.menu_start(cx));
+                item!("c-stop", "Stop", |t, _w, cx| {
+                    if t.state.core_status().is_running() {
+                        t.stop_proxy(cx);
+                    }
+                });
+                panel = panel.child(menu_label("Share"));
+                item!("c-qr", "QR Code and link", |t, w, cx| t
+                    .open_share_qr(w, cx));
+                item!("c-export", "Export config", |t, w, cx| t
+                    .open_export_config(w, cx));
+                item!("c-copy", "Copy links", |t, _w, cx| {
+                    t.copy_selected_links(throne_import::ShareFormat::Protocol, cx);
+                });
+                item!("c-copy-nkr", "Copy Throne links", |t, _w, cx| {
+                    t.copy_selected_links(throne_import::ShareFormat::Throne, cx);
+                });
+                item!("c-copy-test", "Copy test result", |t, _w, cx| {
+                    t.copy_selected_test_result(cx);
+                });
+                item!("c-edit", "Edit", |t, w, cx| t.open_edit_profile(w, cx));
                 item!("c-del", "Delete", |t, _w, cx| t.delete_selected(cx));
-                item!("c-test", "Url Test Selected", |t, _w, cx| t
-                    .url_test_selected(cx));
+                panel = panel.child(menu_separator());
+                item!("c-all", "Select all", |t, _w, cx| t.select_all(cx));
+                item!("c-clone", "Clone", |t, _w, cx| t.clone_selected(cx));
+                item!("c-pin", "Pin", |t, _w, cx| {
+                    t.state
+                        .set_status_message_only("Profile pin is not available in this build");
+                });
+                panel = panel.child(menu_separator());
+                item!("c-test", "URL Test", |t, _w, cx| t.url_test_selected(cx));
+                item!("c-speed", "Speed Test", |t, _w, cx| t
+                    .speed_test_selected(cx));
+                item!("c-ip", "Resolve Out IP", |t, _w, cx| t.ip_test_selected(cx));
+                item!("c-svc", "Service Check", |t, _w, cx| {
+                    t.state
+                        .set_status_message_only("Service Check is not available in this build");
+                });
+                item!("c-dpi", "Find DPI settings", |t, _w, cx| {
+                    t.state.set_status_message_only(
+                        "DPI settings scan is not available in this build",
+                    );
+                });
+                item!("c-domain", "Resolve domain", |t, _w, cx| {
+                    t.resolve_profile_domains(false, cx);
+                });
+                item!("c-clear", "Clear test result", |t, _w, cx| t
+                    .clear_selected_test(cx));
+                item!("c-traffic", "Reset traffic", |t, _w, cx| t
+                    .reset_selected_traffic(cx));
             }
             OpenMenu::GroupTabCtx => {
                 item!("gt-add", "Add new Group", |t, w, cx| {
@@ -6432,7 +6635,7 @@ impl MainWindow {
             .top(px(y))
             .left(px(x))
             .occlude()
-            .child(menu_panel("ctx-menu", 200., items))
+            .child(menu_panel("ctx-menu", 240., items))
             .into_any_element()
     }
 
@@ -8195,6 +8398,125 @@ fn build_gpui_dialog(
                         .text_sm()
                         .text_color(cx.theme().foreground)
                         .child(format!("Remove {name}?")),
+                )
+        }
+        Dialog::ShareLink {
+            title,
+            protocol,
+            throne,
+            deep,
+        } => {
+            let showing_deep = *deep;
+            let link = if showing_deep { throne } else { protocol };
+            let qr = MainWindow::qr_blocks(link);
+            let e_copy = entity.clone();
+            let e_toggle = entity.clone();
+            let link_owned = link.clone();
+            dialog
+                .title(format!("Share {title}"))
+                .w(px(520.))
+                .on_cancel({
+                    let entity = entity.clone();
+                    move |_, _, cx| {
+                        entity.update(cx, |this, cx| {
+                            this.close_dialog();
+                            cx.notify();
+                        });
+                        true
+                    }
+                })
+                .on_close(on_dismiss)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .font_family("Menlo")
+                                .text_xs()
+                                .whitespace_normal()
+                                .child(qr),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(link.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(menu_item("share-copy", "Copy", move |_, _, cx| {
+                                    e_copy.update(cx, |this, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            link_owned.clone(),
+                                        ));
+                                        this.state.set_status_message("Copied");
+                                        cx.notify();
+                                    });
+                                }))
+                                .child(menu_item(
+                                    "share-deep",
+                                    if showing_deep {
+                                        "Show link"
+                                    } else {
+                                        "Deep link"
+                                    },
+                                    move |_, _, cx| {
+                                        e_toggle.update(cx, |this, cx| {
+                                            if let Dialog::ShareLink { deep, .. } = &mut this.dialog
+                                            {
+                                                *deep = !showing_deep;
+                                            }
+                                            this.request_gpui_dialog();
+                                            cx.notify();
+                                        });
+                                    },
+                                )),
+                        ),
+                )
+        }
+        Dialog::ExportConfig { title, body } => {
+            let body_owned = body.clone();
+            let e_copy = entity.clone();
+            dialog
+                .title(format!("Export config — {title}"))
+                .w(px(640.))
+                .on_cancel({
+                    let entity = entity.clone();
+                    move |_, _, cx| {
+                        entity.update(cx, |this, cx| {
+                            this.close_dialog();
+                            cx.notify();
+                        });
+                        true
+                    }
+                })
+                .on_close(on_dismiss)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .max_h(px(420.))
+                        .child(
+                            div()
+                                .max_h(px(360.))
+                                .font_family("Menlo")
+                                .text_xs()
+                                .child(body.clone()),
+                        )
+                        .child(menu_item("export-copy", "Copy", move |_, _, cx| {
+                            e_copy.update(cx, |this, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    body_owned.clone(),
+                                ));
+                                this.state.set_status_message("Copied");
+                                cx.notify();
+                            });
+                        })),
                 )
         }
         Dialog::AddFromInput { .. } => {

@@ -11,6 +11,7 @@ mod fetch;
 mod json_sub;
 mod links;
 mod route_share;
+mod share;
 mod subscription_route;
 mod tls;
 mod wireguard;
@@ -26,6 +27,7 @@ pub use links::parse_share_link;
 pub use route_share::{
     import_route_payload, to_share_link, to_share_object, try_import_routes, RouteImportReport,
 };
+pub use share::{share_link, ShareFormat};
 pub use subscription_route::{
     parse_subscription_route, shipped_routing_link, subscription_routing_value,
     SubscriptionRouteParse,

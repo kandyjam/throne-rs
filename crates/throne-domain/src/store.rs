@@ -669,6 +669,58 @@ impl AppState {
         id
     }
 
+    /// Duplicate a profile in its group, placed just after the original.
+    pub fn clone_profile(&mut self, id: ProfileId) -> Option<ProfileId> {
+        let source = self.profiles.get(&id)?.clone();
+        let new_id = self.next_profile_id;
+        self.next_profile_id += 1;
+        let mut copy = source;
+        copy.id = new_id;
+        let name = copy.name.trim();
+        copy.name = if name.is_empty() {
+            "clone".into()
+        } else {
+            format!("{name} clone")
+        };
+        let group_id = copy.group_id;
+        self.profiles.insert(new_id, copy);
+        if let Some(group) = self.groups.get_mut(&group_id) {
+            let at = group
+                .profile_ids
+                .iter()
+                .position(|pid| *pid == id)
+                .map(|index| index + 1)
+                .unwrap_or(group.profile_ids.len());
+            group.profile_ids.insert(at, new_id);
+        }
+        self.resort_group(group_id);
+        Some(new_id)
+    }
+
+    pub fn clear_profile_test(&mut self, id: ProfileId) -> bool {
+        let Some(profile) = self.profiles.get_mut(&id) else {
+            return false;
+        };
+        profile.latency_ms = 0;
+        profile.latency_at = 0;
+        profile.download_speed.clear();
+        profile.upload_speed.clear();
+        profile.test_country.clear();
+        profile.ip_out.clear();
+        let group_id = profile.group_id;
+        self.resort_group(group_id);
+        true
+    }
+
+    pub fn reset_profile_traffic(&mut self, id: ProfileId) -> bool {
+        let Some(profile) = self.profiles.get_mut(&id) else {
+            return false;
+        };
+        profile.traffic_downlink = 0;
+        profile.traffic_uplink = 0;
+        true
+    }
+
     /// Create an upstream-style Auto Selector profile that tracks `tracked_group_id`.
     ///
     /// The profile is stored in `home_group_id` (usually the active group). The
