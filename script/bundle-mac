@@ -4,7 +4,7 @@
 # 1. cargo-bundle → ThroneRs.app (display name; binary inside stays Throne)
 # 2. Copy ThroneCore beside Throne (parentcheck)
 # 3. Optional codesign
-# 4. hdiutil → DMG in dist/
+# 4. diskutil image → DMG in dist/
 #
 # Usage:
 #   ./script/bundle-mac
@@ -17,7 +17,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 [[ "$HOST" == "macos" ]] || die "bundle-mac must run on macOS (host=$HOST)"
 
-need_cmd hdiutil "macOS disk image tool"
+need_cmd diskutil "macOS disk image tool"
 need_cmd cargo "Rust toolchain"
 
 ensure_cargo_bundle() {
@@ -147,30 +147,23 @@ STAGE="$TARGET_DIR/dmg-stage-$$"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
 cp -R "$APP" "$STAGE/ThroneRs.app"
+# Drag-install target. Created before imaging so the DMG does not need a
+# read-write attach just to add this symlink.
+ln -sf /Applications "$STAGE/Applications"
 
 DMG_NAME="ThroneRs-${VERSION}-${ARCH}"
 DMG_PATH="$DIST/${DMG_NAME}.dmg"
 rm -f "$DMG_PATH"
 
 log "Creating DMG → $DMG_PATH"
-# Temporary RW image, then convert to compressed UDZO (Zed uses hdiutil similarly)
-TMP_DMG="$TARGET_DIR/${DMG_NAME}.tmp.dmg"
-rm -f "$TMP_DMG"
-hdiutil create \
-  -volname "ThroneRs" \
-  -srcfolder "$STAGE" \
-  -ov -format UDRW \
-  "$TMP_DMG"
-
-# Add Applications symlink for drag-install UX
-MOUNT_DIR="$(mktemp -d)"
-hdiutil attach "$TMP_DMG" -mountpoint "$MOUNT_DIR" -nobrowse -quiet
-ln -sf /Applications "$MOUNT_DIR/Applications"
-hdiutil detach "$MOUNT_DIR" -quiet || hdiutil detach "$MOUNT_DIR" -force -quiet
-rmdir "$MOUNT_DIR" 2>/dev/null || true
-
-hdiutil convert "$TMP_DMG" -format UDZO -imagekey zlib-level=9 -o "$DMG_PATH"
-rm -f "$TMP_DMG"
+# hdiutil create -volname is deprecated. diskutil writes the compressed UDZO
+# directly; progress stays off the path echoed below.
+diskutil image create from \
+  --format UDZO \
+  --volumeName "ThroneRs" \
+  "$STAGE" \
+  "$DMG_PATH" \
+  >&2
 rm -rf "$STAGE"
 
 # Also keep a copy of the .app next to the DMG for CI / local install
