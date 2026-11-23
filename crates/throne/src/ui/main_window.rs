@@ -20,10 +20,10 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use gpui::{
-    actions, div, prelude::*, px, uniform_list, App, Bounds, ClipboardItem, Context, DragMoveEvent,
-    Empty, Entity, EntityInputHandler, FocusHandle, Focusable, KeyDownEvent, MouseButton, Pixels,
-    Render, ScrollHandle, ScrollStrategy, SharedString, Subscription, UTF16Selection,
-    UniformListScrollHandle, Window,
+    actions, canvas, div, fill, point, prelude::*, px, rgb, uniform_list, App, Bounds,
+    ClipboardItem, Context, DragMoveEvent, Empty, Entity, EntityInputHandler, FocusHandle,
+    Focusable, KeyDownEvent, MouseButton, Pixels, Render, ScrollHandle, ScrollStrategy,
+    SharedString, Size, Subscription, UTF16Selection, UniformListScrollHandle, Window,
 };
 
 use throne_core_client::{
@@ -704,6 +704,93 @@ struct ColResizeDrag {
 impl Focusable for MainWindow {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+/// Quiet zone required around a QR symbol, in modules.
+const QR_QUIET_ZONE: usize = 4;
+
+struct QrGrid {
+    side: usize,
+    /// Row-major. `true` is a dark module.
+    dark: Vec<bool>,
+}
+
+fn encode_qr(text: &str) -> Result<QrGrid, &'static str> {
+    let code =
+        qrcode::QrCode::new(text.as_bytes()).map_err(|_| "This link is too long for a QR code.")?;
+    let modules = code.width();
+    let side = modules + QR_QUIET_ZONE * 2;
+    let mut dark = vec![false; side * side];
+    for y in 0..modules {
+        for x in 0..modules {
+            if code[(x, y)] == qrcode::Color::Dark {
+                dark[(y + QR_QUIET_ZONE) * side + x + QR_QUIET_ZONE] = true;
+            }
+        }
+    }
+    Ok(QrGrid { side, dark })
+}
+
+fn paint_qr(bounds: Bounds<Pixels>, grid: &QrGrid, window: &mut Window) {
+    let avail = f32::from(bounds.size.width)
+        .min(f32::from(bounds.size.height))
+        .max(1.0);
+    // Whole pixels, so neighboring modules share an edge instead of a gray seam.
+    let module = (avail / grid.side as f32).floor().max(1.0);
+    let drawn = module * grid.side as f32;
+    let origin_x = f32::from(bounds.origin.x) + (f32::from(bounds.size.width) - drawn) * 0.5;
+    let origin_y = f32::from(bounds.origin.y) + (f32::from(bounds.size.height) - drawn) * 0.5;
+    let frame = Bounds {
+        origin: point(px(origin_x), px(origin_y)),
+        size: Size::new(px(drawn), px(drawn)),
+    };
+    window.paint_quad(fill(frame, rgb(0xffffff)));
+    let side = grid.side;
+    for y in 0..side {
+        let mut x = 0;
+        while x < side {
+            if !grid.dark[y * side + x] {
+                x += 1;
+                continue;
+            }
+            let start = x;
+            x += 1;
+            while x < side && grid.dark[y * side + x] {
+                x += 1;
+            }
+            window.paint_quad(fill(
+                Bounds {
+                    origin: point(
+                        px(origin_x + start as f32 * module),
+                        px(origin_y + y as f32 * module),
+                    ),
+                    size: Size::new(px((x - start) as f32 * module), px(module)),
+                },
+                rgb(0x000000),
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod qr_grid_tests {
+    use super::encode_qr;
+
+    #[test]
+    fn finder_squares_sit_inside_a_light_quiet_zone() {
+        let grid = encode_qr("https://example.com").expect("short link encodes");
+        let n = grid.side;
+        let q = super::QR_QUIET_ZONE;
+        assert!(grid.dark[q * n + q], "finder origin");
+        assert!(grid.dark[q * n + q + 6], "finder top-right");
+        assert!(grid.dark[(q + 6) * n + q], "finder bottom-left");
+        assert!(
+            !grid.dark[(q + 1) * n + q + 1],
+            "finder border surrounds a light cell"
+        );
+        assert!(!grid.dark[0], "quiet zone stays light");
+        assert!(!grid.dark[n - 1], "quiet zone stays light");
     }
 }
 
@@ -5697,16 +5784,22 @@ impl MainWindow {
         cx.notify();
     }
 
-    fn qr_blocks(text: &str) -> String {
-        let Ok(code) = qrcode::QrCode::new(text.as_bytes()) else {
-            return "This link is too long for a QR code.".into();
-        };
-        code.render()
-            .quiet_zone(true)
-            .module_dimensions(1, 1)
-            .light_color(' ')
-            .dark_color('█')
-            .build()
+    fn qr_view(text: &str) -> gpui::Div {
+        match encode_qr(text) {
+            Ok(grid) => {
+                // Six pixels per module keeps a normal share link sharp. Clamp so a
+                // long link still fits the dialog and a short one is not a postage stamp.
+                let side = ((grid.side as f32) * 6.0).clamp(240.0, 420.0);
+                div().w(px(side)).h(px(side)).child(
+                    canvas(
+                        move |_, _, _| {},
+                        move |bounds, _, window, _| paint_qr(bounds, &grid, window),
+                    )
+                    .size_full(),
+                )
+            }
+            Err(message) => div().text_sm().child(message.to_string()),
+        }
     }
 
     fn copy_group_share_links(&mut self, deep: bool, cx: &mut Context<Self>) {
@@ -8408,7 +8501,7 @@ fn build_gpui_dialog(
         } => {
             let showing_deep = *deep;
             let link = if showing_deep { throne } else { protocol };
-            let qr = MainWindow::qr_blocks(link);
+            let qr = MainWindow::qr_view(link);
             let e_copy = entity.clone();
             let e_toggle = entity.clone();
             let link_owned = link.clone();
@@ -8431,13 +8524,7 @@ fn build_gpui_dialog(
                         .flex()
                         .flex_col()
                         .gap_2()
-                        .child(
-                            div()
-                                .font_family("Menlo")
-                                .text_xs()
-                                .whitespace_normal()
-                                .child(qr),
-                        )
+                        .child(qr)
                         .child(
                             div()
                                 .text_xs()
